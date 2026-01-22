@@ -456,11 +456,9 @@ impl ChannelMessageHandler for ErroringMessageHandler {
 	fn handle_closing_signed(&self, their_node_id: PublicKey, msg: &msgs::ClosingSigned) {
 		ErroringMessageHandler::push_error(self, their_node_id, msg.channel_id);
 	}
-	#[cfg(simple_close)]
 	fn handle_closing_complete(&self, their_node_id: PublicKey, msg: msgs::ClosingComplete) {
 		ErroringMessageHandler::push_error(self, their_node_id, msg.channel_id);
 	}
-	#[cfg(simple_close)]
 	fn handle_closing_sig(&self, their_node_id: PublicKey, msg: msgs::ClosingSig) {
 		ErroringMessageHandler::push_error(self, their_node_id, msg.channel_id);
 	}
@@ -2492,11 +2490,9 @@ impl<
 			Message::ClosingSigned(msg) => {
 				self.message_handler.chan_handler.handle_closing_signed(their_node_id, &msg);
 			},
-			#[cfg(simple_close)]
 			Message::ClosingComplete(msg) => {
 				self.message_handler.chan_handler.handle_closing_complete(their_node_id, msg);
 			},
-			#[cfg(simple_close)]
 			Message::ClosingSig(msg) => {
 				self.message_handler.chan_handler.handle_closing_sig(their_node_id, msg);
 			},
@@ -3094,7 +3090,6 @@ impl<
 							let msg = Message::ClosingSigned(msg);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id)?, msg);
 						},
-						#[cfg(simple_close)]
 						MessageSendEvent::SendClosingComplete { ref node_id, msg } => {
 							log_debug!(WithContext::from(&self.logger, Some(*node_id), Some(msg.channel_id), None), "Handling SendClosingComplete event in peer_handler for node {} for channel {}",
 									node_id,
@@ -3102,7 +3097,6 @@ impl<
 							let msg = Message::ClosingComplete(msg);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id)?, msg);
 						},
-						#[cfg(simple_close)]
 						MessageSendEvent::SendClosingSig { ref node_id, msg } => {
 							log_debug!(WithContext::from(&self.logger, Some(*node_id), Some(msg.channel_id), None), "Handling SendClosingSig event in peer_handler for node {} for channel {}",
 									node_id,

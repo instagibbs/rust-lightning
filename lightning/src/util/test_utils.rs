@@ -1423,11 +1423,9 @@ impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
 	fn handle_closing_signed(&self, _their_node_id: PublicKey, msg: &msgs::ClosingSigned) {
 		self.received_msg(wire::Message::ClosingSigned(msg.clone()));
 	}
-	#[cfg(simple_close)]
 	fn handle_closing_complete(&self, _their_node_id: PublicKey, msg: msgs::ClosingComplete) {
 		self.received_msg(wire::Message::ClosingComplete(msg));
 	}
-	#[cfg(simple_close)]
 	fn handle_closing_sig(&self, _their_node_id: PublicKey, msg: msgs::ClosingSig) {
 		self.received_msg(wire::Message::ClosingSig(msg));
 	}

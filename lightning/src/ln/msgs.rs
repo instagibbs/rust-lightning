@@ -1874,7 +1874,6 @@ pub enum MessageSendEvent {
 		msg: ClosingSigned,
 	},
 	/// Used to indicate that a `closing_complete` message should be sent to the peer with the given `node_id`.
-	#[cfg(simple_close)]
 	SendClosingComplete {
 		/// The node_id of the node which should receive this message
 		node_id: PublicKey,
@@ -1882,7 +1881,6 @@ pub enum MessageSendEvent {
 		msg: ClosingComplete,
 	},
 	/// Used to indicate that a `closing_sig` message should be sent to the peer with the given `node_id`.
-	#[cfg(simple_close)]
 	SendClosingSig {
 		/// The node_id of the node which should receive this message
 		node_id: PublicKey,
@@ -2106,10 +2104,8 @@ pub trait ChannelMessageHandler: BaseMessageHandler {
 	/// Handle an incoming `closing_signed` message from the given peer.
 	fn handle_closing_signed(&self, their_node_id: PublicKey, msg: &ClosingSigned);
 	/// Handle an incoming `closing_complete` message from the given peer.
-	#[cfg(simple_close)]
 	fn handle_closing_complete(&self, their_node_id: PublicKey, msg: ClosingComplete);
 	/// Handle an incoming `closing_sig` message from the given peer.
-	#[cfg(simple_close)]
 	fn handle_closing_sig(&self, their_node_id: PublicKey, msg: ClosingSig);
 
 	// Quiescence
@@ -2247,11 +2243,9 @@ impl<T: ChannelMessageHandler + ?Sized, C: Deref<Target = T>> ChannelMessageHand
 	fn handle_closing_signed(&self, their_node_id: PublicKey, msg: &ClosingSigned) {
 		self.deref().handle_closing_signed(their_node_id, msg)
 	}
-	#[cfg(simple_close)]
 	fn handle_closing_complete(&self, their_node_id: PublicKey, msg: ClosingComplete) {
 		self.deref().handle_closing_complete(their_node_id, msg)
 	}
-	#[cfg(simple_close)]
 	fn handle_closing_sig(&self, their_node_id: PublicKey, msg: ClosingSig) {
 		self.deref().handle_closing_sig(their_node_id, msg)
 	}

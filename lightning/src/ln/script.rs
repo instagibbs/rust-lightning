@@ -307,8 +307,8 @@ mod shutdown_script_tests {
 		assert!(ShutdownScript::try_from(p2wsh_script).is_ok());
 	}
 
-	#[cfg(simple_close)]
 	#[test]
+	#[cfg(simple_close)]
 	fn generates_op_return_from_data() {
 		let data = [6; 6];
 		let op_return_script = ScriptBuf::new_op_return(&data);
