@@ -14236,10 +14236,78 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		}
 	}
 
+	/// Generates an initial closing_signed message for a funded channel if ready.
+	///
+	/// Returns whether the channel should be retained.
+	fn generate_initial_closing_signed_for_channel(
+		&self, funded_chan: &mut FundedChannel<SP>, cp_id: &PublicKey,
+		their_features: &InitFeatures, pending_msg_events: &mut Vec<MessageSendEvent>,
+		closed_channel_monitor_update_ids: &mut BTreeMap<ChannelId, u64>,
+		in_flight_monitor_updates: &mut BTreeMap<ChannelId, (OutPoint, Vec<ChannelMonitorUpdate>)>,
+		has_update: &mut bool,
+		handle_errors: &mut Vec<(PublicKey, Result<(), MsgHandleErrInternal>)>,
+	) -> bool {
+		let our_features = provided_init_features(&self.config.read().unwrap());
+		let logger = WithChannelContext::from(&self.logger, &funded_chan.context, None);
+		match funded_chan.maybe_propose_closing_signed(
+			&self.fee_estimator,
+			&our_features,
+			their_features,
+			&&logger,
+		) {
+			Ok((msg_opt, tx_shutdown_result_opt)) => {
+				if let Some(msg) = msg_opt {
+					*has_update = true;
+					pending_msg_events.push(MessageSendEvent::SendClosingSigned {
+						node_id: funded_chan.context.get_counterparty_node_id(),
+						msg,
+					});
+				}
+				debug_assert_eq!(tx_shutdown_result_opt.is_some(), funded_chan.is_shutdown());
+				if let Some((tx, shutdown_res)) = tx_shutdown_result_opt {
+					// We're done with this channel. We got a closing_signed and sent back
+					// a closing_signed with a closing transaction to broadcast.
+					let channel_id = funded_chan.context.channel_id();
+					let err = self.locked_handle_funded_coop_close(
+						closed_channel_monitor_update_ids,
+						in_flight_monitor_updates,
+						shutdown_res,
+						funded_chan,
+					);
+					handle_errors.push((*cp_id, Err(err)));
+
+					log_info!(logger, "Broadcasting {}", log_tx!(tx));
+					self.tx_broadcaster.broadcast_transactions(&[(
+						&tx,
+						TransactionType::CooperativeClose {
+							counterparty_node_id: *cp_id,
+							channel_id,
+						},
+					)]);
+					false
+				} else {
+					true
+				}
+			},
+			Err(e) => {
+				*has_update = true;
+				let (close_channel, res) = self.locked_handle_funded_force_close(
+					closed_channel_monitor_update_ids,
+					in_flight_monitor_updates,
+					e,
+					funded_chan,
+				);
+				handle_errors.push((funded_chan.context.get_counterparty_node_id(), Err(res)));
+				!close_channel
+			},
+		}
+	}
+
 	/// Check whether any channels have finished removing all pending updates after a shutdown
-	/// exchange and can now send a closing_signed.
-	/// Returns whether any closing_signed messages were generated.
-	fn maybe_generate_initial_closing_signed(&self) -> bool {
+	///
+	/// exchange and can now send a closing_signed or closing_complete.
+	/// Returns whether any messages were generated.
+	fn maybe_generate_initial_closing_message(&self) -> bool {
 		let mut handle_errors: Vec<(PublicKey, Result<(), _>)> = Vec::new();
 		let mut has_update = false;
 		{
@@ -14254,74 +14322,16 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						return true;
 					}
 					match chan.as_funded_mut() {
-						Some(funded_chan) => {
-							let our_features = provided_init_features(&self.config.read().unwrap());
-							let logger =
-								WithChannelContext::from(&self.logger, &funded_chan.context, None);
-							match funded_chan.maybe_propose_closing_signed(
-								&self.fee_estimator,
-								&our_features,
-								&peer_state.latest_features,
-								&&logger,
-							) {
-								Ok((msg_opt, tx_shutdown_result_opt)) => {
-									if let Some(msg) = msg_opt {
-										has_update = true;
-										pending_msg_events.push(
-											MessageSendEvent::SendClosingSigned {
-												node_id: funded_chan
-													.context
-													.get_counterparty_node_id(),
-												msg,
-											},
-										);
-									}
-									debug_assert_eq!(
-										tx_shutdown_result_opt.is_some(),
-										funded_chan.is_shutdown()
-									);
-									if let Some((tx, shutdown_res)) = tx_shutdown_result_opt {
-										// We're done with this channel. We got a closing_signed and sent back
-										// a closing_signed with a closing transaction to broadcast.
-										let channel_id = funded_chan.context.channel_id();
-										let err = self.locked_handle_funded_coop_close(
-											&mut peer_state.closed_channel_monitor_update_ids,
-											&mut peer_state.in_flight_monitor_updates,
-											shutdown_res,
-											funded_chan,
-										);
-										handle_errors.push((*cp_id, Err(err)));
-
-										log_info!(logger, "Broadcasting {}", log_tx!(tx));
-										self.tx_broadcaster.broadcast_transactions(&[(
-											&tx,
-											TransactionType::CooperativeClose {
-												counterparty_node_id: *cp_id,
-												channel_id,
-											},
-										)]);
-										false
-									} else {
-										true
-									}
-								},
-								Err(e) => {
-									has_update = true;
-									let (close_channel, res) = self
-										.locked_handle_funded_force_close(
-											&mut peer_state.closed_channel_monitor_update_ids,
-											&mut peer_state.in_flight_monitor_updates,
-											e,
-											funded_chan,
-										);
-									handle_errors.push((
-										funded_chan.context.get_counterparty_node_id(),
-										Err(res),
-									));
-									!close_channel
-								},
-							}
-						},
+						Some(funded_chan) => self.generate_initial_closing_signed_for_channel(
+							funded_chan,
+							cp_id,
+							&peer_state.latest_features,
+							pending_msg_events,
+							&mut peer_state.closed_channel_monitor_update_ids,
+							&mut peer_state.in_flight_monitor_updates,
+							&mut has_update,
+							&mut handle_errors,
+						),
 						None => true, // Retain unfunded channels if present.
 					}
 				});
@@ -16055,7 +16065,7 @@ impl<
 			// ChannelMonitors when clearing other events.
 			let mut result = self.process_pending_monitor_events();
 
-			if self.maybe_generate_initial_closing_signed() {
+			if self.maybe_generate_initial_closing_message() {
 				result = NotifyOption::DoPersist;
 			}
 
