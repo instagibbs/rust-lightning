@@ -12602,7 +12602,14 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				hash_map::Entry::Occupied(mut chan_entry) => {
 					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
 						logger = WithChannelContext::from(&self.logger, &chan.context, None);
-						let res = chan.closing_signed(&self.fee_estimator, &msg, &&logger);
+						let our_features = provided_init_features(&self.config.read().unwrap());
+						let res = chan.closing_signed(
+							&self.fee_estimator,
+							&msg,
+							&our_features,
+							&peer_state.latest_features,
+							&&logger,
+						);
 						let (closing_signed, tx_shutdown_result) =
 							try_channel_entry!(self, peer_state, res, chan_entry);
 						debug_assert_eq!(tx_shutdown_result.is_some(), chan.is_shutdown());
@@ -14248,11 +14255,15 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					}
 					match chan.as_funded_mut() {
 						Some(funded_chan) => {
+							let our_features = provided_init_features(&self.config.read().unwrap());
 							let logger =
 								WithChannelContext::from(&self.logger, &funded_chan.context, None);
-							match funded_chan
-								.maybe_propose_closing_signed(&self.fee_estimator, &&logger)
-							{
+							match funded_chan.maybe_propose_closing_signed(
+								&self.fee_estimator,
+								&our_features,
+								&peer_state.latest_features,
+								&&logger,
+							) {
 								Ok((msg_opt, tx_shutdown_result_opt)) => {
 									if let Some(msg) = msg_opt {
 										has_update = true;

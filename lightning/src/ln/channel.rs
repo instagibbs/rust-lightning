@@ -11133,7 +11133,8 @@ where
 	}
 
 	pub fn maybe_propose_closing_signed<F: FeeEstimator, L: Logger>(
-		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, our_features: &InitFeatures,
+		their_features: &InitFeatures, logger: &L,
 	) -> Result<(Option<msgs::ClosingSigned>, Option<(Transaction, ShutdownResult)>), ChannelError>
 	{
 		// If we're waiting on a monitor persistence, that implies we're also waiting to send some
@@ -11146,7 +11147,13 @@ where
 
 		if !self.funding.is_outbound() {
 			if let Some(msg) = &self.context.pending_counterparty_closing_signed.take() {
-				return self.closing_signed(fee_estimator, &msg, logger);
+				return self.closing_signed(
+					fee_estimator,
+					&msg,
+					our_features,
+					their_features,
+					logger,
+				);
 			}
 			return Ok((None, None));
 		}
@@ -11451,9 +11458,14 @@ where
 
 	pub fn closing_signed<F: FeeEstimator, L: Logger>(
 		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, msg: &msgs::ClosingSigned,
-		logger: &L,
+		our_features: &InitFeatures, their_features: &InitFeatures, logger: &L,
 	) -> Result<(Option<msgs::ClosingSigned>, Option<(Transaction, ShutdownResult)>), ChannelError>
 	{
+		if our_features.supports_simple_close() && their_features.supports_simple_close() {
+			return Err(ChannelError::close(
+				"Remote end sent us a closing_signed for an option_simple_close channel".to_owned(),
+			));
+		}
 		if self.is_shutdown_pending_signature() {
 			return Err(ChannelError::Warn(String::from("Remote end sent us a closing_signed while fully shutdown and just waiting on the final closing signature")));
 		}
