@@ -12675,12 +12675,58 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	fn internal_closing_complete(
 		&self, _counterparty_node_id: PublicKey, _msg: msgs::ClosingComplete,
 	) -> Result<(), MsgHandleErrInternal> {
+		// The receiver of `closing_complete` (aka. "the closee"):
+		//  - If `fee_satoshis` is greater than the closer's outstanding balance:
+		//    - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//  - If `closee_scriptpubkey` does not match the last script it sent (from `closing_complete` or from the initial `shutdown`):
+		//    - SHOULD ignore `closing_complete`.
+		//    - SHOULD send a `warning`.
+		//    - SHOULD close the connection.
+		//  - If `closer_scriptpubkey` is invalid (as detailed in the [`shutdown` requirements](#closing-initiation-shutdown)):
+		//    - SHOULD ignore `closing_complete`.
+		//    - SHOULD send a `warning`.
+		//    - SHOULD close the connection.
+		//  - If `closer_scriptpubkey` is a valid `OP_RETURN` script:
+		//    - MUST set the closer's output amount to zero so that all funds go to fees, as specified in [BOLT #3](03-transactions.md#closing-transaction).
+		//  - MUST generate the remote closing transaction as specified in [BOLT #3](03-transactions.md#closing-transaction).
+		//  - Select a signature for validation:
+		//    - If the local output amount is dust:
+		//      - MUST use `closer_output_only`.
+		//    - Otherwise, if it considers the local output amount uneconomical AND its `closee_scriptpubkey` is not `OP_RETURN`:
+		//      - MUST use `closer_output_only`.
+		//    - Otherwise, if `closer_and_closee_outputs` is present:
+		//      - MUST use `closer_and_closee_outputs`.
+		//    - Otherwise:
+		//      - MUST use `closee_output_only`.
+		//  - If the selected signature field does not exist:
+		//    - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//  - If the signature field is not valid for the corresponding closing transaction specified in [BOLT #3](03-transactions.md#closing-transaction):
+		//    - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//  - If the signature field is non-compliant with LOW-S-standard rule<sup>[LOWS](https://github.com/bitcoin/bitcoin/pull/6769)</sup>:
+		//    - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//  - MUST sign and broadcast the corresponding closing transaction.
+		//  - MUST send `closing_sig` with a single valid signature in the same TLV field as the `closing_complete`.
+		//  - MUST use `closer_scriptpubkey` for its own future `closing_complete` messages.
 		unimplemented!("Handling ClosingComplete is not implemented");
 	}
 
 	fn internal_closing_sig(
 		&self, _counterparty_node_id: PublicKey, _msg: msgs::ClosingSig,
 	) -> Result<(), MsgHandleErrInternal> {
+		// The receiver of `closing_sig`:
+		//   - If `closer_scriptpubkey`, `closee_scriptpubkey`, `fee_satoshis` or `locktime` don't match what was sent in `closing_complete`:
+		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//   - If `tlvs` does not contain exactly one signature:
+		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//   - If `tlvs` does not contain one of the TLV fields sent in `closing_complete`:
+		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//   - If the signature field is not valid for the corresponding closing transaction specified in [BOLT #3](03-transactions.md#closing-transaction):
+		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//   - If the signature field is non-compliant with LOW-S-standard rule<sup>[LOWS](https://github.com/bitcoin/bitcoin/pull/6769)</sup>:
+		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
+		//   - otherwise:
+		//     - MUST broadcast the corresponding closing transaction.
+		//   - MAY send another `closing_complete` (e.g. with a different `fee_satoshis` or `closer_scriptpubkey`).
 		unimplemented!("Handling ClosingSig is not implemented");
 	}
 
@@ -14236,6 +14282,56 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		}
 	}
 
+	/// Generates an initial closing_complete message for a funded channel if ready.
+	///
+	/// Returns whether the channel should be retained.
+	fn generate_initial_closing_complete_for_channel(
+		&self, funded_chan: &mut FundedChannel<SP>, cp_id: &PublicKey,
+		pending_msg_events: &mut Vec<MessageSendEvent>,
+		closed_channel_monitor_update_ids: &mut BTreeMap<ChannelId, u64>,
+		in_flight_monitor_updates: &mut BTreeMap<ChannelId, (OutPoint, Vec<ChannelMonitorUpdate>)>,
+		has_update: &mut bool,
+		handle_errors: &mut Vec<(PublicKey, Result<(), MsgHandleErrInternal>)>,
+	) -> bool {
+		let logger = WithChannelContext::from(&self.logger, &funded_chan.context, None);
+		match funded_chan.maybe_propose_closing_complete(&self.fee_estimator, &&logger) {
+			Ok((msg_opt, shutdown_result_opt)) => {
+				if let Some(msg) = msg_opt {
+					*has_update = true;
+					pending_msg_events.push(MessageSendEvent::SendClosingComplete {
+						node_id: funded_chan.context.get_counterparty_node_id(),
+						msg,
+					});
+				}
+				debug_assert_eq!(shutdown_result_opt.is_some(), funded_chan.is_shutdown());
+				if let Some(shutdown_res) = shutdown_result_opt {
+					// We're done with this channel. We got a closing_complete and sent back
+					// a closing_sig.
+					let err = self.locked_handle_funded_coop_close(
+						closed_channel_monitor_update_ids,
+						in_flight_monitor_updates,
+						shutdown_res,
+						funded_chan,
+					);
+					handle_errors.push((*cp_id, Err(err)));
+					false
+				} else {
+					true
+				}
+			},
+			Err(e) => {
+				*has_update = true;
+				let (close_channel, res) = self.locked_handle_funded_force_close(
+					closed_channel_monitor_update_ids,
+					in_flight_monitor_updates,
+					e,
+					funded_chan,
+				);
+				handle_errors.push((funded_chan.context.get_counterparty_node_id(), Err(res)));
+				!close_channel
+			},
+		}
+	}
 	/// Generates an initial closing_signed message for a funded channel if ready.
 	///
 	/// Returns whether the channel should be retained.
@@ -14322,16 +14418,30 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						return true;
 					}
 					match chan.as_funded_mut() {
-						Some(funded_chan) => self.generate_initial_closing_signed_for_channel(
-							funded_chan,
-							cp_id,
-							&peer_state.latest_features,
-							pending_msg_events,
-							&mut peer_state.closed_channel_monitor_update_ids,
-							&mut peer_state.in_flight_monitor_updates,
-							&mut has_update,
-							&mut handle_errors,
-						),
+						Some(funded_chan) => {
+							if peer_state.latest_features.supports_simple_close() {
+								self.generate_initial_closing_complete_for_channel(
+									funded_chan,
+									cp_id,
+									pending_msg_events,
+									&mut peer_state.closed_channel_monitor_update_ids,
+									&mut peer_state.in_flight_monitor_updates,
+									&mut has_update,
+									&mut handle_errors,
+								)
+							} else {
+								self.generate_initial_closing_signed_for_channel(
+									funded_chan,
+									cp_id,
+									&peer_state.latest_features,
+									pending_msg_events,
+									&mut peer_state.closed_channel_monitor_update_ids,
+									&mut peer_state.in_flight_monitor_updates,
+									&mut has_update,
+									&mut handle_errors,
+								)
+							}
+						},
 						None => true, // Retain unfunded channels if present.
 					}
 				});

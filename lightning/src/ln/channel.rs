@@ -11132,6 +11132,40 @@ where
 		Ok(())
 	}
 
+	pub fn maybe_propose_closing_complete<F: FeeEstimator, L: Logger>(
+		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+	) -> Result<(Option<msgs::ClosingComplete>, Option<ShutdownResult>), ChannelError> {
+		// The sender of `closing_complete` (aka. "the closer"):
+		//  - MUST set `fee_satoshis` to a fee less than or equal to its outstanding balance, rounded down to whole satoshis.
+		//  - MUST set `fee_satoshis` so that at least one output is not dust.
+		//  - MUST set `closer_scriptpubkey` to its desired output script.
+		//  - MUST set `closee_scriptpubkey` to the last script it received from its peer (from `closing_complete` or from the initial `shutdown`).
+		//  - MUST set `locktime` to the desired `nLockTime` of the closing transaction.
+		//  - If the local outstanding balance (in millisatoshi) is less than the remote outstanding balance:
+		//    - MUST NOT set `closer_output_only`.
+		//    - MUST set `closee_output_only` if the local output amount is dust.
+		//    - MAY set `closee_output_only` if it considers the local output amount uneconomical AND its `closer_scriptpubkey` is not `OP_RETURN`.
+		//  - Otherwise (not lesser amount, cannot remove its own output):
+		//    - MUST NOT set `closee_output_only`.
+		//    - If it considers the local output amount uneconomical:
+		//      - MAY send a `closer_scriptpubkey` that is a valid `OP_RETURN` script.
+		//      - If it does, the output value MUST be set to zero so that all funds go to fees, as specified in [BOLT #3](03-transactions.md#closing-transaction).
+		//    - If the closee's output amount is dust:
+		//      - MUST set `closer_output_only`.
+		//      - MUST NOT set `closer_and_closee_outputs`.
+		//    - Otherwise:
+		//      - MUST set both `closer_output_only` and `closer_and_closee_outputs`.
+		//  - MUST generate its closing transaction as specified in [BOLT #3](03-transactions.md#closing-transaction).
+		//  - MUST set `signature` fields as valid signature using its `funding_pubkey` of:
+		//    - `closer_output_only`: closing transaction with only the local ("closer") output.
+		//    - `closee_output_only`: closing transaction with only the remote ("closee") output.
+		//    - `closer_and_closee_outputs`: closing transaction with both the closer and closee outputs.
+		//  - If it wants to send another `closing_complete` (e.g. with a different `fee_satoshis` or `closer_scriptpubkey`):
+		//    - MUST wait until it has received `closing_sig` first.
+		//    - SHOULD close the connection if it doesn't receive `closing_sig`.
+		unimplemented!("Sending initial ClosingComplete is not implemented");
+	}
+
 	pub fn maybe_propose_closing_signed<F: FeeEstimator, L: Logger>(
 		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, our_features: &InitFeatures,
 		their_features: &InitFeatures, logger: &L,
