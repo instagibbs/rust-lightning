@@ -349,8 +349,10 @@ pub fn build_commitment_secret(commitment_seed: &[u8; 32], idx: u64) -> [u8; 32]
 }
 
 /// Build a closing transaction
-#[rustfmt::skip]
-pub fn build_closing_transaction(to_holder_value_sat: Amount, to_counterparty_value_sat: Amount, to_holder_script: ScriptBuf, to_counterparty_script: ScriptBuf, funding_outpoint: OutPoint) -> Transaction {
+pub fn build_closing_transaction(
+	to_holder_value_sat: Amount, to_counterparty_value_sat: Amount, to_holder_script: ScriptBuf,
+	to_counterparty_script: ScriptBuf, funding_outpoint: OutPoint,
+) -> Transaction {
 	let txins = {
 		let ins: Vec<TxIn> = vec![TxIn {
 			previous_output: funding_outpoint,
@@ -364,32 +366,24 @@ pub fn build_closing_transaction(to_holder_value_sat: Amount, to_counterparty_va
 	let mut txouts: Vec<(TxOut, ())> = Vec::new();
 
 	if to_counterparty_value_sat > Amount::ZERO {
-		txouts.push((TxOut {
-			script_pubkey: to_counterparty_script,
-			value: to_counterparty_value_sat
-		}, ()));
+		txouts.push((
+			TxOut { script_pubkey: to_counterparty_script, value: to_counterparty_value_sat },
+			(),
+		));
 	}
 
 	if to_holder_value_sat > Amount::ZERO {
-		txouts.push((TxOut {
-			script_pubkey: to_holder_script,
-			value: to_holder_value_sat
-		}, ()));
+		txouts.push((TxOut { script_pubkey: to_holder_script, value: to_holder_value_sat }, ()));
 	}
 
-	transaction_utils::sort_outputs(&mut txouts, |_, _| { cmp::Ordering::Equal }); // Ordering doesnt matter if they used our pubkey...
+	transaction_utils::sort_outputs(&mut txouts, |_, _| cmp::Ordering::Equal); // Ordering doesnt matter if they used our pubkey...
 
 	let mut outputs: Vec<TxOut> = Vec::new();
 	for out in txouts.drain(..) {
 		outputs.push(out.0);
 	}
 
-	Transaction {
-		version: Version::TWO,
-		lock_time: LockTime::ZERO,
-		input: txins,
-		output: outputs,
-	}
+	Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: txins, output: outputs }
 }
 
 /// Implements the per-commitment secret storage scheme from
@@ -1474,27 +1468,25 @@ pub struct ClosingTransaction {
 
 impl ClosingTransaction {
 	/// Construct an object of the class
-	#[rustfmt::skip]
 	pub fn new(
-		to_holder_value_sat: u64,
-		to_counterparty_value_sat: u64,
-		to_holder_script: ScriptBuf,
-		to_counterparty_script: ScriptBuf,
-		funding_outpoint: OutPoint,
+		to_holder_value_sat: u64, to_counterparty_value_sat: u64, to_holder_script: ScriptBuf,
+		to_counterparty_script: ScriptBuf, funding_outpoint: OutPoint,
 	) -> Self {
 		let to_holder_value_sat = Amount::from_sat(to_holder_value_sat);
 		let to_counterparty_value_sat = Amount::from_sat(to_counterparty_value_sat);
 		let built = build_closing_transaction(
-			to_holder_value_sat, to_counterparty_value_sat,
-			to_holder_script.clone(), to_counterparty_script.clone(),
-			funding_outpoint
+			to_holder_value_sat,
+			to_counterparty_value_sat,
+			to_holder_script.clone(),
+			to_counterparty_script.clone(),
+			funding_outpoint,
 		);
 		ClosingTransaction {
 			to_holder_value_sat,
 			to_counterparty_value_sat,
 			to_holder_script,
 			to_counterparty_script,
-			built
+			built,
 		}
 	}
 
@@ -1514,15 +1506,16 @@ impl ClosingTransaction {
 	///
 	/// An external validating signer must call this method before signing
 	/// or using the built transaction.
-	#[rustfmt::skip]
 	pub fn verify(&self, funding_outpoint: OutPoint) -> Result<TrustedClosingTransaction<'_>, ()> {
 		let built = build_closing_transaction(
-			self.to_holder_value_sat, self.to_counterparty_value_sat,
-			self.to_holder_script.clone(), self.to_counterparty_script.clone(),
-			funding_outpoint
+			self.to_holder_value_sat,
+			self.to_counterparty_value_sat,
+			self.to_holder_script.clone(),
+			self.to_counterparty_script.clone(),
+			funding_outpoint,
 		);
 		if self.built != built {
-			return Err(())
+			return Err(());
 		}
 		Ok(TrustedClosingTransaction { inner: self })
 	}
@@ -1561,8 +1554,9 @@ pub struct TrustedClosingTransaction<'a> {
 impl<'a> Deref for TrustedClosingTransaction<'a> {
 	type Target = ClosingTransaction;
 
-	#[rustfmt::skip]
-	fn deref(&self) -> &Self::Target { self.inner }
+	fn deref(&self) -> &Self::Target {
+		self.inner
+	}
 }
 
 impl<'a> TrustedClosingTransaction<'a> {
@@ -1574,9 +1568,17 @@ impl<'a> TrustedClosingTransaction<'a> {
 	/// Get the SIGHASH_ALL sighash value of the transaction.
 	///
 	/// This can be used to verify a signature.
-	#[rustfmt::skip]
-	pub fn get_sighash_all(&self, funding_redeemscript: &Script, channel_value_satoshis: u64) -> Message {
-		let sighash = &sighash::SighashCache::new(&self.inner.built).p2wsh_signature_hash(0, funding_redeemscript, Amount::from_sat(channel_value_satoshis), EcdsaSighashType::All).unwrap()[..];
+	pub fn get_sighash_all(
+		&self, funding_redeemscript: &Script, channel_value_satoshis: u64,
+	) -> Message {
+		let sighash = &sighash::SighashCache::new(&self.inner.built)
+			.p2wsh_signature_hash(
+				0,
+				funding_redeemscript,
+				Amount::from_sat(channel_value_satoshis),
+				EcdsaSighashType::All,
+			)
+			.unwrap()[..];
 		hash_to_message!(sighash)
 	}
 
