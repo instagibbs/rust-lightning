@@ -3450,9 +3450,11 @@ pub(super) struct ChannelContext<SP: SignerProvider> {
 	/// `revoke_and_ack`, we remove all knowledge of said HTLC (or fee update). However, the latest
 	/// local commitment transaction that we can broadcast still contains the HTLC (or old fee)
 	/// until we receive a further `commitment_signed`. Thus we are not eligible for initiating the
-	/// `closing_signed` negotiation if we're expecting a counterparty `commitment_signed`.
+	/// `closing_signed`/`closing_complete` negotiation if we're expecting a counterparty
+	/// `commitment_signed`.
 	///
-	/// To ensure we don't send a `closing_signed` too early, we track this state here, waiting
+	/// To ensure we don't send a `closing_signed`/`closing_complete` too early, we track this
+	/// state here, waiting
 	/// until we see a `commitment_signed` before doing so.
 	///
 	/// We don't bother to persist this - we anticipate this state won't last longer than a few
@@ -11108,10 +11110,13 @@ where
 		self.context.closing_fee_limits.clone().unwrap()
 	}
 
-	/// Returns true if we're ready to commence the closing_signed negotiation phase. This is true
-	/// after both sides have exchanged a `shutdown` message and all HTLCs have been drained. At
-	/// this point if we're the funder we should send the initial closing_signed, and in any case
-	/// shutdown should complete within a reasonable timeframe.
+	/// Returns true if we're ready to commence the closing_complete/closing_signed negotiation
+	/// phase. This is true after both sides have exchanged a `shutdown` message and all HTLCs have
+	/// been drained. At this point if we're the funder we should send the initial closing_signed,
+	/// and in any case shutdown should complete within a reasonable timeframe.
+	///
+	/// For `option_simple_close` channels any of the parties might send `closing_complete` at this
+	/// point.
 	fn closing_negotiation_ready(&self) -> bool {
 		self.context.closing_negotiation_ready()
 	}
@@ -11135,35 +11140,158 @@ where
 	pub fn maybe_propose_closing_complete<F: FeeEstimator, L: Logger>(
 		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<(Option<msgs::ClosingComplete>, Option<ShutdownResult>), ChannelError> {
-		// The sender of `closing_complete` (aka. "the closer"):
-		//  - MUST set `fee_satoshis` to a fee less than or equal to its outstanding balance, rounded down to whole satoshis.
-		//  - MUST set `fee_satoshis` so that at least one output is not dust.
-		//  - MUST set `closer_scriptpubkey` to its desired output script.
-		//  - MUST set `closee_scriptpubkey` to the last script it received from its peer (from `closing_complete` or from the initial `shutdown`).
-		//  - MUST set `locktime` to the desired `nLockTime` of the closing transaction.
-		//  - If the local outstanding balance (in millisatoshi) is less than the remote outstanding balance:
-		//    - MUST NOT set `closer_output_only`.
-		//    - MUST set `closee_output_only` if the local output amount is dust.
-		//    - MAY set `closee_output_only` if it considers the local output amount uneconomical AND its `closer_scriptpubkey` is not `OP_RETURN`.
-		//  - Otherwise (not lesser amount, cannot remove its own output):
-		//    - MUST NOT set `closee_output_only`.
-		//    - If it considers the local output amount uneconomical:
-		//      - MAY send a `closer_scriptpubkey` that is a valid `OP_RETURN` script.
-		//      - If it does, the output value MUST be set to zero so that all funds go to fees, as specified in [BOLT #3](03-transactions.md#closing-transaction).
-		//    - If the closee's output amount is dust:
-		//      - MUST set `closer_output_only`.
-		//      - MUST NOT set `closer_and_closee_outputs`.
-		//    - Otherwise:
-		//      - MUST set both `closer_output_only` and `closer_and_closee_outputs`.
-		//  - MUST generate its closing transaction as specified in [BOLT #3](03-transactions.md#closing-transaction).
-		//  - MUST set `signature` fields as valid signature using its `funding_pubkey` of:
-		//    - `closer_output_only`: closing transaction with only the local ("closer") output.
-		//    - `closee_output_only`: closing transaction with only the remote ("closee") output.
-		//    - `closer_and_closee_outputs`: closing transaction with both the closer and closee outputs.
-		//  - If it wants to send another `closing_complete` (e.g. with a different `fee_satoshis` or `closer_scriptpubkey`):
-		//    - MUST wait until it has received `closing_sig` first.
-		//    - SHOULD close the connection if it doesn't receive `closing_sig`.
-		unimplemented!("Sending initial ClosingComplete is not implemented");
+		// If we're waiting on a monitor persistence, that implies we're also waiting to send some
+		// message to our counterparty (probably a `revoke_and_ack`). In such a case, we shouldn't
+		// initiate `closing_signed` negotiation until we're clear of all pending messages. Note
+		// that closing_negotiation_ready checks this case (as well as a few others).
+		if !self.closing_negotiation_ready() {
+			return Ok((None, None));
+		}
+		// If we already sent a closing_complete and are waiting for a closing_sig, don't
+		// send another one yet.
+		if self
+			.context
+			.v2_closing_negotiation
+			.as_ref()
+			.map_or(false, |n| n.last_sent_closing_complete.is_some())
+		{
+			return Ok((None, None));
+		}
+
+		// If we're waiting on a counterparty `commitment_signed` to clear some updates from our
+		// local commitment transaction, we can't yet initiate `closing_complete` negotiation.
+		if self.context.expecting_peer_commitment_signed {
+			return Ok((None, None));
+		}
+
+		let (our_min_fee, _our_max_fee) = self.calculate_closing_fee_limits(fee_estimator);
+
+		let lock_time = LockTime::ZERO;
+
+		let (
+			closing_tx,
+			total_fee_satoshis,
+			set_closer_output_only,
+			set_closee_output_only,
+			set_closer_and_closee_outputs,
+		) = self.build_v2_closing_transaction(our_min_fee, lock_time)?;
+
+		let mut closer_output_only_sig = None;
+		let mut closee_output_only_sig = None;
+		let mut closer_and_closee_outputs_sig = None;
+
+		if set_closer_output_only && set_closer_and_closee_outputs {
+			// Need signatures for both closer-only and both-outputs variants.
+			// The returned tx is the both-outputs variant, sign it first.
+			closer_and_closee_outputs_sig = self
+				.context
+				.holder_signer
+				.sign_closing_transaction(
+					&self.funding.channel_transaction_parameters,
+					&closing_tx,
+					&self.context.secp_ctx,
+				)
+				.ok();
+			if closer_and_closee_outputs_sig.is_none() {
+				return Ok((None, None));
+			}
+
+			// Build and sign the closer-only variant.
+			let (value_to_closer, to_closer_script) = match &closing_tx {
+				ClosingTransaction::V2 {
+					outputs:
+						ClosingTransactionV2Outputs::CloserAndCloseeOutputs {
+							value_to_closer,
+							to_closer_script,
+							..
+						},
+					..
+				} => (*value_to_closer, to_closer_script.clone()),
+				_ => unreachable!(
+					"build_v2_closing_transaction returns CloserAndCloseeOutputs \
+					 when both closer_output_only and closer_and_closee_outputs are set"
+				),
+			};
+			let closer_only_outputs =
+				ClosingTransactionV2Outputs::CloserOutputOnly { value_to_closer, to_closer_script };
+			let funding_outpoint = self.funding_outpoint().into_bitcoin_outpoint();
+			let closer_only_tx =
+				ClosingTransaction::new_v2(closer_only_outputs, funding_outpoint, lock_time);
+
+			closer_output_only_sig = self
+				.context
+				.holder_signer
+				.sign_closing_transaction(
+					&self.funding.channel_transaction_parameters,
+					&closer_only_tx,
+					&self.context.secp_ctx,
+				)
+				.ok();
+			if closer_output_only_sig.is_none() {
+				return Ok((None, None));
+			}
+		} else {
+			// Only one variant needed - sign the returned tx.
+			let sig = self
+				.context
+				.holder_signer
+				.sign_closing_transaction(
+					&self.funding.channel_transaction_parameters,
+					&closing_tx,
+					&self.context.secp_ctx,
+				)
+				.ok();
+			if sig.is_none() {
+				return Ok((None, None));
+			}
+			let sig = sig.unwrap();
+
+			if set_closer_output_only {
+				closer_output_only_sig = Some(sig);
+			} else if set_closee_output_only {
+				closee_output_only_sig = Some(sig);
+			} else if set_closer_and_closee_outputs {
+				closer_and_closee_outputs_sig = Some(sig);
+			}
+		}
+
+		// Use the script from the closing transaction for closer_scriptpubkey, which may
+		// be OP_RETURN when the closer considers their output uneconomical.
+		let closer_scriptpubkey = match &closing_tx {
+			ClosingTransaction::V2 { outputs, .. } => match outputs {
+				ClosingTransactionV2Outputs::CloserOutputOnly { to_closer_script, .. }
+				| ClosingTransactionV2Outputs::CloserAndCloseeOutputs {
+					to_closer_script, ..
+				} => to_closer_script.clone(),
+				ClosingTransactionV2Outputs::CloseeOutputOnly { .. } => {
+					self.get_closing_scriptpubkey()
+				},
+			},
+			_ => unreachable!("build_v2_closing_transaction always returns V2"),
+		};
+		let closee_scriptpubkey = self.context.counterparty_shutdown_scriptpubkey.clone().unwrap();
+
+		let msg = msgs::ClosingComplete {
+			channel_id: self.context.channel_id,
+			closer_scriptpubkey,
+			closee_scriptpubkey,
+			fee_satoshis: total_fee_satoshis,
+			locktime: lock_time.to_consensus_u32(),
+			closer_output_only: closer_output_only_sig,
+			closee_output_only: closee_output_only_sig,
+			closer_and_closee_outputs: closer_and_closee_outputs_sig,
+		};
+
+		log_trace!(logger, "Proposing closing_complete with fee {} sat", total_fee_satoshis);
+
+		let v2_closing_negotiation =
+			self.context.v2_closing_negotiation.get_or_insert(V2ClosingNegotiation {
+				last_sent_closing_complete: None,
+				closing_sig_sent: false,
+			});
+		v2_closing_negotiation.last_sent_closing_complete = Some(msg.clone());
+
+		Ok((Some(msg), None))
 	}
 
 	pub fn maybe_propose_closing_signed<F: FeeEstimator, L: Logger>(
