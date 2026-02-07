@@ -1695,12 +1695,22 @@ impl<'a> TrustedClosingTransaction<'a> {
 
 	/// Sign a transaction, either because we are counter-signing the counterparty's transaction or
 	/// because we are about to broadcast a holder transaction.
-	pub fn sign<T: secp256k1::Signing>(
+	pub fn sign<T: secp256k1::Signing, ES: EntropySource>(
 		&self, funding_key: &SecretKey, funding_redeemscript: &Script, channel_value_satoshis: u64,
-		secp_ctx: &Secp256k1<T>,
+		secp_ctx: &Secp256k1<T>, entropy_source: &ES,
 	) -> Signature {
 		let sighash = self.get_sighash_all(funding_redeemscript, channel_value_satoshis);
-		sign(secp_ctx, &sighash, funding_key)
+		match self.inner {
+			ClosingTransaction::V1 { .. } => {
+				// TODO, for simplicity we should be good to switch to sign_with_aux_rand here,
+				// too. For now we keep this in place as otherwise some tests leaning on
+				// static signatures break.
+				sign(secp_ctx, &sighash, &funding_key)
+			},
+			ClosingTransaction::V2 { .. } => {
+				sign_with_aux_rand(secp_ctx, &sighash, &funding_key, entropy_source)
+			},
+		}
 	}
 }
 

@@ -1891,11 +1891,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 			&channel_parameters.counterparty_pubkeys().expect(MISSING_PARAMS_ERR).funding_pubkey;
 		let channel_funding_redeemscript =
 			make_funding_redeemscript(&funding_pubkey, counterparty_funding_key);
-		Ok(closing_tx.trust().sign(
+		let trusted_tx = closing_tx.trust();
+		Ok(trusted_tx.sign(
 			&funding_key,
 			&channel_funding_redeemscript,
 			channel_parameters.channel_value_satoshis,
 			secp_ctx,
+			&self,
 		))
 	}
 
