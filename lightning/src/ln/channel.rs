@@ -97,6 +97,7 @@ use crate::sync::Mutex;
 use core::time::Duration;
 use core::{cmp, fmt, mem};
 
+use super::chan_utils::ClosingTransactionV2Outputs;
 use super::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 
 #[cfg(any(test, feature = "_test_utils"))]
@@ -7529,7 +7530,7 @@ where
 	}
 
 	#[inline]
-	fn build_closing_transaction(
+	fn build_v1_closing_transaction(
 		&self, proposed_total_fee_satoshis: u64, skip_remote_output: bool,
 	) -> Result<(ClosingTransaction, u64), ChannelError> {
 		assert!(self.context.pending_inbound_htlcs.is_empty());
@@ -7581,7 +7582,7 @@ where
 			self.context.counterparty_shutdown_scriptpubkey.clone().unwrap();
 		let funding_outpoint = self.funding_outpoint().into_bitcoin_outpoint();
 
-		let closing_transaction = ClosingTransaction::new(
+		let closing_transaction = ClosingTransaction::new_v1(
 			value_to_holder as u64,
 			value_to_counterparty as u64,
 			holder_shutdown_script,
@@ -7589,6 +7590,142 @@ where
 			funding_outpoint,
 		);
 		Ok((closing_transaction, total_fee_satoshis))
+	}
+
+	/// Builds a v2 closing transaction and determines which signature variant(s) are required
+	/// per the `option_simple_close` spec rules.
+	///
+	/// Returns `(closing_tx, fee, set_closer_output_only, set_closee_output_only,
+	/// set_closer_and_closee_outputs)`. The returned `ClosingTransaction` corresponds to the
+	/// "richest" variant selected (i.e., `CloserAndCloseeOutputs` when both that and
+	/// `CloserOutputOnly` are required). The caller is responsible for building additional
+	/// variant transactions from the channel context when multiple bools are set.
+	#[inline]
+	fn build_v2_closing_transaction(
+		&self, mut total_fee_satoshis: u64, lock_time: LockTime,
+	) -> Result<(ClosingTransaction, u64, bool, bool, bool), ChannelError> {
+		assert!(self.context.pending_inbound_htlcs.is_empty());
+		assert!(self.context.pending_outbound_htlcs.is_empty());
+		assert!(self.context.pending_update_fee.is_none());
+
+		let outputs;
+		let mut set_closer_output_only = false;
+		let mut set_closee_output_only = false;
+		let mut set_closer_and_closee_outputs = false;
+
+		let closer_balance_msat = self.funding.value_to_self_msat;
+		let closee_balance_msat =
+			(self.funding.get_value_satoshis() * 1000).saturating_sub(closer_balance_msat);
+
+		assert!(self.context.shutdown_scriptpubkey.is_some());
+		assert!(self.context.counterparty_shutdown_scriptpubkey.is_some());
+
+		//  - If the local outstanding balance (in millisatoshi) is less than the remote outstanding balance:
+		if closer_balance_msat < closee_balance_msat {
+			// - MUST NOT set `closer_output_only`.
+			if closer_balance_msat <= self.context.holder_dust_limit_satoshis * 1000 {
+				// - MUST set `closee_output_only` if the local output amount is dust.
+				set_closee_output_only = true;
+				// The closer's entire balance goes to fees (no closer output).
+				total_fee_satoshis = closer_balance_msat / 1000;
+				let value_to_closee = Amount::from_sat(closee_balance_msat / 1000);
+				let to_closee_script =
+					self.context.counterparty_shutdown_scriptpubkey.clone().unwrap();
+				outputs = ClosingTransactionV2Outputs::CloseeOutputOnly {
+					value_to_closee,
+					to_closee_script,
+				};
+			} else {
+				// - MAY set `closee_output_only` if it considers the local output amount
+				// uneconomical AND its `closer_scriptpubkey` is not `OP_RETURN`.
+				if total_fee_satoshis * 1000 >= closer_balance_msat {
+					set_closee_output_only = true;
+					// The closer's entire balance goes to fees (no closer output).
+					total_fee_satoshis = closer_balance_msat / 1000;
+					let value_to_closee = Amount::from_sat(closee_balance_msat / 1000);
+					let to_closee_script =
+						self.context.counterparty_shutdown_scriptpubkey.clone().unwrap();
+					outputs = ClosingTransactionV2Outputs::CloseeOutputOnly {
+						value_to_closee,
+						to_closee_script,
+					};
+				} else {
+					set_closer_and_closee_outputs = true;
+					let tmp_value_to_closer_sat: i64 =
+						(closer_balance_msat as i64) / 1000 - total_fee_satoshis as i64;
+					if tmp_value_to_closer_sat < 0 {
+						total_fee_satoshis += (-tmp_value_to_closer_sat) as u64;
+					}
+					let value_to_closer = Amount::from_sat(tmp_value_to_closer_sat as u64);
+					let to_closer_script = self.get_closing_scriptpubkey();
+
+					let value_to_closee = Amount::from_sat(closee_balance_msat / 1000);
+					let to_closee_script =
+						self.context.counterparty_shutdown_scriptpubkey.clone().unwrap();
+					outputs = ClosingTransactionV2Outputs::CloserAndCloseeOutputs {
+						value_to_closer,
+						to_closer_script,
+						value_to_closee,
+						to_closee_script,
+					}
+				}
+			}
+		} else {
+			// - Otherwise (not lesser amount, cannot remove its own output):
+			//   - MUST NOT set `closee_output_only`.
+			//   - If it considers the local output amount uneconomical:
+			let (value_to_closer, to_closer_script) =
+				if total_fee_satoshis * 1000 >= closer_balance_msat {
+					// - MAY send a `closer_scriptpubkey` that is a valid `OP_RETURN` script.
+					// - If it does, the output value MUST be set to zero so that all funds go to fees, as specified in [BOLT #3](03-transactions.md#closing-transaction).
+					total_fee_satoshis = closer_balance_msat / 1000 as u64;
+					let to_closer_script =
+						ShutdownScript::new_op_return([0u8; 6]).unwrap().into_inner();
+					(Amount::ZERO, to_closer_script)
+				} else {
+					let value_to_closer =
+						Amount::from_sat(closer_balance_msat / 1000 - total_fee_satoshis);
+					debug_assert!(value_to_closer > Amount::ZERO);
+					let to_closer_script = self.get_closing_scriptpubkey();
+					(value_to_closer, to_closer_script)
+				};
+
+			if closee_balance_msat <= self.context.counterparty_dust_limit_satoshis * 1000 {
+				// - If the closee's output amount is dust:
+				//   - MUST set `closer_output_only`.
+				//   - MUST NOT set `closer_and_closee_outputs`.
+				set_closer_output_only = true;
+				outputs = ClosingTransactionV2Outputs::CloserOutputOnly {
+					value_to_closer,
+					to_closer_script,
+				}
+			} else {
+				//   - Otherwise:
+				//     - MUST set both `closer_output_only` and `closer_and_closee_outputs`.
+				set_closer_output_only = true;
+				set_closer_and_closee_outputs = true;
+				let value_to_closee = Amount::from_sat(closee_balance_msat / 1000);
+				let to_closee_script =
+					self.context.counterparty_shutdown_scriptpubkey.clone().unwrap();
+				outputs = ClosingTransactionV2Outputs::CloserAndCloseeOutputs {
+					value_to_closer,
+					to_closer_script,
+					value_to_closee,
+					to_closee_script,
+				}
+			}
+		}
+
+		let funding_outpoint = self.funding_outpoint().into_bitcoin_outpoint();
+		let closing_transaction = ClosingTransaction::new_v2(outputs, funding_outpoint, lock_time);
+
+		Ok((
+			closing_transaction,
+			total_fee_satoshis,
+			set_closer_output_only,
+			set_closee_output_only,
+			set_closer_and_closee_outputs,
+		))
 	}
 
 	pub fn funding_outpoint(&self) -> OutPoint {
@@ -10228,7 +10365,7 @@ where
 			if let Some((fee, skip_remote_output, fee_range, holder_sig)) = self.context.last_sent_closing_fee.clone() {
 				debug_assert!(holder_sig.is_none());
 				log_trace!(logger, "Attempting to generate pending closing_signed...");
-				let closing_transaction_result = self.build_closing_transaction(fee, skip_remote_output);
+				let closing_transaction_result = self.build_v1_closing_transaction(fee, skip_remote_output);
 				match closing_transaction_result {
 					Ok((closing_tx, fee)) => {
 						let closing_signed = self.get_closing_signed_msg(&closing_tx, skip_remote_output,
@@ -11002,7 +11139,7 @@ where
 
 		assert!(self.context.shutdown_scriptpubkey.is_some());
 		let (closing_tx, total_fee_satoshis) =
-			self.build_closing_transaction(our_min_fee, false)?;
+			self.build_v1_closing_transaction(our_min_fee, false)?;
 		log_trace!(logger, "Proposing initial closing_signed for our counterparty with a fee range of {}-{} sat (with initial proposal {} sats)",
 			our_min_fee, our_max_fee, total_fee_satoshis);
 
@@ -11318,7 +11455,7 @@ where
 			));
 		}
 		if msg.fee_satoshis > TOTAL_BITCOIN_SUPPLY_SATOSHIS {
-			// this is required to stop potential overflow in build_closing_transaction
+			// this is required to stop potential overflow in build_v1_closing_transaction
 			return Err(ChannelError::close(
 				"Remote tried to send us a closing tx with > 21 million BTC fee".to_owned(),
 			));
@@ -11336,7 +11473,7 @@ where
 		let funding_redeemscript = self.funding.get_funding_redeemscript();
 		let mut skip_remote_output = false;
 		let (mut closing_tx, used_total_fee) =
-			self.build_closing_transaction(msg.fee_satoshis, skip_remote_output)?;
+			self.build_v1_closing_transaction(msg.fee_satoshis, skip_remote_output)?;
 		if used_total_fee != msg.fee_satoshis {
 			return Err(ChannelError::close(format!("Remote sent us a closing_signed with a fee other than the value they can claim. Fee in message: {}. Actual closing tx fee: {}", msg.fee_satoshis, used_total_fee)));
 		}
@@ -11355,7 +11492,7 @@ where
 				// limits, so check for that case by re-checking the signature here.
 				skip_remote_output = true;
 				closing_tx =
-					self.build_closing_transaction(msg.fee_satoshis, skip_remote_output)?.0;
+					self.build_v1_closing_transaction(msg.fee_satoshis, skip_remote_output)?.0;
 				let sighash = closing_tx
 					.trust()
 					.get_sighash_all(&funding_redeemscript, self.funding.get_value_satoshis());
@@ -11396,7 +11533,7 @@ where
 					(closing_tx, $new_fee)
 				} else {
 					skip_remote_output = false;
-					self.build_closing_transaction($new_fee, skip_remote_output)?
+					self.build_v1_closing_transaction($new_fee, skip_remote_output)?
 				};
 
 				let closing_signed = self.get_closing_signed_msg(

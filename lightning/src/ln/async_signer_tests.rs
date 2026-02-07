@@ -1235,7 +1235,7 @@ fn do_test_closing_signed(extra_closing_signed: bool, reconnect: bool) {
 			let holder_script = nodes[0].keys_manager.get_shutdown_scriptpubkey().unwrap();
 			let counterparty_script = nodes[1].keys_manager.get_shutdown_scriptpubkey().unwrap();
 			let funding_outpoint = bitcoin::OutPoint { txid: funding_tx.compute_txid(), vout: 0 };
-			let closing_tx_2 = ClosingTransaction::new(
+			let closing_tx_2 = ClosingTransaction::new_v1(
 				50000,
 				0,
 				holder_script.into(),

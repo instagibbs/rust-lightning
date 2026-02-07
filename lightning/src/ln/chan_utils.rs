@@ -348,9 +348,9 @@ pub fn build_commitment_secret(commitment_seed: &[u8; 32], idx: u64) -> [u8; 32]
 	res
 }
 
-/// Build a closing transaction
-pub fn build_closing_transaction(
-	to_holder_value_sat: Amount, to_counterparty_value_sat: Amount, to_holder_script: ScriptBuf,
+/// Build a V1 closing transaction.
+pub fn build_v1_closing_transaction(
+	to_holder_value: Amount, to_counterparty_value: Amount, to_holder_script: ScriptBuf,
 	to_counterparty_script: ScriptBuf, funding_outpoint: OutPoint,
 ) -> Transaction {
 	let txins = {
@@ -365,15 +365,15 @@ pub fn build_closing_transaction(
 
 	let mut txouts: Vec<(TxOut, ())> = Vec::new();
 
-	if to_counterparty_value_sat > Amount::ZERO {
+	if to_counterparty_value > Amount::ZERO {
 		txouts.push((
-			TxOut { script_pubkey: to_counterparty_script, value: to_counterparty_value_sat },
+			TxOut { script_pubkey: to_counterparty_script, value: to_counterparty_value },
 			(),
 		));
 	}
 
-	if to_holder_value_sat > Amount::ZERO {
-		txouts.push((TxOut { script_pubkey: to_holder_script, value: to_holder_value_sat }, ()));
+	if to_holder_value > Amount::ZERO {
+		txouts.push((TxOut { script_pubkey: to_holder_script, value: to_holder_value }, ()));
 	}
 
 	transaction_utils::sort_outputs(&mut txouts, |_, _| cmp::Ordering::Equal); // Ordering doesnt matter if they used our pubkey...
@@ -384,6 +384,63 @@ pub fn build_closing_transaction(
 	}
 
 	Transaction { version: Version::TWO, lock_time: LockTime::ZERO, input: txins, output: outputs }
+}
+
+/// Build a V2 / `option_simple_close` closing transaction
+pub fn build_v2_closing_transaction(
+	outputs: ClosingTransactionV2Outputs, funding_outpoint: OutPoint, lock_time: LockTime,
+) -> Transaction {
+	// The v2 closing transaction input sequence as specified in BOLT 3.
+	const CLOSING_TX_V2_SEQUENCE: Sequence = Sequence(0xFFFFFFFD);
+
+	let txins = {
+		let ins: Vec<TxIn> = vec![TxIn {
+			previous_output: funding_outpoint,
+			script_sig: ScriptBuf::new(),
+			sequence: CLOSING_TX_V2_SEQUENCE,
+			witness: Witness::new(),
+		}];
+		ins
+	};
+
+	let mut txouts: Vec<(TxOut, ())> = Vec::new();
+
+	match outputs {
+		ClosingTransactionV2Outputs::CloserOutputOnly { value_to_closer, to_closer_script } => {
+			debug_assert!(!to_closer_script.is_op_return());
+			debug_assert!(value_to_closer > Amount::ZERO);
+			txouts.push((TxOut { script_pubkey: to_closer_script, value: value_to_closer }, ()));
+		},
+		ClosingTransactionV2Outputs::CloseeOutputOnly { value_to_closee, to_closee_script } => {
+			debug_assert!(!to_closee_script.is_op_return());
+			debug_assert!(value_to_closee > Amount::ZERO);
+			txouts.push((TxOut { script_pubkey: to_closee_script, value: value_to_closee }, ()));
+		},
+		ClosingTransactionV2Outputs::CloserAndCloseeOutputs {
+			value_to_closer,
+			to_closer_script,
+			value_to_closee,
+			to_closee_script,
+		} => {
+			if to_closer_script.is_op_return() {
+				debug_assert_eq!(value_to_closer, Amount::ZERO);
+			}
+			if to_closee_script.is_op_return() {
+				debug_assert_eq!(value_to_closee, Amount::ZERO);
+			}
+			txouts.push((TxOut { script_pubkey: to_closer_script, value: value_to_closer }, ()));
+			txouts.push((TxOut { script_pubkey: to_closee_script, value: value_to_closee }, ()));
+		},
+	}
+
+	transaction_utils::sort_outputs(&mut txouts, |_, _| cmp::Ordering::Equal); // Ordering doesnt matter if they used our pubkey...
+
+	let mut outputs: Vec<TxOut> = Vec::new();
+	for out in txouts.drain(..) {
+		outputs.push(out.0);
+	}
+
+	Transaction { version: Version::TWO, lock_time, input: txins, output: outputs }
 }
 
 /// Implements the per-commitment secret storage scheme from
@@ -1452,42 +1509,98 @@ impl BuiltCommitmentTransaction {
 	}
 }
 
+/// Indicates which outputs we're including and which are skipped.
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub enum ClosingTransactionV2Outputs {
+	/// We only include our ouput, skip the closee output.
+	CloserOutputOnly {
+		/// The value sent to the closer.
+		value_to_closer: Amount,
+		/// The destination of the closer's output.
+		to_closer_script: ScriptBuf,
+	},
+	/// We only include the closee's ouput, skip ours.
+	CloseeOutputOnly {
+		/// The value sent to the closee.
+		value_to_closee: Amount,
+		/// The destination of the closee's output.
+		to_closee_script: ScriptBuf,
+	},
+	/// We both outputs.
+	CloserAndCloseeOutputs {
+		/// The value sent to the closer.
+		value_to_closer: Amount,
+		/// The destination of the closer's output, or `OP_RETURN` in which case `value_to_closer` must 0.
+		to_closer_script: ScriptBuf,
+		/// The value sent to the closee.
+		value_to_closee: Amount,
+		/// The destination of the closee's output, or `OP_RETURN` in which case `value_to_closee` must 0.
+		to_closee_script: ScriptBuf,
+	},
+}
+
 /// This class tracks the per-transaction information needed to build a closing transaction and will
 /// actually build it and sign.
 ///
 /// This class can be used inside a signer implementation to generate a signature given the relevant
 /// secret key.
 #[derive(Clone, Hash, PartialEq, Eq)]
-pub struct ClosingTransaction {
-	to_holder_value_sat: Amount,
-	to_counterparty_value_sat: Amount,
-	to_holder_script: ScriptBuf,
-	to_counterparty_script: ScriptBuf,
-	built: Transaction,
+pub enum ClosingTransaction {
+	/// A v1 closing transaction negotiated via `closing_signed`.
+	V1 {
+		/// The value to be sent to the holder, or zero if the output will be omitted.
+		to_holder_value: Amount,
+		/// The value to be sent to the counterparty, or zero if the output will be omitted.
+		to_counterparty_value: Amount,
+		/// The destination of the holder's output.
+		to_holder_script: ScriptBuf,
+		/// The destination of the counterparty's output.
+		to_counterparty_script: ScriptBuf,
+		/// The pre-built transaction.
+		built: Transaction,
+	},
+	/// A v2 closing transaction negotiated via `closing_complete`/`closing_sig`
+	/// (`option_simple_close`).
+	V2 {
+		/// The outputs that are included.
+		outputs: ClosingTransactionV2Outputs,
+		/// The pre-built transaction.
+		built: Transaction,
+		/// The closing transaction locktime from `closing_complete`.
+		lock_time: LockTime,
+	},
 }
 
 impl ClosingTransaction {
-	/// Construct an object of the class
-	pub fn new(
+	/// Construct a v1 closing transaction (locktime=0, sequence=MAX).
+	pub fn new_v1(
 		to_holder_value_sat: u64, to_counterparty_value_sat: u64, to_holder_script: ScriptBuf,
 		to_counterparty_script: ScriptBuf, funding_outpoint: OutPoint,
 	) -> Self {
-		let to_holder_value_sat = Amount::from_sat(to_holder_value_sat);
-		let to_counterparty_value_sat = Amount::from_sat(to_counterparty_value_sat);
-		let built = build_closing_transaction(
-			to_holder_value_sat,
-			to_counterparty_value_sat,
+		let to_holder_value = Amount::from_sat(to_holder_value_sat);
+		let to_counterparty_value = Amount::from_sat(to_counterparty_value_sat);
+		let built = build_v1_closing_transaction(
+			to_holder_value,
+			to_counterparty_value,
 			to_holder_script.clone(),
 			to_counterparty_script.clone(),
 			funding_outpoint,
 		);
-		ClosingTransaction {
-			to_holder_value_sat,
-			to_counterparty_value_sat,
+		ClosingTransaction::V1 {
+			to_holder_value,
+			to_counterparty_value,
 			to_holder_script,
 			to_counterparty_script,
 			built,
 		}
+	}
+
+	/// Construct a v2 closing transaction (`option_simple_close`) with the given locktime.
+	pub fn new_v2(
+		outputs: ClosingTransactionV2Outputs, funding_outpoint: OutPoint, lock_time: LockTime,
+	) -> Self {
+		let built = build_v2_closing_transaction(outputs.clone(), funding_outpoint, lock_time);
+		ClosingTransaction::V2 { outputs, built, lock_time }
 	}
 
 	/// Trust our pre-built transaction.
@@ -1507,37 +1620,35 @@ impl ClosingTransaction {
 	/// An external validating signer must call this method before signing
 	/// or using the built transaction.
 	pub fn verify(&self, funding_outpoint: OutPoint) -> Result<TrustedClosingTransaction<'_>, ()> {
-		let built = build_closing_transaction(
-			self.to_holder_value_sat,
-			self.to_counterparty_value_sat,
-			self.to_holder_script.clone(),
-			self.to_counterparty_script.clone(),
-			funding_outpoint,
-		);
-		if self.built != built {
+		let built = match self {
+			ClosingTransaction::V1 {
+				to_holder_value,
+				to_counterparty_value,
+				to_holder_script,
+				to_counterparty_script,
+				..
+			} => build_v1_closing_transaction(
+				*to_holder_value,
+				*to_counterparty_value,
+				to_holder_script.clone(),
+				to_counterparty_script.clone(),
+				funding_outpoint,
+			),
+			ClosingTransaction::V2 { outputs, lock_time, .. } => {
+				build_v2_closing_transaction(outputs.clone(), funding_outpoint, *lock_time)
+			},
+		};
+
+		if *self.built_transaction() != built {
 			return Err(());
 		}
 		Ok(TrustedClosingTransaction { inner: self })
 	}
 
-	/// The value to be sent to the holder, or zero if the output will be omitted
-	pub fn to_holder_value_sat(&self) -> u64 {
-		self.to_holder_value_sat.to_sat()
-	}
-
-	/// The value to be sent to the counterparty, or zero if the output will be omitted
-	pub fn to_counterparty_value_sat(&self) -> u64 {
-		self.to_counterparty_value_sat.to_sat()
-	}
-
-	/// The destination of the holder's output
-	pub fn to_holder_script(&self) -> &Script {
-		&self.to_holder_script
-	}
-
-	/// The destination of the counterparty's output
-	pub fn to_counterparty_script(&self) -> &Script {
-		&self.to_counterparty_script
+	fn built_transaction(&self) -> &Transaction {
+		match self {
+			ClosingTransaction::V1 { built, .. } | ClosingTransaction::V2 { built, .. } => built,
+		}
 	}
 }
 
@@ -1562,7 +1673,7 @@ impl<'a> Deref for TrustedClosingTransaction<'a> {
 impl<'a> TrustedClosingTransaction<'a> {
 	/// The pre-built Bitcoin commitment transaction
 	pub fn built_transaction(&self) -> &'a Transaction {
-		&self.inner.built
+		self.inner.built_transaction()
 	}
 
 	/// Get the SIGHASH_ALL sighash value of the transaction.
@@ -1571,7 +1682,7 @@ impl<'a> TrustedClosingTransaction<'a> {
 	pub fn get_sighash_all(
 		&self, funding_redeemscript: &Script, channel_value_satoshis: u64,
 	) -> Message {
-		let sighash = &sighash::SighashCache::new(&self.inner.built)
+		let sighash = &sighash::SighashCache::new(self.inner.built_transaction())
 			.p2wsh_signature_hash(
 				0,
 				funding_redeemscript,
