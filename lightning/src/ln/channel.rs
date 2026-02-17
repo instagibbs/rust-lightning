@@ -1258,6 +1258,21 @@ pub(super) struct SignerResumeUpdates {
 	pub shutdown_result: Option<ShutdownResult>,
 }
 
+/// Tracks the state of a v2 closing negotiation (`option_simple_close`).
+///
+/// Set to `Some` when closing negotiation begins and both parties support
+/// `option_simple_close`. Reset to `None` on reconnect.
+#[cfg_attr(test, derive(Debug))]
+pub(super) struct V2ClosingNegotiation {
+	/// The last `closing_complete` we sent, if any. `Some` means we're
+	/// waiting for a `closing_sig` response.
+	pub last_sent_closing_complete: Option<msgs::ClosingComplete>,
+	/// Whether we've already sent a `closing_sig` and broadcast a tx.
+	/// Allows accepting additional `closing_complete` for RBF without
+	/// re-broadcasting stale transactions.
+	pub closing_sig_sent: bool,
+}
+
 /// The return value of `channel_reestablish`
 pub(super) struct ReestablishResponses {
 	pub channel_ready: Option<msgs::ChannelReady>,
@@ -3427,6 +3442,10 @@ pub(super) struct ChannelContext<SP: SignerProvider> {
 	#[cfg(not(any(test, feature = "_test_utils")))]
 	closing_fee_limits: Option<(u64, u64)>,
 
+	/// State tracking for v2 closing negotiation (`option_simple_close`).
+	/// `None` when v2 closing is not active.
+	v2_closing_negotiation: Option<V2ClosingNegotiation>,
+
 	/// If we remove an HTLC (or fee update), commit, and receive our counterparty's
 	/// `revoke_and_ack`, we remove all knowledge of said HTLC (or fee update). However, the latest
 	/// local commitment transaction that we can broadcast still contains the HTLC (or old fee)
@@ -4189,6 +4208,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			pending_counterparty_closing_signed: None,
 			expecting_peer_commitment_signed: false,
 			closing_fee_limits: None,
+			v2_closing_negotiation: None,
 			target_closing_feerate_sats_per_kw: None,
 
 			channel_creation_height: current_chain_height,
@@ -4504,6 +4524,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			pending_counterparty_closing_signed: None,
 			expecting_peer_commitment_signed: false,
 			closing_fee_limits: None,
+			v2_closing_negotiation: None,
 			target_closing_feerate_sats_per_kw: None,
 
 			channel_creation_height: current_chain_height,
@@ -9911,6 +9932,7 @@ where
 		self.context.last_sent_closing_fee = None;
 		self.context.pending_counterparty_closing_signed = None;
 		self.context.closing_fee_limits = None;
+		self.context.v2_closing_negotiation = None;
 
 		let mut inbound_drop_count = 0;
 		self.context.pending_inbound_htlcs.retain(|htlc| {
@@ -17357,6 +17379,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				pending_counterparty_closing_signed: None,
 				expecting_peer_commitment_signed: false,
 				closing_fee_limits: None,
+				v2_closing_negotiation: None,
 				target_closing_feerate_sats_per_kw,
 
 				channel_creation_height,
