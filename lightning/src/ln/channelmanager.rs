@@ -12745,23 +12745,68 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	}
 
 	fn internal_closing_sig(
-		&self, _counterparty_node_id: PublicKey, _msg: msgs::ClosingSig,
+		&self, counterparty_node_id: PublicKey, msg: msgs::ClosingSig,
 	) -> Result<(), MsgHandleErrInternal> {
-		// The receiver of `closing_sig`:
-		//   - If `closer_scriptpubkey`, `closee_scriptpubkey`, `fee_satoshis` or `locktime` don't match what was sent in `closing_complete`:
-		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
-		//   - If `tlvs` does not contain exactly one signature:
-		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
-		//   - If `tlvs` does not contain one of the TLV fields sent in `closing_complete`:
-		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
-		//   - If the signature field is not valid for the corresponding closing transaction specified in [BOLT #3](03-transactions.md#closing-transaction):
-		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
-		//   - If the signature field is non-compliant with LOW-S-standard rule<sup>[LOWS](https://github.com/bitcoin/bitcoin/pull/6769)</sup>:
-		//     - MUST either send a `warning` and close the connection, or send an `error` and fail the channel.
-		//   - otherwise:
-		//     - MUST broadcast the corresponding closing transaction.
-		//   - MAY send another `closing_complete` (e.g. with a different `fee_satoshis` or `closer_scriptpubkey`).
-		unimplemented!("Handling ClosingSig is not implemented");
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(&counterparty_node_id).ok_or_else(|| {
+			debug_assert!(false);
+			MsgHandleErrInternal::unreachable_no_such_peer(&counterparty_node_id, msg.channel_id)
+		})?;
+		let logger;
+		let tx_err: Option<(_, Result<Infallible, _>)> = {
+			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &mut *peer_state_lock;
+			match peer_state.channel_by_id.entry(msg.channel_id.clone()) {
+				hash_map::Entry::Occupied(mut chan_entry) => {
+					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+						logger = WithChannelContext::from(&self.logger, &chan.context, None);
+						let res = chan.closing_sig(&msg, &&logger);
+						let tx_shutdown_result =
+							try_channel_entry!(self, peer_state, res, chan_entry);
+						if let Some((tx, close_res)) = tx_shutdown_result {
+							let err = self.locked_handle_funded_coop_close(
+								&mut peer_state.closed_channel_monitor_update_ids,
+								&mut peer_state.in_flight_monitor_updates,
+								close_res,
+								chan,
+							);
+							chan_entry.remove();
+							Some((tx, Err(err)))
+						} else {
+							None
+						}
+					} else {
+						return try_channel_entry!(
+							self,
+							peer_state,
+							Err(ChannelError::close(
+								"Got a closing_sig message for an unfunded channel!".into()
+							)),
+							chan_entry
+						);
+					}
+				},
+				hash_map::Entry::Vacant(_) => {
+					return Err(MsgHandleErrInternal::no_such_channel_for_peer(
+						&counterparty_node_id,
+						msg.channel_id,
+					))
+				},
+			}
+		};
+		mem::drop(per_peer_state);
+		if let Some((broadcast_tx, err)) = tx_err {
+			log_info!(logger, "Broadcasting {}", log_tx!(broadcast_tx));
+			self.tx_broadcaster.broadcast_transactions(&[(
+				&broadcast_tx,
+				TransactionType::CooperativeClose {
+					counterparty_node_id,
+					channel_id: msg.channel_id,
+				},
+			)]);
+			let _ = self.handle_error(err, counterparty_node_id);
+		}
+		Ok(())
 	}
 
 	#[rustfmt::skip]

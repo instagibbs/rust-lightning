@@ -12034,6 +12034,182 @@ where
 		Ok((Some(closing_sig), Some((signed_tx, shutdown_result))))
 	}
 
+	pub fn closing_sig<L: Logger>(
+		&mut self, msg: &msgs::ClosingSig, logger: &L,
+	) -> Result<Option<(Transaction, ShutdownResult)>, ChannelError> {
+		if !self.context.channel_state.is_both_sides_shutdown() {
+			return Err(ChannelError::close(
+				"Remote end sent us a closing_sig before both sides provided a shutdown".to_owned(),
+			));
+		}
+		if self.context.channel_state.is_peer_disconnected() {
+			return Err(ChannelError::close(
+				"Peer sent closing_sig when we needed a channel_reestablish".to_owned(),
+			));
+		}
+		if !self.context.pending_inbound_htlcs.is_empty()
+			|| !self.context.pending_outbound_htlcs.is_empty()
+		{
+			return Err(ChannelError::close(
+				"Remote end sent us a closing_sig while there were still pending HTLCs".to_owned(),
+			));
+		}
+
+		// Retrieve the closing_complete we sent that this closing_sig is responding to.
+		let v2_closing_negotiation =
+			self.context.v2_closing_negotiation.as_ref().ok_or_else(|| {
+				ChannelError::close(
+					"Received closing_sig without an active v2 closing negotiation".to_owned(),
+				)
+			})?;
+		let sent_closing_complete =
+			v2_closing_negotiation.last_sent_closing_complete.as_ref().ok_or_else(|| {
+				ChannelError::close(
+					"Received closing_sig without having sent closing_complete".to_owned(),
+				)
+			})?;
+
+		// Validate that the echoed fields match what we sent in closing_complete.
+		if msg.closer_scriptpubkey != sent_closing_complete.closer_scriptpubkey
+			|| msg.closee_scriptpubkey != sent_closing_complete.closee_scriptpubkey
+			|| msg.fee_satoshis != sent_closing_complete.fee_satoshis
+			|| msg.locktime != sent_closing_complete.locktime
+		{
+			return Err(ChannelError::WarnAndDisconnect(
+				"closing_sig fields do not match what was sent in closing_complete".to_owned(),
+			));
+		}
+
+		// Validate exactly one signature is present.
+		let sig_count = msg.closer_output_only.is_some() as u8
+			+ msg.closee_output_only.is_some() as u8
+			+ msg.closer_and_closee_outputs.is_some() as u8;
+		if sig_count != 1 {
+			return Err(ChannelError::WarnAndDisconnect(
+				"closing_sig must contain exactly one signature".to_owned(),
+			));
+		}
+
+		// Validate that the signature field corresponds to one we sent in closing_complete.
+		enum SelectedField {
+			CloserOutputOnly,
+			CloseeOutputOnly,
+			CloserAndCloseeOutputs,
+		}
+
+		let (selected_field, counterparty_sig) = if let Some(sig) = msg.closer_output_only {
+			if sent_closing_complete.closer_output_only.is_none() {
+				return Err(ChannelError::WarnAndDisconnect(
+					"closing_sig contains closer_output_only but we did not send it in \
+						 closing_complete"
+						.to_owned(),
+				));
+			}
+			(SelectedField::CloserOutputOnly, sig)
+		} else if let Some(sig) = msg.closee_output_only {
+			if sent_closing_complete.closee_output_only.is_none() {
+				return Err(ChannelError::WarnAndDisconnect(
+					"closing_sig contains closee_output_only but we did not send it in \
+						 closing_complete"
+						.to_owned(),
+				));
+			}
+			(SelectedField::CloseeOutputOnly, sig)
+		} else if let Some(sig) = msg.closer_and_closee_outputs {
+			if sent_closing_complete.closer_and_closee_outputs.is_none() {
+				return Err(ChannelError::WarnAndDisconnect(
+					"closing_sig contains closer_and_closee_outputs but we did not send it \
+						 in closing_complete"
+						.to_owned(),
+				));
+			}
+			(SelectedField::CloserAndCloseeOutputs, sig)
+		} else {
+			// Already checked sig_count == 1, so this is unreachable.
+			unreachable!()
+		};
+
+		// Extract our stored signature from the sent closing_complete.
+		let our_sig = match selected_field {
+			SelectedField::CloserOutputOnly => sent_closing_complete.closer_output_only.unwrap(),
+			SelectedField::CloseeOutputOnly => sent_closing_complete.closee_output_only.unwrap(),
+			SelectedField::CloserAndCloseeOutputs => {
+				sent_closing_complete.closer_and_closee_outputs.unwrap()
+			},
+		};
+
+		// Build the closing transaction for the selected variant.
+		// We are the closer, so fee comes from our balance.
+		let closer_balance_msat = self.funding.value_to_self_msat;
+		let closee_balance_msat =
+			(self.funding.get_value_satoshis() * 1000).saturating_sub(closer_balance_msat);
+
+		let closer_is_op_return = msg.closer_scriptpubkey.is_op_return();
+		let value_to_closer = if closer_is_op_return {
+			Amount::ZERO
+		} else {
+			Amount::from_sat(closer_balance_msat / 1000 - msg.fee_satoshis)
+		};
+		let value_to_closee = Amount::from_sat(closee_balance_msat / 1000);
+		let lock_time = LockTime::from_consensus(msg.locktime);
+
+		let funding_outpoint = self.funding_outpoint().into_bitcoin_outpoint();
+		let outputs = match selected_field {
+			SelectedField::CloserOutputOnly => ClosingTransactionV2Outputs::CloserOutputOnly {
+				value_to_closer,
+				to_closer_script: msg.closer_scriptpubkey.clone(),
+			},
+			SelectedField::CloseeOutputOnly => ClosingTransactionV2Outputs::CloseeOutputOnly {
+				value_to_closee,
+				to_closee_script: msg.closee_scriptpubkey.clone(),
+			},
+			SelectedField::CloserAndCloseeOutputs => {
+				ClosingTransactionV2Outputs::CloserAndCloseeOutputs {
+					value_to_closer,
+					to_closer_script: msg.closer_scriptpubkey.clone(),
+					value_to_closee,
+					to_closee_script: msg.closee_scriptpubkey.clone(),
+				}
+			},
+		};
+		let closing_tx = ClosingTransaction::new_v2(outputs, funding_outpoint, lock_time);
+
+		// Verify the counterparty's signature.
+		let funding_redeemscript = self.funding.get_funding_redeemscript();
+		let sighash = closing_tx
+			.trust()
+			.get_sighash_all(&funding_redeemscript, self.funding.get_value_satoshis());
+		secp_check!(
+			self.context.secp_ctx.verify_ecdsa(
+				&sighash,
+				&counterparty_sig,
+				self.funding.counterparty_funding_pubkey(),
+			),
+			"Invalid closing_sig signature from peer".to_owned()
+		);
+
+		// Build the signed closing transaction.
+		let signed_tx =
+			self.build_signed_closing_transaction(&closing_tx, &counterparty_sig, &our_sig);
+
+		// State transitions.
+		self.context.channel_state = ChannelState::ShutdownComplete;
+		self.context.update_time_counter += 1;
+
+		let v2_closing_negotiation = self.context.v2_closing_negotiation.as_mut().unwrap();
+		v2_closing_negotiation.last_sent_closing_complete = None;
+
+		let shutdown_result = self.shutdown_result_coop_close();
+
+		log_info!(
+			logger,
+			"Received closing_sig with fee {} sat, broadcasting closing tx",
+			msg.fee_satoshis,
+		);
+
+		Ok(Some((signed_tx, shutdown_result)))
+	}
+
 	#[rustfmt::skip]
 	fn internal_htlc_satisfies_config(
 		&self, htlc: &msgs::UpdateAddHTLC, amt_to_forward: u64, outgoing_cltv_value: u32, config: &ChannelConfig,
