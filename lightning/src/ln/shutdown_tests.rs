@@ -1963,3 +1963,438 @@ fn test_pending_htlcs_arent_lost_on_mon_delay() {
 	do_commitment_signed_dance(&nodes[0], &nodes[1], &failures.commitment_signed, false, false);
 	expect_payment_failed!(nodes[0], payment_hash_b, false);
 }
+
+/// Exchange `option_simple_close` shutdown messages between two nodes. Returns the
+/// `closing_complete` message from the initiator.
+///
+/// In v2 closing, after the non-initiating node handles the initiator's shutdown,
+/// `get_and_clear_pending_msg_events()` may return both `SendShutdown` and
+/// `SendClosingComplete` (since both sides independently generate `closing_complete`).
+/// This helper handles that by extracting the shutdown, discarding the non-initiator's
+/// `closing_complete`, and returning the initiator's `closing_complete`.
+fn simple_close_exchange_shutdowns<'a, 'b, 'c>(
+	initiator: &Node<'a, 'b, 'c>, closee: &Node<'a, 'b, 'c>, chan_id: ChannelId,
+) -> msgs::ClosingComplete {
+	let closer_id = initiator.node.get_our_node_id();
+	let closee_id = closee.node.get_our_node_id();
+
+	initiator.node.close_channel(&chan_id, &closee_id).unwrap();
+	let shutdown_initiator = get_event_msg!(initiator, MessageSendEvent::SendShutdown, closee_id);
+
+	// The closee handles shutdown and generates SendShutdown + potentially SendClosingComplete.
+	closee.node.handle_shutdown(closer_id, &shutdown_initiator);
+	let closee_events = closee.node.get_and_clear_pending_msg_events();
+	let shutdown_closee = closee_events
+		.iter()
+		.find_map(|e| {
+			if let MessageSendEvent::SendShutdown { ref node_id, ref msg } = e {
+				assert_eq!(*node_id, closer_id);
+				Some(msg.clone())
+			} else {
+				None
+			}
+		})
+		.expect("Expected SendShutdown from closee");
+
+	// Deliver closee's shutdown to the initiator.
+	initiator.node.handle_shutdown(closee_id, &shutdown_closee);
+
+	// The initiator now generates SendClosingComplete (no shutdown since it was already sent).
+	get_event_msg!(initiator, MessageSendEvent::SendClosingComplete, closee_id)
+}
+
+fn do_test_simple_close(initiator: usize) {
+	// Test the option_simple_close cooperative closing flow (closing_complete / closing_sig).
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut features_0 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_0.set_simple_close_optional();
+	*node_cfgs[0].override_init_features.borrow_mut() = Some(features_0);
+	let mut features_1 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_1.set_simple_close_optional();
+	*node_cfgs[1].override_init_features.borrow_mut() = Some(features_1);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+
+	let closee = if initiator == 0 { 1 } else { 0 };
+	let closer_id = if initiator == 0 { node_a_id } else { node_b_id };
+	let closee_id = if initiator == 0 { node_b_id } else { node_a_id };
+
+	let closing_complete =
+		simple_close_exchange_shutdowns(&nodes[initiator], &nodes[closee], chan.2);
+
+	// Closee handles closing_complete → sends closing_sig + broadcasts.
+	nodes[closee].node.handle_closing_complete(closer_id, closing_complete);
+	let closing_sig = get_closing_sig_broadcast(&nodes[closee], closer_id);
+
+	// Closee broadcasts closing tx.
+	let closee_txn = nodes[closee].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	assert_eq!(closee_txn.len(), 1);
+
+	// Closee emits ChannelClosed event.
+	let reason_closee = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[closee], 1, reason_closee, &[closer_id], 1_000_000);
+
+	// Step 4: Closer handles closing_sig → broadcasts.
+	nodes[initiator].node.handle_closing_sig(closee_id, closing_sig);
+
+	// Closer has BroadcastChannelUpdate only (no SendClosingSig).
+	let events = nodes[initiator].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	match &events[0] {
+		MessageSendEvent::BroadcastChannelUpdate { ref msg, .. } => {
+			assert_eq!(msg.contents.channel_flags & 2, 2);
+		},
+		_ => panic!("Expected BroadcastChannelUpdate, got {:?}", events[0]),
+	}
+
+	// Closer broadcasts closing tx.
+	let closer_txn = nodes[initiator].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	assert_eq!(closer_txn.len(), 1);
+
+	// Both sides broadcast the same transaction.
+	assert_eq!(closee_txn[0], closer_txn[0]);
+
+	// Closer emits ChannelClosed event.
+	let reason_closer = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[initiator], 1, reason_closer, &[closee_id], 1_000_000);
+
+	// Channels should be fully removed.
+	assert!(nodes[0].node.list_channels().is_empty());
+	assert!(nodes[1].node.list_channels().is_empty());
+}
+
+#[test]
+fn test_simple_close() {
+	do_test_simple_close(0);
+	do_test_simple_close(1);
+}
+
+#[test]
+fn test_simple_close_dust_closee() {
+	// When the closee has a dust-level balance, only `closer_output_only` signature is used.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut features_0 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_0.set_simple_close_optional();
+	*node_cfgs[0].override_init_features.borrow_mut() = Some(features_0);
+	let mut features_1 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_1.set_simple_close_optional();
+	*node_cfgs[1].override_init_features.borrow_mut() = Some(features_1);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// Node 0 opens 100k sats, pushes 0 → node 1 has ~0 balance (dust).
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+
+	let closing_complete = simple_close_exchange_shutdowns(&nodes[0], &nodes[1], chan.2);
+
+	// Verify signature fields: only closer_output_only should be set.
+	assert!(closing_complete.closer_output_only.is_some());
+	assert!(closing_complete.closee_output_only.is_none());
+	assert!(closing_complete.closer_and_closee_outputs.is_none());
+
+	// Complete the close flow.
+	nodes[1].node.handle_closing_complete(node_a_id, closing_complete);
+	let closing_sig = get_closing_sig_broadcast(&nodes[1], node_a_id);
+
+	// closing_sig should also use closer_output_only.
+	assert!(closing_sig.closer_output_only.is_some());
+	assert!(closing_sig.closee_output_only.is_none());
+	assert!(closing_sig.closer_and_closee_outputs.is_none());
+
+	assert_eq!(nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let reason_b = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[1], 1, reason_b, &[node_a_id], 100_000);
+
+	nodes[0].node.handle_closing_sig(node_b_id, closing_sig);
+	let events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	assert!(matches!(events[0], MessageSendEvent::BroadcastChannelUpdate { .. }));
+	assert_eq!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let reason_a = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[0], 1, reason_a, &[node_b_id], 100_000);
+}
+
+#[test]
+fn test_simple_close_dust_closer() {
+	// When the closer has a dust-level balance, only `closee_output_only` signature is used.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut features_0 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_0.set_simple_close_optional();
+	*node_cfgs[0].override_init_features.borrow_mut() = Some(features_0);
+	let mut features_1 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_1.set_simple_close_optional();
+	*node_cfgs[1].override_init_features.borrow_mut() = Some(features_1);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// Node 0 opens 100k sats, pushes 0 → node 1 has ~0 balance.
+	// Node 1 initiates close → node 1 is the closer with ~0 balance (dust).
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+
+	let closing_complete = simple_close_exchange_shutdowns(&nodes[1], &nodes[0], chan.2);
+
+	// Verify signature fields: only closee_output_only should be set (closer is dust).
+	assert!(closing_complete.closer_output_only.is_none());
+	assert!(closing_complete.closee_output_only.is_some());
+	assert!(closing_complete.closer_and_closee_outputs.is_none());
+
+	// Complete the close flow.
+	nodes[0].node.handle_closing_complete(node_b_id, closing_complete);
+	let closing_sig = get_closing_sig_broadcast(&nodes[0], node_b_id);
+
+	assert!(closing_sig.closer_output_only.is_none());
+	assert!(closing_sig.closee_output_only.is_some());
+	assert!(closing_sig.closer_and_closee_outputs.is_none());
+
+	assert_eq!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let reason_a = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[0], 1, reason_a, &[node_b_id], 100_000);
+
+	nodes[1].node.handle_closing_sig(node_a_id, closing_sig);
+	let events = nodes[1].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	assert!(matches!(events[0], MessageSendEvent::BroadcastChannelUpdate { .. }));
+	assert_eq!(nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let reason_b = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[1], 1, reason_b, &[node_a_id], 100_000);
+}
+
+#[test]
+fn test_simple_close_two_sig_variants() {
+	// When closer balance >= closee balance and closee is not dust, both `closer_output_only`
+	// and `closer_and_closee_outputs` signatures are provided.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut features_0 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_0.set_simple_close_optional();
+	*node_cfgs[0].override_init_features.borrow_mut() = Some(features_0);
+	let mut features_1 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_1.set_simple_close_optional();
+	*node_cfgs[1].override_init_features.borrow_mut() = Some(features_1);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// Node 0 opens 100k sats, pushes 10k to node 1 → closer ~90k, closee ~10k (non-dust).
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 10_000_000);
+
+	let closing_complete = simple_close_exchange_shutdowns(&nodes[0], &nodes[1], chan.2);
+
+	// Closer >= closee and closee not dust → both variants provided.
+	assert!(closing_complete.closer_output_only.is_some());
+	assert!(closing_complete.closee_output_only.is_none());
+	assert!(closing_complete.closer_and_closee_outputs.is_some());
+
+	// Closee picks closer_and_closee_outputs (since their output is non-dust).
+	nodes[1].node.handle_closing_complete(node_a_id, closing_complete);
+	let closing_sig = get_closing_sig_broadcast(&nodes[1], node_a_id);
+
+	assert!(closing_sig.closer_output_only.is_none());
+	assert!(closing_sig.closee_output_only.is_none());
+	assert!(closing_sig.closer_and_closee_outputs.is_some());
+
+	assert_eq!(nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let reason_b = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[1], 1, reason_b, &[node_a_id], 100_000);
+
+	nodes[0].node.handle_closing_sig(node_b_id, closing_sig);
+	let events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	assert!(matches!(events[0], MessageSendEvent::BroadcastChannelUpdate { .. }));
+	assert_eq!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let reason_a = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[0], 1, reason_a, &[node_b_id], 100_000);
+}
+
+#[test]
+fn test_simple_close_v1_fallback() {
+	// When the counterparty doesn't support `option_simple_close`, fall back to v1
+	// `closing_signed` negotiation.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	// Enable simple_close on node 0, but NOT on node 1 → forces v1 fallback.
+	let mut features_0 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_0.set_simple_close_optional();
+	*node_cfgs[0].override_init_features.borrow_mut() = Some(features_0);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let chan = create_announced_chan_between_nodes(&nodes, 0, 1);
+
+	nodes[0].node.close_channel(&chan.2, &node_b_id).unwrap();
+	let shutdown_0 = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	nodes[1].node.handle_shutdown(node_a_id, &shutdown_0);
+
+	// Node 1 may generate SendShutdown + SendClosingComplete (since
+	// `maybe_generate_initial_closing_message` checks the peer's features, not the
+	// local node's — node 0 supports simple_close, so node 1 incorrectly attempts v2).
+	// Extract just the shutdown.
+	let events_1 = nodes[1].node.get_and_clear_pending_msg_events();
+	let shutdown_1 = events_1
+		.iter()
+		.find_map(|e| {
+			if let MessageSendEvent::SendShutdown { ref node_id, ref msg } = e {
+				assert_eq!(*node_id, node_a_id);
+				Some(msg.clone())
+			} else {
+				None
+			}
+		})
+		.expect("Expected SendShutdown from node 1");
+	nodes[0].node.handle_shutdown(node_b_id, &shutdown_1);
+
+	// Key assertion: node 0 generates SendClosingSigned (v1), NOT SendClosingComplete (v2),
+	// because node 1 doesn't support option_simple_close.
+	let mut closing_signed_0 =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingSigned, node_b_id);
+
+	// Strip fee_range so that the non-funder accepts the proposed fee in one round
+	// (with fee_range, the non-funder picks the highest fee in the overlap, requiring
+	// extra negotiation rounds).
+	closing_signed_0.fee_range = None;
+
+	// Complete the standard v1 closing_signed flow.
+	nodes[1].node.handle_closing_signed(node_a_id, &closing_signed_0);
+	let (_, closing_signed_1_opt) = get_closing_signed_broadcast(&nodes[1], node_a_id);
+	nodes[0].node.handle_closing_signed(node_b_id, &closing_signed_1_opt.unwrap());
+	let (_, none_0) = get_closing_signed_broadcast(&nodes[0], node_b_id);
+	assert!(none_0.is_none());
+
+	let reason_a = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[0], 1, reason_a, &[node_b_id], 100_000);
+	let reason_b = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[1], 1, reason_b, &[node_a_id], 100_000);
+
+	assert!(nodes[0].node.list_channels().is_empty());
+	assert!(nodes[1].node.list_channels().is_empty());
+}
+
+#[test]
+fn test_simple_close_reconnect() {
+	// After shutdown exchange and before closing_complete is delivered, disconnecting and
+	// reconnecting resets the v2 negotiation state and allows the protocol to restart.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut features_0 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_0.set_simple_close_optional();
+	*node_cfgs[0].override_init_features.borrow_mut() = Some(features_0);
+	let mut features_1 = channelmanager::provided_init_features(&test_default_channel_config());
+	features_1.set_simple_close_optional();
+	*node_cfgs[1].override_init_features.borrow_mut() = Some(features_1);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let chan = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+
+	// Exchange shutdowns and get closing_complete from closer (which we'll make stale
+	// by disconnecting before delivering it).
+	let _stale_closing_complete = simple_close_exchange_shutdowns(&nodes[0], &nodes[1], chan.2);
+
+	// Disconnect.
+	nodes[0].node.peer_disconnected(node_b_id);
+	nodes[1].node.peer_disconnected(node_a_id);
+
+	// Reconnect: exchange channel_reestablish.
+	connect_nodes(&nodes[0], &nodes[1]);
+	let reestablish_0 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
+	let reestablish_1 = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
+	assert_eq!(reestablish_0.len(), 1);
+	assert_eq!(reestablish_1.len(), 1);
+
+	nodes[1].node.handle_channel_reestablish(node_a_id, &reestablish_0[0]);
+	nodes[0].node.handle_channel_reestablish(node_b_id, &reestablish_1[0]);
+
+	// After reestablish, both sides emit SendShutdown (retransmission) + SendClosingComplete
+	// (fresh from maybe_generate_initial_closing_message). We need to handle these manually
+	// since handle_chan_reestablish_msgs! doesn't expect shutdown/closing events.
+	let events_0 = nodes[0].node.get_and_clear_pending_msg_events();
+	let events_1 = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// Extract shutdown and closing_complete from node 0 events.
+	// Events may also include SendChannelReady from the reestablish handshake.
+	let mut new_shutdown_0 = None;
+	let mut new_closing_complete_0 = None;
+	for event in &events_0 {
+		match event {
+			MessageSendEvent::SendShutdown { ref node_id, ref msg } => {
+				assert_eq!(*node_id, node_b_id);
+				new_shutdown_0 = Some(msg.clone());
+			},
+			MessageSendEvent::SendClosingComplete { ref node_id, ref msg } => {
+				assert_eq!(*node_id, node_b_id);
+				new_closing_complete_0 = Some(msg.clone());
+			},
+			MessageSendEvent::SendChannelReady { .. } => {},
+			_ => panic!("Unexpected event from node 0: {:?}", event),
+		}
+	}
+
+	// Extract shutdown from node 1 events.
+	let mut new_shutdown_1 = None;
+	for event in &events_1 {
+		match event {
+			MessageSendEvent::SendShutdown { ref node_id, ref msg } => {
+				assert_eq!(*node_id, node_a_id);
+				new_shutdown_1 = Some(msg.clone());
+			},
+			MessageSendEvent::SendClosingComplete { ref node_id, .. } => {
+				// Node 1 also generates a closing_complete (both sides do independently).
+				assert_eq!(*node_id, node_a_id);
+			},
+			MessageSendEvent::SendChannelReady { .. } => {},
+			_ => panic!("Unexpected event from node 1: {:?}", event),
+		}
+	}
+
+	// Deliver retransmitted shutdowns (these are mostly no-ops since both sides are
+	// already in shutdown state).
+	nodes[1].node.handle_shutdown(node_a_id, &new_shutdown_0.unwrap());
+	nodes[0].node.handle_shutdown(node_b_id, &new_shutdown_1.unwrap());
+
+	// Any events generated by handle_shutdown should be empty (already shutdown).
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+
+	// Deliver the fresh closing_complete from node 0 to node 1.
+	let closing_complete = new_closing_complete_0.unwrap();
+	nodes[1].node.handle_closing_complete(node_a_id, closing_complete);
+
+	// Complete the close flow as normal.
+	let closing_sig = get_closing_sig_broadcast(&nodes[1], node_a_id);
+
+	let closee_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	assert_eq!(closee_txn.len(), 1);
+	let reason_b = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[1], 1, reason_b, &[node_a_id], 1_000_000);
+
+	nodes[0].node.handle_closing_sig(node_b_id, closing_sig);
+	let events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 1);
+	assert!(matches!(events[0], MessageSendEvent::BroadcastChannelUpdate { .. }));
+
+	let closer_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	assert_eq!(closer_txn.len(), 1);
+	assert_eq!(closee_txn[0], closer_txn[0]);
+
+	let reason_a = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event(&nodes[0], 1, reason_a, &[node_b_id], 1_000_000);
+
+	assert!(nodes[0].node.list_channels().is_empty());
+	assert!(nodes[1].node.list_channels().is_empty());
+}

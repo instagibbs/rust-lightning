@@ -2229,6 +2229,27 @@ pub fn get_closing_signed_broadcast(
 	)
 }
 
+/// Extract a `ClosingSig` message and verify a `BroadcastChannelUpdate` from the closee's
+/// pending message events after `handle_closing_complete`.
+pub fn get_closing_sig_broadcast(node: &Node, dest_pubkey: PublicKey) -> msgs::ClosingSig {
+	let events = node.node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 2);
+	let closing_sig = match &events[0] {
+		MessageSendEvent::SendClosingSig { ref node_id, ref msg } => {
+			assert_eq!(*node_id, dest_pubkey);
+			msg.clone()
+		},
+		_ => panic!("Expected SendClosingSig, got {:?}", events[0]),
+	};
+	match &events[1] {
+		MessageSendEvent::BroadcastChannelUpdate { ref msg, .. } => {
+			assert_eq!(msg.contents.channel_flags & 2, 2);
+		},
+		_ => panic!("Expected BroadcastChannelUpdate, got {:?}", events[1]),
+	};
+	closing_sig
+}
+
 #[cfg(test)]
 macro_rules! check_warn_msg {
 	($node: expr, $recipient_node_id: expr, $chan_id: expr) => {{
