@@ -116,6 +116,8 @@ mod reorg_tests;
 #[cfg(test)]
 #[allow(unused_mut)]
 mod shutdown_tests;
+#[cfg(test)]
+mod teleport_tests;
 #[cfg(any(feature = "_test_utils", test))]
 pub mod splicing_tests;
 #[cfg(any(test, feature = "_externalize_tests"))]
