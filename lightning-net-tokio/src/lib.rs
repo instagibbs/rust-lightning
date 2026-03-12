@@ -894,6 +894,14 @@ mod tests {
 		fn handle_splice_init(&self, _their_node_id: PublicKey, _msg: &SpliceInit) {}
 		fn handle_splice_ack(&self, _their_node_id: PublicKey, _msg: &SpliceAck) {}
 		fn handle_splice_locked(&self, _their_node_id: PublicKey, _msg: &SpliceLocked) {}
+		fn handle_teleport_init(&self, _their_node_id: PublicKey, _msg: &TeleportInit) {}
+		fn handle_teleport_ack(&self, _their_node_id: PublicKey, _msg: &TeleportAck) {}
+		fn handle_teleport_abort(&self, _their_node_id: PublicKey, _msg: &TeleportAbort) {}
+		fn handle_teleport_complete(&self, _their_node_id: PublicKey, _msg: &TeleportComplete) {}
+		fn handle_teleport_complete_ack(
+			&self, _their_node_id: PublicKey, _msg: &TeleportCompleteAck,
+		) {
+		}
 		fn handle_tx_add_input(&self, _their_node_id: PublicKey, _msg: &TxAddInput) {}
 		fn handle_tx_add_output(&self, _their_node_id: PublicKey, _msg: &TxAddOutput) {}
 		fn handle_tx_remove_input(&self, _their_node_id: PublicKey, _msg: &TxRemoveInput) {}

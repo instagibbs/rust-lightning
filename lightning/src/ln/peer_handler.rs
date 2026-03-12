@@ -476,6 +476,23 @@ impl ChannelMessageHandler for ErroringMessageHandler {
 	fn handle_splice_locked(&self, their_node_id: PublicKey, msg: &msgs::SpliceLocked) {
 		ErroringMessageHandler::push_error(&self, their_node_id, msg.channel_id);
 	}
+	fn handle_teleport_init(&self, their_node_id: PublicKey, msg: &msgs::TeleportInit) {
+		ErroringMessageHandler::push_error(&self, their_node_id, msg.channel_id);
+	}
+	fn handle_teleport_ack(&self, their_node_id: PublicKey, msg: &msgs::TeleportAck) {
+		ErroringMessageHandler::push_error(&self, their_node_id, msg.channel_id);
+	}
+	fn handle_teleport_abort(&self, their_node_id: PublicKey, msg: &msgs::TeleportAbort) {
+		ErroringMessageHandler::push_error(&self, their_node_id, msg.channel_id);
+	}
+	fn handle_teleport_complete(&self, their_node_id: PublicKey, msg: &msgs::TeleportComplete) {
+		ErroringMessageHandler::push_error(&self, their_node_id, msg.channel_id);
+	}
+	fn handle_teleport_complete_ack(
+		&self, their_node_id: PublicKey, msg: &msgs::TeleportCompleteAck,
+	) {
+		ErroringMessageHandler::push_error(&self, their_node_id, msg.channel_id);
+	}
 	fn handle_update_add_htlc(&self, their_node_id: PublicKey, msg: &msgs::UpdateAddHTLC) {
 		ErroringMessageHandler::push_error(self, their_node_id, msg.channel_id);
 	}
@@ -2456,6 +2473,24 @@ impl<
 			Message::SpliceLocked(msg) => {
 				self.message_handler.chan_handler.handle_splice_locked(their_node_id, &msg);
 			},
+			Message::TeleportInit(msg) => {
+				self.message_handler.chan_handler.handle_teleport_init(their_node_id, &msg);
+			},
+			Message::TeleportAck(msg) => {
+				self.message_handler.chan_handler.handle_teleport_ack(their_node_id, &msg);
+			},
+			Message::TeleportAbort(msg) => {
+				self.message_handler.chan_handler.handle_teleport_abort(their_node_id, &msg);
+			},
+			Message::TeleportComplete(msg) => {
+				self.message_handler.chan_handler.handle_teleport_complete(their_node_id, &msg);
+			},
+			Message::TeleportCompleteAck(msg) => {
+				self.message_handler.chan_handler.handle_teleport_complete_ack(
+					their_node_id,
+					&msg,
+				);
+			},
 
 			// Interactive transaction construction messages:
 			Message::TxAddInput(msg) => {
@@ -2953,6 +2988,46 @@ impl<
 									node_id,
 									&msg.channel_id);
 							let msg = Message::SpliceLocked(msg);
+							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id)?, msg);
+						},
+						MessageSendEvent::SendTeleportInit { ref node_id, msg } => {
+							log_debug!(WithContext::from(&self.logger, Some(*node_id), Some(msg.channel_id), None),
+								"Handling SendTeleportInit event in peer_handler for node {} for channel {}",
+								node_id,
+								&msg.channel_id);
+							let msg = Message::TeleportInit(msg);
+							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id)?, msg);
+						},
+						MessageSendEvent::SendTeleportAck { ref node_id, msg } => {
+							log_debug!(WithContext::from(&self.logger, Some(*node_id), Some(msg.channel_id), None),
+								"Handling SendTeleportAck event in peer_handler for node {} for channel {}",
+								node_id,
+								&msg.channel_id);
+							let msg = Message::TeleportAck(msg);
+							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id)?, msg);
+						},
+						MessageSendEvent::SendTeleportAbort { ref node_id, msg } => {
+							log_debug!(WithContext::from(&self.logger, Some(*node_id), Some(msg.channel_id), None),
+								"Handling SendTeleportAbort event in peer_handler for node {} for channel {}",
+								node_id,
+								&msg.channel_id);
+							let msg = Message::TeleportAbort(msg);
+							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id)?, msg);
+						},
+						MessageSendEvent::SendTeleportComplete { ref node_id, msg } => {
+							log_debug!(WithContext::from(&self.logger, Some(*node_id), Some(msg.channel_id), None),
+								"Handling SendTeleportComplete event in peer_handler for node {} for channel {}",
+								node_id,
+								&msg.channel_id);
+							let msg = Message::TeleportComplete(msg);
+							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id)?, msg);
+						},
+						MessageSendEvent::SendTeleportCompleteAck { ref node_id, msg } => {
+							log_debug!(WithContext::from(&self.logger, Some(*node_id), Some(msg.channel_id), None),
+								"Handling SendTeleportCompleteAck event in peer_handler for node {} for channel {}",
+								node_id,
+								&msg.channel_id);
+							let msg = Message::TeleportCompleteAck(msg);
 							self.enqueue_message(&mut *get_peer_for_forwarding!(node_id)?, msg);
 						},
 						MessageSendEvent::SendTxAddInput { ref node_id, msg } => {

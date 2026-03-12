@@ -1178,6 +1178,7 @@ pub(super) struct MonitorRestoreUpdates {
 	pub raa: Option<msgs::RevokeAndACK>,
 	/// A `CommitmentUpdate` to be sent to our channel peer.
 	pub commitment_update: Option<msgs::CommitmentUpdate>,
+	pub teleport_complete_ack: Option<msgs::TeleportCompleteAck>,
 	pub commitment_order: RAACommitmentOrder,
 	pub accepted_htlcs: Vec<(PendingHTLCInfo, u64)>,
 	pub failed_htlcs: Vec<(HTLCSource, PaymentHash, HTLCFailReason)>,
@@ -1709,16 +1710,20 @@ where
 			if matches!(chan.context.channel_state, ChannelState::ChannelReady(_)) {
 				chan.context.channel_state.clear_local_stfu_sent();
 				chan.context.channel_state.clear_remote_stfu_sent();
+				chan.clear_nonpersistent_teleport();
 				if chan.should_reset_pending_splice_state(false) {
 					// If there was a pending splice negotiation that failed due to disconnecting, we
 					// also take the opportunity to clean up our state.
 					let splice_funding_failed = chan.reset_pending_splice_state();
 					debug_assert!(!chan.context.channel_state.is_quiescent());
 					splice_funding_failed
-				} else if !chan.has_pending_splice_awaiting_signatures() {
+				} else if !chan.has_pending_splice_awaiting_signatures()
+					&& !chan.has_persistent_teleport()
+				{
 					// We shouldn't be quiescent anymore upon reconnecting if:
 					// - We were in quiescence but a splice/RBF was never negotiated or
 					// - We were in quiescence but the splice negotiation failed due to disconnecting
+					// - We were in quiescence for a teleport that never reached `teleport_ack`
 					chan.context.channel_state.clear_quiescent();
 					None
 				} else {
@@ -2352,6 +2357,7 @@ where
 					context: chan.context,
 					holder_commitment_point,
 					pending_splice: None,
+					pending_teleport: None,
 					quiescent_action: None,
 				};
 				let res = funded_channel.initial_commitment_signed_v2(msg, best_block, signer_provider, logger)
@@ -2381,7 +2387,30 @@ where
 					// Not having a signing session implies they've already sent `splice_locked`,
 					// which must always come after the initial commitment signed is sent.
 					.unwrap_or(true);
-				let res = if has_negotiated_pending_splice && !session_received_commitment_signed {
+				let res = if let Some((new_funding_txo, is_initiator)) = funded_channel
+					.pending_teleport
+					.as_ref()
+					.and_then(|pending_teleport| {
+						if let PendingTeleport::AwaitingRemoteCommitmentSigned {
+							new_funding_txo,
+							is_initiator,
+						} = pending_teleport
+						{
+							Some((*new_funding_txo, *is_initiator))
+						} else {
+							None
+						}
+					}) {
+					funded_channel
+						.teleport_commitment_signed(
+							msg,
+							new_funding_txo,
+							is_initiator,
+							fee_estimator,
+							logger,
+						)
+						.map(|monitor_update_opt| (None, monitor_update_opt))
+				} else if has_negotiated_pending_splice && !session_received_commitment_signed {
 					let has_holder_tx_signatures = funded_channel
 						.context
 						.interactive_tx_signing_session
@@ -2842,6 +2871,43 @@ impl FundingScope {
 		}
 	}
 
+	/// Constructs a `FundingScope` for teleporting a channel to a new funding outpoint.
+	fn for_teleport(prev_funding: &Self, new_funding_txo: OutPoint) -> Self {
+		let mut channel_transaction_parameters =
+			prev_funding.channel_transaction_parameters.clone();
+		channel_transaction_parameters.funding_outpoint = Some(new_funding_txo);
+		channel_transaction_parameters.splice_parent_funding_txid = None;
+
+		Self {
+			value_to_self_msat: prev_funding.value_to_self_msat,
+			counterparty_selected_channel_reserve_satoshis:
+				prev_funding.counterparty_selected_channel_reserve_satoshis,
+			holder_selected_channel_reserve_satoshis:
+				prev_funding.holder_selected_channel_reserve_satoshis,
+			#[cfg(debug_assertions)]
+			holder_prev_commitment_tx_balance: {
+				let prev = *prev_funding.holder_prev_commitment_tx_balance.lock().unwrap();
+				Mutex::new(prev)
+			},
+			#[cfg(debug_assertions)]
+			counterparty_prev_commitment_tx_balance: {
+				let prev =
+					*prev_funding.counterparty_prev_commitment_tx_balance.lock().unwrap();
+				Mutex::new(prev)
+			},
+			#[cfg(any(test, fuzzing))]
+			next_local_fee: Mutex::new(*prev_funding.next_local_fee.lock().unwrap()),
+			#[cfg(any(test, fuzzing))]
+			next_remote_fee: Mutex::new(*prev_funding.next_remote_fee.lock().unwrap()),
+			channel_transaction_parameters,
+			funding_transaction: None,
+			funding_tx_confirmed_in: None,
+			funding_tx_confirmation_height: 0,
+			short_channel_id: None,
+			minimum_depth_override: None,
+		}
+	}
+
 	/// Compute the post-splice channel value from each counterparty's contributions.
 	pub(super) fn compute_post_splice_value(
 		&self, our_funding_contribution: i64, their_funding_contribution: i64,
@@ -3000,9 +3066,65 @@ pub(crate) enum QuiescentAction {
 		contribution: FundingContribution,
 		locktime: LockTime,
 	},
+	Teleport {
+		new_funding_txo: OutPoint,
+	},
 	#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 	DoNothing,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PendingTeleport {
+	AwaitingTeleportAck { new_funding_txo: OutPoint },
+	AwaitingUserDecision { new_funding_txo: OutPoint },
+	AwaitingTeleportAckSend { new_funding_txo: OutPoint },
+	AwaitingRemoteCommitmentSigned { new_funding_txo: OutPoint, is_initiator: bool },
+	AwaitingLocalComplete { new_funding_txo: OutPoint },
+	AwaitingRemoteComplete { new_funding_txo: OutPoint },
+	AwaitingTeleportCompleteAck { new_funding_txo: OutPoint },
+	AwaitingTeleportCompleteAckSend { new_funding_txo: OutPoint },
+}
+
+impl PendingTeleport {
+	fn is_persistent(&self) -> bool {
+		matches!(
+			self,
+			Self::AwaitingRemoteCommitmentSigned { .. }
+				| Self::AwaitingLocalComplete { .. }
+				| Self::AwaitingRemoteComplete { .. }
+				| Self::AwaitingTeleportCompleteAck { .. }
+				| Self::AwaitingTeleportCompleteAckSend { .. }
+		)
+	}
+}
+
+impl_writeable_tlv_based_enum_upgradable!(PendingTeleport,
+	(0, AwaitingTeleportAck) => {
+		(0, new_funding_txo, required),
+	},
+	(2, AwaitingUserDecision) => {
+		(0, new_funding_txo, required),
+	},
+	(4, AwaitingTeleportAckSend) => {
+		(0, new_funding_txo, required),
+	},
+	(6, AwaitingRemoteCommitmentSigned) => {
+		(0, new_funding_txo, required),
+		(2, is_initiator, required),
+	},
+	(8, AwaitingLocalComplete) => {
+		(0, new_funding_txo, required),
+	},
+	(10, AwaitingRemoteComplete) => {
+		(0, new_funding_txo, required),
+	},
+	(12, AwaitingTeleportCompleteAck) => {
+		(0, new_funding_txo, required),
+	},
+	(14, AwaitingTeleportCompleteAckSend) => {
+		(0, new_funding_txo, required),
+	},
+);
 
 pub(super) enum QuiescentError {
 	DoNothing,
@@ -3023,6 +3145,7 @@ impl From<QuiescentAction> for QuiescentError {
 					contributed_outputs,
 				});
 			},
+			QuiescentAction::Teleport { .. } => QuiescentError::DoNothing,
 			#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 			QuiescentAction::DoNothing => QuiescentError::DoNothing,
 		}
@@ -3032,6 +3155,7 @@ impl From<QuiescentAction> for QuiescentError {
 pub(crate) enum StfuResponse {
 	Stfu(msgs::Stfu),
 	SpliceInit(msgs::SpliceInit),
+	TeleportInit(msgs::TeleportInit),
 }
 
 /// Wrapper around a [`Transaction`] useful for caching the result of [`Transaction::compute_txid`].
@@ -6415,6 +6539,9 @@ pub(super) struct FundedChannel<SP: SignerProvider> {
 	/// Information about any pending splice candidates, including RBF attempts.
 	pending_splice: Option<PendingFunding>,
 
+	/// Information about an in-flight teleport handshake.
+	pending_teleport: Option<PendingTeleport>,
+
 	/// Once we become quiescent, if we're the initiator, there's some action we'll want to take.
 	/// This keeps track of that action. Note that if we become quiescent and we're not the
 	/// initiator we may be able to merge this action into what the counterparty wanted to do (e.g.
@@ -6639,6 +6766,7 @@ where
 					contributed_outputs: outputs,
 				})
 			},
+			Some(QuiescentAction::Teleport { .. }) => None,
 			#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 			Some(quiescent_action) => {
 				self.quiescent_action = Some(quiescent_action);
@@ -6683,6 +6811,133 @@ where
 		} else {
 			&[]
 		}
+	}
+
+	fn has_persistent_teleport(&self) -> bool {
+		self.pending_teleport
+			.as_ref()
+			.map(|pending_teleport| pending_teleport.is_persistent())
+			.unwrap_or(false)
+	}
+
+	fn clear_nonpersistent_teleport(&mut self) {
+		if self
+			.pending_teleport
+			.as_ref()
+			.map(|pending_teleport| !pending_teleport.is_persistent())
+			.unwrap_or(false)
+		{
+			self.pending_teleport.take();
+		}
+	}
+
+	fn teleport_funding(&self, new_funding_txo: OutPoint) -> FundingScope {
+		FundingScope::for_teleport(&self.funding, new_funding_txo)
+	}
+
+	fn get_initial_teleport_commitment_signed<L: Logger>(
+		&mut self, new_funding_txo: OutPoint, logger: &L,
+	) -> Option<msgs::CommitmentSigned> {
+		let funding = self.teleport_funding(new_funding_txo);
+		self.context.get_initial_commitment_signed_v2(&funding, logger)
+	}
+
+	fn teleport_initial_commitment_signed<F: FeeEstimator, L: Logger>(
+		&mut self, msg: &msgs::CommitmentSigned, new_funding_txo: OutPoint,
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
+		let teleport_funding = self.teleport_funding(new_funding_txo);
+
+		let transaction_number = self.holder_commitment_point.current_transaction_number();
+		let commitment_point = self.holder_commitment_point.current_point().ok_or_else(|| {
+			debug_assert!(false);
+			ChannelError::close(
+				"current_point should be set while teleporting a channel".to_owned(),
+			)
+		})?;
+		let (holder_commitment_tx, _) = self.context.validate_commitment_signed(
+			&teleport_funding,
+			transaction_number,
+			commitment_point,
+			msg,
+			fee_estimator,
+			logger,
+		)?;
+		let counterparty_commitment_tx = self
+			.context
+			.build_commitment_transaction(
+				&teleport_funding,
+				self.context.counterparty_next_commitment_transaction_number + 1,
+				&self.context.counterparty_current_commitment_point.unwrap(),
+				false,
+				false,
+				logger,
+			)
+			.tx;
+
+		log_info!(
+			logger,
+			"Received teleport commitment_signed from peer with funding txid {}",
+			new_funding_txo.txid
+		);
+
+		self.context.latest_monitor_update_id += 1;
+		let monitor_update = ChannelMonitorUpdate {
+			update_id: self.context.latest_monitor_update_id,
+			updates: vec![ChannelMonitorUpdateStep::RenegotiatedFunding {
+				channel_parameters: teleport_funding.channel_transaction_parameters.clone(),
+				holder_commitment_tx,
+				counterparty_commitment_tx,
+			}],
+			channel_id: Some(self.context.channel_id()),
+		};
+
+		self.monitor_updating_paused(
+			false,
+			false,
+			false,
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			logger,
+		);
+		Ok(self.push_ret_blockable_mon_update(monitor_update))
+	}
+
+	fn promote_teleport_funding<L: Logger>(
+		&mut self, new_funding_txo: OutPoint, logger: &L,
+	) -> Option<ChannelMonitorUpdate> {
+		log_info!(
+			logger,
+			"Promoting teleport funding txid {}",
+			new_funding_txo.txid
+		);
+
+		if let Some(scid) = self.funding.short_channel_id {
+			self.context.historical_scids.push(scid);
+		}
+		self.funding = self.teleport_funding(new_funding_txo);
+		self.context.announcement_sigs = None;
+		self.context.announcement_sigs_state = AnnouncementSigsState::NotSent;
+
+		self.context.latest_monitor_update_id += 1;
+		let monitor_update = ChannelMonitorUpdate {
+			update_id: self.context.latest_monitor_update_id,
+			updates: vec![ChannelMonitorUpdateStep::RenegotiatedFundingLocked {
+				funding_txid: new_funding_txo.txid,
+			}],
+			channel_id: Some(self.context.channel_id()),
+		};
+		self.monitor_updating_paused(
+			false,
+			false,
+			false,
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			logger,
+		);
+		self.push_ret_blockable_mon_update(monitor_update)
 	}
 
 	fn funding_and_pending_funding_iter_mut(&mut self) -> impl Iterator<Item = &mut FundingScope> {
@@ -9172,6 +9427,17 @@ where
 			self.get_channel_ready(logger)
 		} else { None };
 
+		let teleport_complete_ack = self.pending_teleport.as_ref().and_then(|pending_teleport| {
+			if matches!(
+				pending_teleport,
+				PendingTeleport::AwaitingTeleportCompleteAckSend { .. }
+			) {
+				Some(msgs::TeleportCompleteAck { channel_id: self.context.channel_id() })
+			} else {
+				None
+			}
+		});
+
 		let announcement_sigs = self.get_announcement_sigs(node_signer, chain_hash, user_config, best_block_height, logger);
 
 		let mut accepted_htlcs = Vec::new();
@@ -9198,6 +9464,7 @@ where
 				raa: None, commitment_update: None, commitment_order: RAACommitmentOrder::RevokeAndACKFirst,
 				accepted_htlcs, failed_htlcs, finalized_claimed_htlcs, pending_update_adds,
 				funding_broadcastable, channel_ready, announcement_sigs, tx_signatures: None,
+				teleport_complete_ack: None,
 				channel_ready_order, committed_outbound_htlc_sources
 			};
 		}
@@ -9229,6 +9496,7 @@ where
 		MonitorRestoreUpdates {
 			raa, commitment_update, commitment_order, accepted_htlcs, failed_htlcs, finalized_claimed_htlcs,
 			pending_update_adds, funding_broadcastable, channel_ready, announcement_sigs, tx_signatures,
+			teleport_complete_ack,
 			channel_ready_order, committed_outbound_htlc_sources
 		}
 	}
@@ -10166,7 +10434,9 @@ where
 	#[allow(clippy::assertions_on_constants)]
 	#[rustfmt::skip]
 	pub fn should_disconnect_peer_awaiting_response(&mut self) -> bool {
-		if let Some(ticks_elapsed) = self.context.sent_message_awaiting_response.as_mut() {
+		if self.has_persistent_teleport() {
+			false
+		} else if let Some(ticks_elapsed) = self.context.sent_message_awaiting_response.as_mut() {
 			*ticks_elapsed += 1;
 			*ticks_elapsed >= DISCONNECT_PEER_AWAITING_RESPONSE_TICKS
 		} else if
@@ -11775,6 +12045,48 @@ where
 		Ok(FundingTemplate::new(Some(shared_input), min_feerate, max_feerate))
 	}
 
+	pub fn teleport_channel<L: Logger>(
+		&mut self, new_funding_txo: OutPoint, logger: &L,
+	) -> Result<Option<msgs::Stfu>, APIError> {
+		if self.pending_teleport.is_some() {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} cannot teleport as one is currently in progress",
+					self.context.channel_id(),
+				),
+			});
+		}
+		if self.pending_splice.is_some() {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} cannot teleport while a splice is pending",
+					self.context.channel_id(),
+				),
+			});
+		}
+		if self.quiescent_action.is_some() {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} cannot teleport as a quiescent action is already pending",
+					self.context.channel_id(),
+				),
+			});
+		}
+		if !self.context.is_usable() {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} cannot teleport as it is either pending open/close",
+					self.context.channel_id()
+				),
+			});
+		}
+
+		self.propose_quiescence(logger, QuiescentAction::Teleport { new_funding_txo })
+			.map_err(|_| APIError::APIMisuseError {
+				err: format!("Channel {} cannot begin teleport", self.context.channel_id()),
+			})
+	}
+
 	pub fn funding_contributed<L: Logger>(
 		&mut self, contribution: FundingContribution, locktime: LockTime, logger: &L,
 	) -> Result<Option<msgs::Stfu>, QuiescentError> {
@@ -11908,6 +12220,268 @@ where
 			funding_pubkey,
 			require_confirmed_inputs: None,
 		}
+	}
+
+	pub fn ack_teleport<L: Logger>(
+		&mut self, logger: &L,
+	) -> Result<(msgs::TeleportAck, Option<msgs::CommitmentSigned>), APIError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo }) => {
+				self.pending_teleport =
+					Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo });
+				let commitment_signed =
+					self.get_initial_teleport_commitment_signed(new_funding_txo, logger);
+				Ok((
+					msgs::TeleportAck { channel_id: self.context.channel_id() },
+					commitment_signed,
+				))
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(APIError::APIMisuseError {
+					err: format!(
+						"Channel {} is not awaiting teleport acknowledgement",
+						self.context.channel_id(),
+					),
+				})
+			},
+			None => Err(APIError::APIMisuseError {
+				err: format!("Channel {} has no pending teleport", self.context.channel_id()),
+			}),
+		}
+	}
+
+	pub fn cancel_teleport(&mut self) -> Result<(msgs::TeleportAbort, bool), APIError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingUserDecision { .. }) => {
+				let exited_quiescence = self.context.channel_state.is_quiescent();
+				self.context.channel_state.clear_quiescent();
+				Ok((msgs::TeleportAbort { channel_id: self.context.channel_id() }, exited_quiescence))
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(APIError::APIMisuseError {
+					err: format!(
+						"Channel {} cannot cancel teleport after acknowledgement",
+						self.context.channel_id(),
+					),
+				})
+			},
+			None => Err(APIError::APIMisuseError {
+				err: format!("Channel {} has no pending teleport", self.context.channel_id()),
+			}),
+		}
+	}
+
+	pub fn complete_teleport(&mut self) -> Result<msgs::TeleportComplete, APIError> {
+		if !self.context.is_live() {
+			return Err(APIError::ChannelUnavailable {
+				err: format!(
+					"Channel {} cannot complete teleport while disconnected",
+					self.context.channel_id(),
+				),
+			});
+		}
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingLocalComplete { new_funding_txo }) => {
+				self.pending_teleport =
+					Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo });
+				Ok(msgs::TeleportComplete { channel_id: self.context.channel_id() })
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(APIError::APIMisuseError {
+					err: format!(
+						"Channel {} is not ready to complete teleport",
+						self.context.channel_id(),
+					),
+				})
+			},
+			None => Err(APIError::APIMisuseError {
+				err: format!("Channel {} has no pending teleport", self.context.channel_id()),
+			}),
+		}
+	}
+
+	pub(crate) fn teleport_init(
+		&mut self, msg: &msgs::TeleportInit,
+	) -> Result<OutPoint, ChannelError> {
+		if !self.context.channel_state.is_quiescent() {
+			return Err(ChannelError::WarnAndDisconnect("Quiescence needed to teleport".to_owned()));
+		}
+		if self.pending_teleport.is_some() {
+			return Err(ChannelError::WarnAndDisconnect(format!(
+				"Channel {} already has a teleport pending",
+				self.context.channel_id(),
+			)));
+		}
+		if self.pending_splice.is_some() {
+			return Err(ChannelError::WarnAndDisconnect(format!(
+				"Channel {} cannot teleport while a splice is pending",
+				self.context.channel_id(),
+			)));
+		}
+		if !self.context.is_live() {
+			return Err(ChannelError::WarnAndDisconnect(
+				"Teleport requested on a channel that is not live".to_owned(),
+			));
+		}
+
+		self.pending_teleport =
+			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo: msg.new_funding_txo });
+		Ok(msg.new_funding_txo)
+	}
+
+	pub(crate) fn teleport_ack<L: Logger>(
+		&mut self, _msg: &msgs::TeleportAck, logger: &L,
+	) -> Result<Option<msgs::CommitmentSigned>, ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo }) => {
+				self.mark_response_received();
+				let commitment_signed =
+					self.get_initial_teleport_commitment_signed(new_funding_txo, logger);
+				self.pending_teleport =
+					Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
+						new_funding_txo,
+						is_initiator: true,
+					});
+				Ok(commitment_signed)
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::WarnAndDisconnect(
+					"Got unexpected teleport_ack".to_owned(),
+				))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_ack".to_owned())),
+		}
+	}
+
+	pub(crate) fn teleport_ack_sent(&mut self) -> Result<(), ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo }) => {
+				self.pending_teleport =
+					Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
+						new_funding_txo,
+						is_initiator: false,
+					});
+				Ok(())
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::Ignore("Got unexpected teleport_ack send".to_owned()))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_ack send".to_owned())),
+		}
+	}
+
+	pub(crate) fn teleport_abort(
+		&mut self, _msg: &msgs::TeleportAbort,
+	) -> Result<bool, ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportAck { .. }) => {
+				self.mark_response_received();
+				let exited_quiescence = self.context.channel_state.is_quiescent();
+				self.context.channel_state.clear_quiescent();
+				Ok(exited_quiescence)
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::WarnAndDisconnect("Got unexpected teleport_abort".to_owned()))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_abort".to_owned())),
+		}
+	}
+
+	pub(crate) fn teleport_complete<L: Logger>(
+		&mut self, _msg: &msgs::TeleportComplete, logger: &L,
+	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingRemoteComplete { new_funding_txo }) => {
+				self.pending_teleport =
+					Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo });
+				Ok(self.promote_teleport_funding(new_funding_txo, logger))
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::WarnAndDisconnect(
+					"Got unexpected teleport_complete".to_owned(),
+				))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_complete".to_owned())),
+		}
+	}
+
+	pub(crate) fn teleport_complete_ack_sent(&mut self) -> Result<bool, ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportCompleteAckSend { .. }) => {
+				let exited_quiescence = self.context.channel_state.is_quiescent();
+				self.context.channel_state.clear_quiescent();
+				Ok(exited_quiescence)
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::Ignore(
+					"Got unexpected teleport_complete_ack send".to_owned(),
+				))
+			},
+			None => Err(ChannelError::Ignore(
+				"Got unexpected teleport_complete_ack send".to_owned(),
+			)),
+		}
+	}
+
+	pub(crate) fn teleport_complete_ack<L: Logger>(
+		&mut self, _msg: &msgs::TeleportCompleteAck, logger: &L,
+	) -> Result<(bool, Option<ChannelMonitorUpdate>), ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) => {
+				self.mark_response_received();
+				let exited_quiescence = self.context.channel_state.is_quiescent();
+				self.context.channel_state.clear_quiescent();
+				Ok((
+					exited_quiescence,
+					self.promote_teleport_funding(new_funding_txo, logger),
+				))
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::WarnAndDisconnect(
+					"Got unexpected teleport_complete_ack".to_owned(),
+				))
+			},
+			None => Err(ChannelError::Ignore(
+				"Got unexpected teleport_complete_ack".to_owned(),
+			)),
+		}
+	}
+
+	fn teleport_commitment_signed<F: FeeEstimator, L: Logger>(
+		&mut self, msg: &msgs::CommitmentSigned, new_funding_txo: OutPoint, is_initiator: bool,
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
+		if msg.funding_txid != Some(new_funding_txo.txid) {
+			return Err(ChannelError::close(format!(
+				"Unexpected teleport funding txid {}; expected {}",
+				msg.funding_txid
+					.map(|txid| txid.to_string())
+					.unwrap_or_else(|| "none".to_owned()),
+				new_funding_txo.txid,
+			)));
+		}
+
+		let monitor_update = self.teleport_initial_commitment_signed(
+			msg,
+			new_funding_txo,
+			fee_estimator,
+			logger,
+		)?;
+		self.pending_teleport = Some(if is_initiator {
+			PendingTeleport::AwaitingLocalComplete { new_funding_txo }
+		} else {
+			PendingTeleport::AwaitingRemoteComplete { new_funding_txo }
+		});
+		Ok(monitor_update)
 	}
 
 	#[cfg(test)]
@@ -13129,6 +13703,23 @@ where
 					let splice_init = self.send_splice_init(context);
 					return Ok(Some(StfuResponse::SpliceInit(splice_init)));
 				},
+				Some(QuiescentAction::Teleport { new_funding_txo }) => {
+					if self.pending_teleport.is_some() {
+						debug_assert!(false);
+						self.quiescent_action =
+							Some(QuiescentAction::Teleport { new_funding_txo });
+						return Err(ChannelError::WarnAndDisconnect(
+							"Channel already has a teleport pending".to_owned(),
+						));
+					}
+
+					self.pending_teleport =
+						Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo });
+					return Ok(Some(StfuResponse::TeleportInit(msgs::TeleportInit {
+						channel_id: self.context.channel_id,
+						new_funding_txo,
+					})));
+				},
 				#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 				Some(QuiescentAction::DoNothing) => {
 					// In quiescence test we want to just hang out here, letting the test manually
@@ -13537,6 +14128,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			context: self.context,
 			holder_commitment_point,
 			pending_splice: None,
+			pending_teleport: None,
 			quiescent_action: None,
 		};
 
@@ -13837,6 +14429,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 			context: self.context,
 			holder_commitment_point,
 			pending_splice: None,
+			pending_teleport: None,
 			quiescent_action: None,
 		};
 		let need_channel_ready = channel.check_get_channel_ready(0, logger).is_some()
@@ -14313,12 +14906,14 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 					channel_state.clear_local_stfu_sent();
 					channel_state.clear_remote_stfu_sent();
 					if self.should_reset_pending_splice_state(false)
-						|| !self.has_pending_splice_awaiting_signatures()
+						|| (!self.has_pending_splice_awaiting_signatures()
+							&& !self.has_persistent_teleport())
 					{
 						// We shouldn't be quiescent anymore upon reconnecting if:
 						// - We were in quiescence but a splice/RBF was never negotiated or
 						// - We were in quiescence but the splice negotiation failed due to
 						// disconnecting
+						// - We were in quiescence for a teleport that never reached `teleport_ack`
 						channel_state.clear_quiescent();
 					}
 				},
@@ -14702,6 +15297,10 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		// can only read `FundingNegotiation::AwaitingSignatures` variants anyway.
 		let pending_splice =
 			self.pending_splice.as_ref().filter(|_| !self.should_reset_pending_splice_state(false));
+		let pending_teleport = self
+			.pending_teleport
+			.as_ref()
+			.filter(|pending_teleport| pending_teleport.is_persistent());
 
 		let monitor_pending_tx_signatures =
 			self.context.monitor_pending_tx_signatures.then_some(());
@@ -14764,6 +15363,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(75, inbound_committed_update_adds, optional_vec),
 			(77, holding_cell_accountable_flags, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
+			(81, pending_teleport, upgradable_option), // Added in 0.3
 		});
 
 		Ok(())
@@ -15146,6 +15746,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 		let mut minimum_depth_override: Option<u32> = None;
 
 		let mut pending_splice: Option<PendingFunding> = None;
+		let mut pending_teleport: Option<PendingTeleport> = None;
 
 		let mut pending_outbound_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
 		let mut holding_cell_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
@@ -15207,6 +15808,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(75, inbound_committed_update_adds_opt, optional_vec),
 			(77, holding_cell_accountable, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
+			(81, pending_teleport, upgradable_option), // Added in 0.3
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -15524,6 +16126,11 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				return Err(DecodeError::InvalidValue);
 			}
 		}
+		if let Some(pending_teleport) = pending_teleport.as_ref() {
+			if !pending_teleport.is_persistent() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
 
 		Ok(FundedChannel {
 			funding: FundingScope {
@@ -15664,6 +16271,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			},
 			holder_commitment_point,
 			pending_splice,
+			pending_teleport,
 			quiescent_action: None,
 		})
 	}

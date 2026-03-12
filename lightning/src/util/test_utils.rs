@@ -1361,6 +1361,23 @@ impl msgs::ChannelMessageHandler for TestChannelMessageHandler {
 	fn handle_splice_locked(&self, _their_node_id: PublicKey, msg: &msgs::SpliceLocked) {
 		self.received_msg(wire::Message::SpliceLocked(msg.clone()));
 	}
+	fn handle_teleport_init(&self, _their_node_id: PublicKey, msg: &msgs::TeleportInit) {
+		self.received_msg(wire::Message::TeleportInit(msg.clone()));
+	}
+	fn handle_teleport_ack(&self, _their_node_id: PublicKey, msg: &msgs::TeleportAck) {
+		self.received_msg(wire::Message::TeleportAck(msg.clone()));
+	}
+	fn handle_teleport_abort(&self, _their_node_id: PublicKey, msg: &msgs::TeleportAbort) {
+		self.received_msg(wire::Message::TeleportAbort(msg.clone()));
+	}
+	fn handle_teleport_complete(&self, _their_node_id: PublicKey, msg: &msgs::TeleportComplete) {
+		self.received_msg(wire::Message::TeleportComplete(msg.clone()));
+	}
+	fn handle_teleport_complete_ack(
+		&self, _their_node_id: PublicKey, msg: &msgs::TeleportCompleteAck,
+	) {
+		self.received_msg(wire::Message::TeleportCompleteAck(msg.clone()));
+	}
 	fn handle_update_add_htlc(&self, _their_node_id: PublicKey, msg: &msgs::UpdateAddHTLC) {
 		self.received_msg(wire::Message::UpdateAddHTLC(msg.clone()));
 	}

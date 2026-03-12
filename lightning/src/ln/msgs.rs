@@ -34,6 +34,7 @@ use bitcoin::{secp256k1, Transaction, Witness};
 use crate::blinded_path::message::BlindedMessagePath;
 use crate::blinded_path::payment::{BlindedPaymentTlvs, DummyTlvs, ForwardTlvs, ReceiveTlvs};
 use crate::blinded_path::payment::{BlindedTrampolineTlvs, TrampolineForwardTlvs};
+use crate::chain::transaction::OutPoint;
 use crate::ln::onion_utils;
 use crate::ln::types::ChannelId;
 use crate::offers::invoice_request::InvoiceRequest;
@@ -507,6 +508,43 @@ pub struct SpliceLocked {
 	pub channel_id: ChannelId,
 	/// The ID of the new funding transaction that has been locked
 	pub splice_txid: Txid,
+}
+
+/// A `teleport_init` message to be sent by or received from the stfu initiator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportInit {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
+	/// The outpoint of the replacement funding transaction agreed out of band.
+	pub new_funding_txo: OutPoint,
+}
+
+/// A `teleport_ack` message to be received by or sent to the teleport initiator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportAck {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
+}
+
+/// A `teleport_abort` message to be received by or sent to the teleport initiator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportAbort {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
+}
+
+/// A `teleport_complete` message to be sent by the teleport initiator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportComplete {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
+}
+
+/// A `teleport_complete_ack` message to be sent in response to `teleport_complete`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportCompleteAck {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
 }
 
 /// A [`tx_add_input`] message for adding an input during interactive transaction construction
@@ -1794,6 +1832,41 @@ pub enum MessageSendEvent {
 		/// The message which should be sent.
 		msg: SpliceLocked,
 	},
+	/// Used to indicate that a teleport_init message should be sent to the peer with the given node id.
+	SendTeleportInit {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportInit,
+	},
+	/// Used to indicate that a teleport_ack message should be sent to the peer with the given node id.
+	SendTeleportAck {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportAck,
+	},
+	/// Used to indicate that a teleport_abort message should be sent to the peer with the given node id.
+	SendTeleportAbort {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportAbort,
+	},
+	/// Used to indicate that a teleport_complete message should be sent to the peer with the given node id.
+	SendTeleportComplete {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportComplete,
+	},
+	/// Used to indicate that a teleport_complete_ack message should be sent to the peer with the given node id.
+	SendTeleportCompleteAck {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportCompleteAck,
+	},
 	/// Used to indicate that a tx_add_input message should be sent to the peer with the given node_id.
 	SendTxAddInput {
 		/// The node_id of the node which should receive this message
@@ -2145,6 +2218,16 @@ pub trait ChannelMessageHandler: BaseMessageHandler {
 	fn handle_splice_ack(&self, their_node_id: PublicKey, msg: &SpliceAck);
 	/// Handle an incoming `splice_locked` message from the given peer.
 	fn handle_splice_locked(&self, their_node_id: PublicKey, msg: &SpliceLocked);
+	/// Handle an incoming `teleport_init` message from the given peer.
+	fn handle_teleport_init(&self, their_node_id: PublicKey, msg: &TeleportInit);
+	/// Handle an incoming `teleport_ack` message from the given peer.
+	fn handle_teleport_ack(&self, their_node_id: PublicKey, msg: &TeleportAck);
+	/// Handle an incoming `teleport_abort` message from the given peer.
+	fn handle_teleport_abort(&self, their_node_id: PublicKey, msg: &TeleportAbort);
+	/// Handle an incoming `teleport_complete` message from the given peer.
+	fn handle_teleport_complete(&self, their_node_id: PublicKey, msg: &TeleportComplete);
+	/// Handle an incoming `teleport_complete_ack` message from the given peer.
+	fn handle_teleport_complete_ack(&self, their_node_id: PublicKey, msg: &TeleportCompleteAck);
 
 	// Interactive channel construction
 	/// Handle an incoming `tx_add_input message` from the given peer.
@@ -2288,6 +2371,21 @@ impl<T: ChannelMessageHandler + ?Sized, C: Deref<Target = T>> ChannelMessageHand
 	}
 	fn handle_splice_locked(&self, their_node_id: PublicKey, msg: &SpliceLocked) {
 		self.deref().handle_splice_locked(their_node_id, msg)
+	}
+	fn handle_teleport_init(&self, their_node_id: PublicKey, msg: &TeleportInit) {
+		self.deref().handle_teleport_init(their_node_id, msg)
+	}
+	fn handle_teleport_ack(&self, their_node_id: PublicKey, msg: &TeleportAck) {
+		self.deref().handle_teleport_ack(their_node_id, msg)
+	}
+	fn handle_teleport_abort(&self, their_node_id: PublicKey, msg: &TeleportAbort) {
+		self.deref().handle_teleport_abort(their_node_id, msg)
+	}
+	fn handle_teleport_complete(&self, their_node_id: PublicKey, msg: &TeleportComplete) {
+		self.deref().handle_teleport_complete(their_node_id, msg)
+	}
+	fn handle_teleport_complete_ack(&self, their_node_id: PublicKey, msg: &TeleportCompleteAck) {
+		self.deref().handle_teleport_complete_ack(their_node_id, msg)
 	}
 	fn handle_tx_add_input(&self, their_node_id: PublicKey, msg: &TxAddInput) {
 		self.deref().handle_tx_add_input(their_node_id, msg)
@@ -3087,6 +3185,27 @@ impl_writeable_msg!(SpliceAck, {
 impl_writeable_msg!(SpliceLocked, {
 	channel_id,
 	splice_txid,
+}, {});
+
+impl_writeable_msg!(TeleportInit, {
+	channel_id,
+	new_funding_txo,
+}, {});
+
+impl_writeable_msg!(TeleportAck, {
+	channel_id,
+}, {});
+
+impl_writeable_msg!(TeleportAbort, {
+	channel_id,
+}, {});
+
+impl_writeable_msg!(TeleportComplete, {
+	channel_id,
+}, {});
+
+impl_writeable_msg!(TeleportCompleteAck, {
+	channel_id,
 }, {});
 
 impl Writeable for TxAddInput {

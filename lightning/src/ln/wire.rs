@@ -76,6 +76,11 @@ pub(crate) enum Message<T: core::fmt::Debug + Type + TestEq> {
 	SpliceInit(msgs::SpliceInit),
 	SpliceAck(msgs::SpliceAck),
 	SpliceLocked(msgs::SpliceLocked),
+	TeleportInit(msgs::TeleportInit),
+	TeleportAck(msgs::TeleportAck),
+	TeleportAbort(msgs::TeleportAbort),
+	TeleportComplete(msgs::TeleportComplete),
+	TeleportCompleteAck(msgs::TeleportCompleteAck),
 	TxAddInput(msgs::TxAddInput),
 	TxAddOutput(msgs::TxAddOutput),
 	TxRemoveInput(msgs::TxRemoveInput),
@@ -138,6 +143,11 @@ impl<T: core::fmt::Debug + Type + TestEq> Writeable for Message<T> {
 			&Message::SpliceInit(ref msg) => msg.write(writer),
 			&Message::SpliceAck(ref msg) => msg.write(writer),
 			&Message::SpliceLocked(ref msg) => msg.write(writer),
+			&Message::TeleportInit(ref msg) => msg.write(writer),
+			&Message::TeleportAck(ref msg) => msg.write(writer),
+			&Message::TeleportAbort(ref msg) => msg.write(writer),
+			&Message::TeleportComplete(ref msg) => msg.write(writer),
+			&Message::TeleportCompleteAck(ref msg) => msg.write(writer),
 			&Message::TxAddInput(ref msg) => msg.write(writer),
 			&Message::TxAddOutput(ref msg) => msg.write(writer),
 			&Message::TxRemoveInput(ref msg) => msg.write(writer),
@@ -200,6 +210,11 @@ impl<T: core::fmt::Debug + Type + TestEq> Type for Message<T> {
 			&Message::SpliceInit(ref msg) => msg.type_id(),
 			&Message::SpliceAck(ref msg) => msg.type_id(),
 			&Message::SpliceLocked(ref msg) => msg.type_id(),
+			&Message::TeleportInit(ref msg) => msg.type_id(),
+			&Message::TeleportAck(ref msg) => msg.type_id(),
+			&Message::TeleportAbort(ref msg) => msg.type_id(),
+			&Message::TeleportComplete(ref msg) => msg.type_id(),
+			&Message::TeleportCompleteAck(ref msg) => msg.type_id(),
 			&Message::TxAddInput(ref msg) => msg.type_id(),
 			&Message::TxAddOutput(ref msg) => msg.type_id(),
 			&Message::TxRemoveInput(ref msg) => msg.type_id(),
@@ -321,6 +336,21 @@ where
 		},
 		msgs::SpliceLocked::TYPE => {
 			Ok(Message::SpliceLocked(LengthReadable::read_from_fixed_length_buffer(buffer)?))
+		},
+		msgs::TeleportInit::TYPE => {
+			Ok(Message::TeleportInit(LengthReadable::read_from_fixed_length_buffer(buffer)?))
+		},
+		msgs::TeleportAck::TYPE => {
+			Ok(Message::TeleportAck(LengthReadable::read_from_fixed_length_buffer(buffer)?))
+		},
+		msgs::TeleportAbort::TYPE => {
+			Ok(Message::TeleportAbort(LengthReadable::read_from_fixed_length_buffer(buffer)?))
+		},
+		msgs::TeleportComplete::TYPE => {
+			Ok(Message::TeleportComplete(LengthReadable::read_from_fixed_length_buffer(buffer)?))
+		},
+		msgs::TeleportCompleteAck::TYPE => {
+			Ok(Message::TeleportCompleteAck(LengthReadable::read_from_fixed_length_buffer(buffer)?))
 		},
 		msgs::TxAddInput::TYPE => {
 			Ok(Message::TxAddInput(LengthReadable::read_from_fixed_length_buffer(buffer)?))
@@ -565,6 +595,26 @@ impl Encode for msgs::SpliceAck {
 
 impl Encode for msgs::SpliceLocked {
 	const TYPE: u16 = 77;
+}
+
+impl Encode for msgs::TeleportInit {
+	const TYPE: u16 = 82;
+}
+
+impl Encode for msgs::TeleportAck {
+	const TYPE: u16 = 83;
+}
+
+impl Encode for msgs::TeleportAbort {
+	const TYPE: u16 = 84;
+}
+
+impl Encode for msgs::TeleportComplete {
+	const TYPE: u16 = 85;
+}
+
+impl Encode for msgs::TeleportCompleteAck {
+	const TYPE: u16 = 86;
 }
 
 impl Encode for msgs::TxAddInput {
