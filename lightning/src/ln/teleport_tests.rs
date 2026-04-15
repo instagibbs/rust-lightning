@@ -269,6 +269,114 @@ fn test_channel_teleport_disconnect_before_ack_sent_abandons_attempt() {
 }
 
 #[test]
+fn test_channel_teleport_disconnect_before_ack_sent_allows_fresh_attempt_after_reconnect() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+	let replacement_funding_txo = test_outpoint(7, 0);
+
+	start_teleport(initiator, responder, channel_id, test_outpoint(5, 0));
+	let _ = get_event!(responder, Event::ChannelTeleport);
+	responder.node.ack_teleport(&channel_id, &initiator_id).unwrap();
+
+	initiator.node.peer_disconnected(responder_id);
+	responder.node.peer_disconnected(initiator_id);
+
+	let mut reconnect_args = ReconnectArgs::new(initiator, responder);
+	reconnect_args.send_channel_ready = (true, true);
+	reconnect_args.send_announcement_sigs = (true, true);
+	reconnect_nodes(reconnect_args);
+
+	start_teleport(initiator, responder, channel_id, replacement_funding_txo);
+	match get_event!(responder, Event::ChannelTeleport) {
+		Event::ChannelTeleport {
+			channel_id: ev_channel_id,
+			user_channel_id: _,
+			counterparty_node_id,
+			new_funding_txo: ev_outpoint,
+		} => {
+			assert_eq!(ev_channel_id, channel_id);
+			assert_eq!(counterparty_node_id, initiator_id);
+			assert_eq!(ev_outpoint, replacement_funding_txo.into_bitcoin_outpoint());
+		},
+		_ => panic!(),
+	}
+	ack_teleport(initiator, responder, channel_id);
+
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
+}
+
+#[test]
+fn test_channel_teleport_disconnect_after_ack_dequeued_before_delivery_allows_fresh_attempt_after_reconnect() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+	let replacement_funding_txo = test_outpoint(8, 0);
+
+	start_teleport(initiator, responder, channel_id, test_outpoint(5, 0));
+	let _ = get_event!(responder, Event::ChannelTeleport);
+	responder.node.ack_teleport(&channel_id, &initiator_id).unwrap();
+
+	let mut responder_events = responder.node.get_and_clear_pending_msg_events();
+	assert_eq!(responder_events.len(), 2, "{responder_events:?}");
+	match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::SendTeleportAck { .. } => {},
+		event => panic!("Unexpected event {event:?}"),
+	};
+	match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::UpdateHTLCs { updates, .. } => {
+			assert_eq!(updates.commitment_signed.len(), 1);
+		},
+		event => panic!("Unexpected event {event:?}"),
+	};
+	assert!(responder_events.is_empty());
+
+	initiator.node.peer_disconnected(responder_id);
+	responder.node.peer_disconnected(initiator_id);
+
+	let mut reconnect_args = ReconnectArgs::new(initiator, responder);
+	reconnect_args.send_channel_ready = (true, true);
+	reconnect_args.send_announcement_sigs = (true, true);
+	reconnect_nodes(reconnect_args);
+
+	start_teleport(initiator, responder, channel_id, replacement_funding_txo);
+	match get_event!(responder, Event::ChannelTeleport) {
+		Event::ChannelTeleport {
+			channel_id: ev_channel_id,
+			user_channel_id: _,
+			counterparty_node_id,
+			new_funding_txo: ev_outpoint,
+		} => {
+			assert_eq!(ev_channel_id, channel_id);
+			assert_eq!(counterparty_node_id, initiator_id);
+			assert_eq!(ev_outpoint, replacement_funding_txo.into_bitcoin_outpoint());
+		},
+		_ => panic!(),
+	}
+	ack_teleport(initiator, responder, channel_id);
+
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
+}
+
+#[test]
 fn test_channel_teleport_disconnect_after_ack_preserves_quiescence() {
 	let chanmon_cfgs = create_chanmon_cfgs(2);
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);

@@ -1785,6 +1785,9 @@ where
 					//
 					// NOTE: While `exit_quiescence` clears the disconnect timer, it should already
 					// have been cleared by `remove_uncommitted_htlcs_and_mark_paused`.
+					if matches!(chan.quiescent_action, Some(QuiescentAction::Teleport { .. })) {
+						chan.quiescent_action = None;
+					}
 					chan.exit_quiescence();
 					None
 				} else {
@@ -3353,7 +3356,7 @@ impl PendingTeleport {
 	fn is_persistent(&self) -> bool {
 		matches!(
 			self,
-			Self::AwaitingRemoteCommitmentSigned { .. }
+			Self::AwaitingRemoteCommitmentSigned { is_initiator: true, .. }
 				| Self::AwaitingLocalComplete { .. }
 				| Self::AwaitingRemoteComplete { .. }
 				| Self::AwaitingTeleportCompleteAck { .. }
