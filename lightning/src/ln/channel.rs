@@ -1724,6 +1724,9 @@ where
 					// - We were in quiescence but a splice/RBF was never negotiated or
 					// - We were in quiescence but the splice negotiation failed due to disconnecting
 					// - We were in quiescence for a teleport that never reached `teleport_ack`
+					if matches!(chan.quiescent_action, Some(QuiescentAction::Teleport { .. })) {
+						chan.quiescent_action = None;
+					}
 					chan.context.channel_state.clear_quiescent();
 					None
 				} else {
@@ -3089,7 +3092,7 @@ impl PendingTeleport {
 	fn is_persistent(&self) -> bool {
 		matches!(
 			self,
-			Self::AwaitingRemoteCommitmentSigned { .. }
+			Self::AwaitingRemoteCommitmentSigned { is_initiator: true, .. }
 				| Self::AwaitingLocalComplete { .. }
 				| Self::AwaitingRemoteComplete { .. }
 				| Self::AwaitingTeleportCompleteAck { .. }
