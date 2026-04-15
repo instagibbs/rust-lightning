@@ -17386,6 +17386,9 @@ impl<
 					}
 				},
 			};
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			persist
 		});
