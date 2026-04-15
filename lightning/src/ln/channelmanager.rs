@@ -4952,8 +4952,7 @@ impl<
 	/// This enters quiescence first and, once both peers are quiescent, sends `teleport_init` to
 	/// the counterparty containing `new_funding_txo`.
 	pub fn teleport_channel(
-		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
-		new_funding_txo: OutPoint,
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, new_funding_txo: OutPoint,
 	) -> Result<(), APIError> {
 		let mut result = Ok(());
 		PersistenceNotifierGuard::optionally_notify(self, || {
@@ -4985,10 +4984,12 @@ impl<
 						match chan.teleport_channel(new_funding_txo, &&logger) {
 							Ok(stfu_opt) => {
 								if let Some(msg) = stfu_opt {
-									peer_state.pending_msg_events.push(MessageSendEvent::SendStfu {
-										node_id: *counterparty_node_id,
-										msg,
-									});
+									peer_state.pending_msg_events.push(
+										MessageSendEvent::SendStfu {
+											node_id: *counterparty_node_id,
+											msg,
+										},
+									);
 								}
 								result = Ok(());
 								NotifyOption::DoPersist
@@ -5046,23 +5047,27 @@ impl<
 						let logger = WithChannelContext::from(&self.logger, &chan.context, None);
 						match chan.ack_teleport(&&logger) {
 							Ok((msg, commitment_signed)) => {
-								peer_state.pending_msg_events.push(MessageSendEvent::SendTeleportAck {
-									node_id: *counterparty_node_id,
-									msg,
-								});
-								if let Some(commitment_signed) = commitment_signed {
-									peer_state.pending_msg_events.push(MessageSendEvent::UpdateHTLCs {
+								peer_state.pending_msg_events.push(
+									MessageSendEvent::SendTeleportAck {
 										node_id: *counterparty_node_id,
-										channel_id: *channel_id,
-										updates: CommitmentUpdate {
-											commitment_signed: vec![commitment_signed],
-											update_add_htlcs: vec![],
-											update_fulfill_htlcs: vec![],
-											update_fail_htlcs: vec![],
-											update_fail_malformed_htlcs: vec![],
-											update_fee: None,
+										msg,
+									},
+								);
+								if let Some(commitment_signed) = commitment_signed {
+									peer_state.pending_msg_events.push(
+										MessageSendEvent::UpdateHTLCs {
+											node_id: *counterparty_node_id,
+											channel_id: *channel_id,
+											updates: CommitmentUpdate {
+												commitment_signed: vec![commitment_signed],
+												update_add_htlcs: vec![],
+												update_fulfill_htlcs: vec![],
+												update_fail_htlcs: vec![],
+												update_fail_malformed_htlcs: vec![],
+												update_fee: None,
+											},
 										},
-									});
+									);
 								}
 								result = Ok(());
 								NotifyOption::DoPersist
@@ -5120,12 +5125,15 @@ impl<
 					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
 						match chan.cancel_teleport() {
 							Ok((msg, exited_quiescence)) => {
-								peer_state.pending_msg_events.push(MessageSendEvent::SendTeleportAbort {
-									node_id: *counterparty_node_id,
-									msg,
-								});
+								peer_state.pending_msg_events.push(
+									MessageSendEvent::SendTeleportAbort {
+										node_id: *counterparty_node_id,
+										msg,
+									},
+								);
 								if exited_quiescence {
-									holding_cell_res = self.check_free_peer_holding_cells(peer_state);
+									holding_cell_res =
+										self.check_free_peer_holding_cells(peer_state);
 								}
 								result = Ok(());
 								NotifyOption::DoPersist
@@ -10068,7 +10076,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: &HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -10106,7 +10115,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -12313,6 +12323,23 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		MsgHandleErrInternal::from_chan_no_close(err, channel_id)
 	}
 
+	fn note_post_teleport_complete_ack_activity(
+		&self, counterparty_node_id: &PublicKey, channel_id: ChannelId,
+	) {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let Some(peer_state_mutex) = per_peer_state.get(counterparty_node_id) else {
+			return;
+		};
+		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+		if let Some(chan) = peer_state_lock
+			.channel_by_id
+			.get_mut(&channel_id)
+			.and_then(Channel::as_funded_mut)
+		{
+			chan.note_counterparty_post_teleport_complete_ack_activity();
+		}
+	}
+
 	fn internal_tx_msg<
 		HandleTxMsgFn: Fn(&mut Channel<SP>) -> Result<InteractiveTxMessageSend, InteractiveTxMsgError>,
 	>(
@@ -13765,7 +13792,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						let (htlc_forwards, decode_update_add_htlcs) = self.handle_channel_resumption(
 							&mut peer_state.pending_msg_events, chan, responses.raa, responses.commitment_update, responses.commitment_order,
 							Vec::new(), Vec::new(), None, responses.channel_ready, responses.announcement_sigs,
-							funding_tx_signed, None, responses.tx_abort, responses.channel_ready_order,
+							funding_tx_signed, responses.teleport_complete_ack, responses.tx_abort,
+							responses.channel_ready_order,
 						);
 						debug_assert!(htlc_forwards.is_empty());
 						debug_assert!(decode_update_add_htlcs.is_none());
@@ -14230,9 +14258,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					try_channel_entry!(
 						self,
 						peer_state,
-						Err(ChannelError::close(
-							"Channel is not funded, cannot teleport".into()
-						)),
+						Err(ChannelError::close("Channel is not funded, cannot teleport".into())),
 						chan_entry
 					)
 				}
@@ -14283,9 +14309,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					try_channel_entry!(
 						self,
 						peer_state,
-						Err(ChannelError::close(
-							"Channel is not funded, cannot teleport".into()
-						)),
+						Err(ChannelError::close("Channel is not funded, cannot teleport".into())),
 						chan_entry
 					)
 				}
@@ -14313,8 +14337,12 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				},
 				hash_map::Entry::Occupied(mut chan_entry) => {
 					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
-						let exited_quiescence =
-							try_channel_entry!(self, peer_state, chan.teleport_abort(msg), chan_entry);
+						let exited_quiescence = try_channel_entry!(
+							self,
+							peer_state,
+							chan.teleport_abort(msg),
+							chan_entry
+						);
 						if exited_quiescence {
 							self.check_free_peer_holding_cells(peer_state)
 						} else {
@@ -14386,9 +14414,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 					try_channel_entry!(
 						self,
 						peer_state,
-						Err(ChannelError::close(
-							"Channel is not funded, cannot teleport".into()
-						)),
+						Err(ChannelError::close("Channel is not funded, cannot teleport".into())),
 						chan_entry
 					)
 				}
@@ -16900,7 +16926,8 @@ impl<
 					}
 				}
 				if exited_quiescence {
-					holding_cell_results.append(&mut self.check_free_peer_holding_cells(peer_state));
+					holding_cell_results
+						.append(&mut self.check_free_peer_holding_cells(peer_state));
 				}
 
 				if peer_state.pending_msg_events.len() > 0 {
@@ -17695,6 +17722,9 @@ impl<
 	fn handle_splice_locked(&self, counterparty_node_id: PublicKey, msg: &msgs::SpliceLocked) {
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let res = self.internal_splice_locked(&counterparty_node_id, msg);
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
 				Err(_) => NotifyOption::SkipPersistHandleEvents,
@@ -17777,12 +17807,18 @@ impl<
 	fn handle_shutdown(&self, counterparty_node_id: PublicKey, msg: &msgs::Shutdown) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_shutdown(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
 	fn handle_closing_signed(&self, counterparty_node_id: PublicKey, msg: &msgs::ClosingSigned) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_closing_signed(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
@@ -17809,6 +17845,9 @@ impl<
 				Err(_) => NotifyOption::SkipPersistHandleEvents,
 				Ok(()) => NotifyOption::SkipPersistNoEvents,
 			};
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			persist
 		});
@@ -17818,7 +17857,11 @@ impl<
 		&self, counterparty_node_id: PublicKey, msg: msgs::UpdateFulfillHTLC,
 	) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let channel_id = msg.channel_id;
 		let res = self.internal_update_fulfill_htlc(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
@@ -17833,6 +17876,9 @@ impl<
 				Err(_) => NotifyOption::SkipPersistHandleEvents,
 				Ok(()) => NotifyOption::SkipPersistNoEvents,
 			};
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			persist
 		});
@@ -17851,6 +17897,9 @@ impl<
 				Err(_) => NotifyOption::SkipPersistHandleEvents,
 				Ok(()) => NotifyOption::SkipPersistNoEvents,
 			};
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			persist
 		});
@@ -17861,6 +17910,9 @@ impl<
 	) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_commitment_signed(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
@@ -17870,12 +17922,18 @@ impl<
 	) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_commitment_signed_batch(&counterparty_node_id, channel_id, batch);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
 	fn handle_revoke_and_ack(&self, counterparty_node_id: PublicKey, msg: &msgs::RevokeAndACK) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_revoke_and_ack(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
@@ -18043,6 +18101,9 @@ impl<
 		let _persistence_guard = PersistenceNotifierGuard::manually_notify(self, || {
 			let res = self.internal_tx_add_input(counterparty_node_id, msg);
 			debug_assert!(res.as_ref().err().map_or(true, |err| !err.closes_channel()));
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			self.event_persist_notifier.notify();
 		});
@@ -18052,6 +18113,9 @@ impl<
 		let _persistence_guard = PersistenceNotifierGuard::manually_notify(self, || {
 			let res = self.internal_tx_add_output(counterparty_node_id, msg);
 			debug_assert!(res.as_ref().err().map_or(true, |err| !err.closes_channel()));
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			self.event_persist_notifier.notify();
 		});
@@ -18061,6 +18125,9 @@ impl<
 		let _persistence_guard = PersistenceNotifierGuard::manually_notify(self, || {
 			let res = self.internal_tx_remove_input(counterparty_node_id, msg);
 			debug_assert!(res.as_ref().err().map_or(true, |err| !err.closes_channel()));
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			self.event_persist_notifier.notify();
 		});
@@ -18070,6 +18137,9 @@ impl<
 		let _persistence_guard = PersistenceNotifierGuard::manually_notify(self, || {
 			let res = self.internal_tx_remove_output(counterparty_node_id, msg);
 			debug_assert!(res.as_ref().err().map_or(true, |err| !err.closes_channel()));
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			self.event_persist_notifier.notify();
 		});
@@ -18079,6 +18149,9 @@ impl<
 		let _persistence_guard = PersistenceNotifierGuard::manually_notify(self, || {
 			let res = self.internal_tx_complete(counterparty_node_id, msg);
 			debug_assert!(res.as_ref().err().map_or(true, |err| !err.closes_channel()));
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let _ = self.handle_error(res, counterparty_node_id);
 			self.event_persist_notifier.notify();
 		});
@@ -18087,6 +18160,9 @@ impl<
 	fn handle_tx_signatures(&self, counterparty_node_id: PublicKey, msg: &msgs::TxSignatures) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_tx_signatures(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
@@ -18122,6 +18198,9 @@ impl<
 		// be persisted before any signatures are exchanged.
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let res = self.internal_tx_abort(&counterparty_node_id, msg);
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
 				Err(_) => NotifyOption::SkipPersistHandleEvents,

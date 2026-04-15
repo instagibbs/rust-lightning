@@ -1285,6 +1285,7 @@ pub(super) struct ReestablishResponses {
 	pub announcement_sigs: Option<msgs::AnnouncementSignatures>,
 	pub shutdown_msg: Option<msgs::Shutdown>,
 	pub tx_signatures: Option<msgs::TxSignatures>,
+	pub teleport_complete_ack: Option<msgs::TeleportCompleteAck>,
 	pub tx_abort: Option<msgs::TxAbort>,
 	pub splice_locked: Option<msgs::SpliceLocked>,
 	pub inferred_splice_locked: Option<msgs::SpliceLocked>,
@@ -3350,6 +3351,7 @@ pub(crate) enum PendingTeleport {
 	AwaitingRemoteComplete { new_funding_txo: OutPoint },
 	AwaitingTeleportCompleteAck { new_funding_txo: OutPoint },
 	AwaitingTeleportCompleteAckSend { new_funding_txo: OutPoint },
+	AwaitingRemoteActivityAfterTeleportCompleteAckSend { new_funding_txo: OutPoint },
 }
 
 impl PendingTeleport {
@@ -3361,6 +3363,7 @@ impl PendingTeleport {
 				| Self::AwaitingRemoteComplete { .. }
 				| Self::AwaitingTeleportCompleteAck { .. }
 				| Self::AwaitingTeleportCompleteAckSend { .. }
+				| Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. }
 		)
 	}
 }
@@ -3389,6 +3392,9 @@ impl_writeable_tlv_based_enum_upgradable!(PendingTeleport,
 		(0, new_funding_txo, required),
 	},
 	(14, AwaitingTeleportCompleteAckSend) => {
+		(0, new_funding_txo, required),
+	},
+	(16, AwaitingRemoteActivityAfterTeleportCompleteAckSend) => {
 		(0, new_funding_txo, required),
 	},
 );
@@ -7543,6 +7549,20 @@ where
 		FundingScope::for_teleport(&self.funding, new_funding_txo)
 	}
 
+	fn get_pending_teleport_complete_ack(&self) -> Option<msgs::TeleportCompleteAck> {
+		self.pending_teleport.as_ref().and_then(|pending_teleport| {
+			if matches!(
+				pending_teleport,
+				PendingTeleport::AwaitingTeleportCompleteAckSend { .. }
+					| PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. }
+			) {
+				Some(msgs::TeleportCompleteAck { channel_id: self.context.channel_id() })
+			} else {
+				None
+			}
+		})
+	}
+
 	fn get_initial_teleport_commitment_signed<L: Logger>(
 		&mut self, new_funding_txo: OutPoint, logger: &L,
 	) -> Option<msgs::CommitmentSigned> {
@@ -10459,16 +10479,7 @@ where
 			channel_ready
 		} else { None };
 
-		let teleport_complete_ack = self.pending_teleport.as_ref().and_then(|pending_teleport| {
-			if matches!(
-				pending_teleport,
-				PendingTeleport::AwaitingTeleportCompleteAckSend { .. }
-			) {
-				Some(msgs::TeleportCompleteAck { channel_id: self.context.channel_id() })
-			} else {
-				None
-			}
-		});
+		let teleport_complete_ack = self.get_pending_teleport_complete_ack();
 
 		let announcement_sigs = self.get_announcement_sigs(node_signer, chain_hash, user_config, best_block_height, logger);
 		requires_channel_manager_persistence |= announcement_sigs.is_some();
@@ -11225,6 +11236,8 @@ where
 			funding_mut.signing_nonce = Some(next_local_nonce);
 		}
 
+		let teleport_complete_ack = self.get_pending_teleport_complete_ack();
+
 		if matches!(self.context.channel_state, ChannelState::AwaitingChannelReady(_)) {
 			// If we're waiting on a monitor update, we shouldn't re-send any channel_ready's.
 			if !self.context.channel_state.is_our_channel_ready() ||
@@ -11240,6 +11253,7 @@ where
 					commitment_order: self.context.resend_order.clone(),
 					shutdown_msg, announcement_sigs,
 					tx_signatures,
+					teleport_complete_ack,
 					tx_abort: None,
 					splice_locked: None,
 					inferred_splice_locked: None,
@@ -11254,6 +11268,7 @@ where
 				commitment_order: self.context.resend_order.clone(),
 				shutdown_msg, announcement_sigs,
 				tx_signatures,
+				teleport_complete_ack,
 				tx_abort,
 				splice_locked: None,
 				inferred_splice_locked: None,
@@ -11351,6 +11366,7 @@ where
 				commitment_update,
 				commitment_order: self.context.resend_order.clone(),
 				tx_signatures,
+				teleport_complete_ack,
 				tx_abort,
 				splice_locked,
 				inferred_splice_locked,
@@ -11377,6 +11393,7 @@ where
 					commitment_update: None, raa: None,
 					commitment_order: self.context.resend_order.clone(),
 					tx_signatures: None,
+					teleport_complete_ack,
 					tx_abort,
 					splice_locked,
 					inferred_splice_locked,
@@ -11405,6 +11422,7 @@ where
 					raa, commitment_update,
 					commitment_order: self.context.resend_order.clone(),
 					tx_signatures: None,
+					teleport_complete_ack,
 					tx_abort,
 					splice_locked,
 					inferred_splice_locked,
@@ -14402,7 +14420,12 @@ where
 
 	pub(crate) fn teleport_complete_ack_sent(&mut self) -> Result<bool, ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportCompleteAckSend { .. }) => {
+			Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo }) => {
+				self.pending_teleport = Some(
+					PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+						new_funding_txo,
+					},
+				);
 				let exited_quiescence = self.context.channel_state.is_quiescent();
 				self.context.channel_state.clear_quiescent();
 				Ok(exited_quiescence)
@@ -14416,6 +14439,17 @@ where
 			None => Err(ChannelError::Ignore(
 				"Got unexpected teleport_complete_ack send".to_owned(),
 			)),
+		}
+	}
+
+	pub(crate) fn note_counterparty_post_teleport_complete_ack_activity(&mut self) {
+		if matches!(
+			self.pending_teleport,
+			Some(PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+				..
+			})
+		) {
+			self.pending_teleport = None;
 		}
 	}
 
