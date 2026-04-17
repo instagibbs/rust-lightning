@@ -1362,6 +1362,7 @@ mod tests {
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 			channel_value_satoshis: 0,
+			ark_htlc_success_csv_delta: None,
 		};
 
 		// Create an OnchainTxHandler for a commitment containing HTLCs with CLTV expiries of 0, 1,
@@ -1377,6 +1378,7 @@ mod tests {
 					cltv_expiry: i as u32,
 					payment_hash: hash,
 					transaction_output_index: Some(i as u32),
+					ark_htlc_success_csv_delta: None,
 				}
 			);
 		}
