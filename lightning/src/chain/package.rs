@@ -852,10 +852,15 @@ impl PackageSolvingData {
 		let sequence = match self {
 			PackageSolvingData::RevokedOutput(_) => Sequence::ENABLE_RBF_NO_LOCKTIME,
 			PackageSolvingData::RevokedHTLCOutput(_) => Sequence::ENABLE_RBF_NO_LOCKTIME,
-			PackageSolvingData::CounterpartyOfferedHTLCOutput(outp) => if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
-				Sequence::from_consensus(1)
-			} else {
-				Sequence::ENABLE_RBF_NO_LOCKTIME
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(outp) => {
+				// Ark-on-Lightning: when the counterparty-offered HTLC carries a
+				// success-branch CSV delta, the preimage spend this package constructs must
+				// satisfy that relative timelock. Use the max of the baseline anchor CSV
+				// (1 block if applicable) and the Ark delta.
+				let baseline: u32 = if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx() { 1 } else { 0 };
+				let ark_csv: u32 = outp.htlc.ark_htlc_success_csv_delta.unwrap_or(0) as u32;
+				let csv = core::cmp::max(baseline, ark_csv);
+				if csv == 0 { Sequence::ENABLE_RBF_NO_LOCKTIME } else { Sequence::from_consensus(csv) }
 			},
 			PackageSolvingData::CounterpartyReceivedHTLCOutput(outp) => if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
 				Sequence::from_consensus(1)
