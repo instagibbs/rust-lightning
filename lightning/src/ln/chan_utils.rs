@@ -933,13 +933,21 @@ pub fn build_htlc_transaction(
 
 #[rustfmt::skip]
 pub(crate) fn build_htlc_input(commitment_txid: &Txid, htlc: &HTLCOutputInCommitment, channel_type_features: &ChannelTypeFeatures) -> TxIn {
+	let baseline_csv = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { 1 } else { 0 };
+	// When the HTLC carries an Ark success-branch CSV delta, the HTLC-Success tx spending this
+	// input must satisfy that relative timelock too. The HTLC-Timeout tx spends through a
+	// different script branch that doesn't have the Ark CSV, but using the same nSequence for
+	// both 2nd-stage txs is still valid (it's >= the baseline anchor CSV) and keeps the pre-
+	// signed tx templates symmetric across both parties.
+	let ark_csv = htlc.ark_htlc_success_csv_delta.unwrap_or(0) as u32;
+	let sequence = core::cmp::max(baseline_csv, ark_csv);
 	TxIn {
 		previous_output: OutPoint {
 			txid: commitment_txid.clone(),
 			vout: htlc.transaction_output_index.expect("Can't build an HTLC transaction for a dust output"),
 		},
 		script_sig: ScriptBuf::new(),
-		sequence: Sequence(if channel_type_features.supports_anchors_zero_fee_htlc_tx() { 1 } else { 0 }),
+		sequence: Sequence(sequence),
 		witness: Witness::new(),
 	}
 }
