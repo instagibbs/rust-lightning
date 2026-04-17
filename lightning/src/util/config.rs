@@ -269,6 +269,19 @@ pub struct ChannelHandshakeConfig {
 	///
 	/// [`negotiate_ark_channel`]: ChannelHandshakeConfig::negotiate_ark_channel
 	pub ark_exit_delay: Option<u16>,
+	/// Ark-on-Lightning: if `Some`, every HTLC output on this channel's commitment transactions
+	/// carries an additional relative timelock of this many blocks on the preimage-revealing
+	/// (success) branch. This is a consensus-enforced race edge that ensures the counterparty's
+	/// timeout claim path activates before the local success path, so the Ark server never has to
+	/// unroll the tree to resolve an HTLC.
+	///
+	/// Both sides of the channel must set this to the same value for the channel's commitment
+	/// signatures to validate. Intended for use only between Ark-aware peers; there is no
+	/// feature-bit negotiation yet, so setting this with a stock LDK counterparty will break the
+	/// channel.
+	///
+	/// Default value: `None` (standard BOLT-3 HTLC script shape).
+	pub ark_htlc_success_csv_delta: Option<u16>,
 }
 
 impl Default for ChannelHandshakeConfig {
@@ -288,6 +301,7 @@ impl Default for ChannelHandshakeConfig {
 			our_max_accepted_htlcs: 50,
 			negotiate_ark_channel: false,
 			ark_exit_delay: None,
+			ark_htlc_success_csv_delta: None,
 		}
 	}
 }
@@ -322,6 +336,7 @@ impl Readable for ChannelHandshakeConfig {
 			our_max_accepted_htlcs: Readable::read(reader)?,
 			negotiate_ark_channel: Readable::read(reader)?,
 			ark_exit_delay: Readable::read(reader)?,
+			ark_htlc_success_csv_delta: Readable::read(reader)?,
 		})
 	}
 }
@@ -1247,6 +1262,11 @@ pub struct ChannelHandshakeConfigUpdate {
 	/// The Proportion of the channel value to configure as counterparty's channel reserve. See
 	/// [`ChannelHandshakeConfig::their_channel_reserve_proportional_millionths`].
 	pub channel_reserve_proportional_millionths: Option<u32>,
+
+	/// Override for the Ark-on-Lightning HTLC success-path CSV delta. See
+	/// [`ChannelHandshakeConfig::ark_htlc_success_csv_delta`]. `Some(Some(d))` sets the delta,
+	/// `Some(None)` disables Ark protection, `None` leaves the existing config value alone.
+	pub ark_htlc_success_csv_delta: Option<Option<u16>>,
 }
 
 impl From<ChannelHandshakeConfig> for ChannelHandshakeConfigUpdate {
@@ -1265,6 +1285,7 @@ impl From<ChannelHandshakeConfig> for ChannelHandshakeConfigUpdate {
 			channel_reserve_proportional_millionths: Some(
 				config.their_channel_reserve_proportional_millionths,
 			),
+			ark_htlc_success_csv_delta: Some(config.ark_htlc_success_csv_delta),
 		}
 	}
 }
@@ -1304,6 +1325,10 @@ impl ChannelHandshakeConfig {
 
 		if let Some(channel_reserve) = config.channel_reserve_proportional_millionths {
 			self.their_channel_reserve_proportional_millionths = channel_reserve;
+		}
+
+		if let Some(ark_delta) = config.ark_htlc_success_csv_delta {
+			self.ark_htlc_success_csv_delta = ark_delta;
 		}
 	}
 }

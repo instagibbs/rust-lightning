@@ -2866,6 +2866,7 @@ impl FundingScope {
 			splice_parent_funding_txid: prev_funding.get_funding_txid(),
 			channel_type_features: channel_parameters.channel_type_features.clone(),
 			channel_value_satoshis: post_channel_value_sat,
+			ark_htlc_success_csv_delta: channel_parameters.ark_htlc_success_csv_delta,
 		};
 		post_channel_transaction_parameters
 			.counterparty_parameters
@@ -4174,6 +4175,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				splice_parent_funding_txid: None,
 				channel_type_features: channel_type.clone(),
 				channel_value_satoshis,
+				ark_htlc_success_csv_delta: config.channel_handshake_config.ark_htlc_success_csv_delta,
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -4496,6 +4498,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				channel_type_features: channel_type.clone(),
 				// We'll add our counterparty's `funding_satoshis` when we receive `accept_channel2`.
 				channel_value_satoshis,
+				ark_htlc_success_csv_delta: config.channel_handshake_config.ark_htlc_success_csv_delta,
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -6133,6 +6136,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			self.channel_id,
 			if local { "us" } else { "remote" }, if generated_by_local { "us" } else { "remote" }, feerate_per_kw);
 
+		let ark_htlc_success_csv_delta = funding.channel_transaction_parameters.ark_htlc_success_csv_delta;
 		macro_rules! get_htlc_in_commitment {
 			($htlc: expr, $offered: expr) => {
 				HTLCOutputInCommitment {
@@ -6141,6 +6145,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 					cltv_expiry: $htlc.cltv_expiry,
 					payment_hash: $htlc.payment_hash,
 					transaction_output_index: None,
+					ark_htlc_success_csv_delta,
 				}
 			}
 		}
