@@ -188,6 +188,7 @@ fn test_inbound_anchors_config_overridden() {
 			to_self_delay: Some(200),
 			max_accepted_htlcs: Some(5),
 			channel_reserve_proportional_millionths: Some(20000),
+			ark_htlc_success_csv_delta: None,
 		}),
 		update_overrides: None,
 	};
@@ -1076,6 +1077,7 @@ pub fn test_accept_inbound_channel_config_override() {
 			to_self_delay: None,
 			max_accepted_htlcs: Some(3),
 			channel_reserve_proportional_millionths: None,
+			ark_htlc_success_csv_delta: None,
 		}),
 		update_overrides: Some(ChannelConfigUpdate {
 			forwarding_fee_proportional_millionths: None,

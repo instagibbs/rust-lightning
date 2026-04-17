@@ -5,9 +5,9 @@ use core::cmp;
 use bitcoin::secp256k1::{self, PublicKey, Secp256k1};
 
 use crate::ln::chan_utils::{
-	commit_tx_fee_sat, htlc_success_tx_weight, htlc_timeout_tx_weight, htlc_tx_fees_sat,
-	second_stage_tx_fees_sat, ChannelTransactionParameters, CommitmentTransaction,
-	HTLCOutputInCommitment,
+	commit_tx_fee_sat, htlc_success_tx_weight_with_ark, htlc_timeout_tx_weight_with_ark,
+	htlc_tx_fees_sat, second_stage_tx_fees_sat, ChannelTransactionParameters,
+	CommitmentTransaction, HTLCOutputInCommitment,
 };
 use crate::ln::channel::{CommitmentStats, ANCHOR_OUTPUT_VALUE_SATOSHI};
 use crate::prelude::*;
@@ -732,14 +732,15 @@ impl TxBuilder for SpecTxBuilder {
 		let mut remote_htlc_total_msat = 0;
 		let channel_type = &channel_parameters.channel_type_features;
 
+		let ark_delta = channel_parameters.ark_htlc_success_csv_delta;
 		let is_dust = |offered: bool, amount_msat: u64| -> bool {
 			let htlc_tx_fee_sat = if channel_type.supports_anchors_zero_fee_htlc_tx() {
 				0
 			} else {
 				let htlc_tx_weight = if offered {
-					htlc_timeout_tx_weight(channel_type)
+					htlc_timeout_tx_weight_with_ark(channel_type, ark_delta)
 				} else {
-					htlc_success_tx_weight(channel_type)
+					htlc_success_tx_weight_with_ark(channel_type, ark_delta)
 				};
 				// As required by the spec, round down
 				feerate_per_kw as u64 * htlc_tx_weight / 1000

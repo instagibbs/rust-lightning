@@ -6562,7 +6562,8 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 					let transaction_output_index: Option<u32> = Readable::read(reader)?;
 
 					HTLCOutputInCommitment {
-						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index
+						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index,
+						ark_htlc_success_csv_delta: None,
 					}
 				}
 			}
@@ -6956,6 +6957,7 @@ pub(super) fn dummy_monitor<S: EcdsaChannelSigner + 'static>(
 		splice_parent_funding_txid: None,
 		channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 		channel_value_satoshis: 0,
+		ark_htlc_success_csv_delta: None,
 	};
 	let shutdown_script = crate::ln::script::ShutdownScript::new_p2wpkh_from_pubkey(dummy_key);
 	let best_block = BestBlock::from_network(Network::Testnet);
@@ -7176,6 +7178,7 @@ mod tests {
 							cltv_expiry: 0,
 							payment_hash: preimage.1.clone(),
 							transaction_output_index: Some(idx as u32),
+							ark_htlc_success_csv_delta: None,
 						});
 					}
 					res
@@ -7290,6 +7293,7 @@ mod tests {
 					cltv_expiry: 2 << 16,
 					payment_hash: PaymentHash([1; 32]),
 					transaction_output_index: Some($idx as u32),
+					ark_htlc_success_csv_delta: None,
 				};
 				let redeem_script = if *$weight == WEIGHT_REVOKED_OUTPUT { chan_utils::get_revokeable_redeemscript(&RevocationKey::from_basepoint(&secp_ctx, &RevocationBasepoint::from(pubkey), &pubkey), 256, &DelayedPaymentKey::from_basepoint(&secp_ctx, &DelayedPaymentBasepoint::from(pubkey), &pubkey)) } else { chan_utils::get_htlc_redeemscript_with_explicit_keys(&htlc, $opt_anchors, &HtlcKey::from_basepoint(&secp_ctx, &HtlcBasepoint::from(pubkey), &pubkey), &HtlcKey::from_basepoint(&secp_ctx, &HtlcBasepoint::from(pubkey), &pubkey), &RevocationKey::from_basepoint(&secp_ctx, &RevocationBasepoint::from(pubkey), &pubkey)) };
 				let sighash = hash_to_message!(&$sighash_parts.p2wsh_signature_hash($idx, &redeem_script, $amount, EcdsaSighashType::All).unwrap()[..]);
