@@ -55,35 +55,42 @@ use super::chaininterface::LowerBoundedFeeEstimator;
 const MAX_ALLOC_SIZE: usize = 64 * 1024;
 
 #[rustfmt::skip]
-pub(crate) fn weight_revoked_offered_htlc(channel_type_features: &ChannelTypeFeatures) -> u64 {
+pub(crate) fn weight_revoked_offered_htlc(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	// number_of_witness_elements + sig_length + revocation_sig + pubkey_length + revocationpubkey + witness_script_length + witness_script
 	const WEIGHT_REVOKED_OFFERED_HTLC: u64 = 1 + 1 + 73 + 1 + 33 + 1 + 133;
 	const WEIGHT_REVOKED_OFFERED_HTLC_ANCHORS: u64 = WEIGHT_REVOKED_OFFERED_HTLC + 3; // + OP_1 + OP_CSV + OP_DROP
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_REVOKED_OFFERED_HTLC_ANCHORS } else { WEIGHT_REVOKED_OFFERED_HTLC }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_REVOKED_OFFERED_HTLC_ANCHORS } else { WEIGHT_REVOKED_OFFERED_HTLC };
+	base + crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 #[rustfmt::skip]
-pub(crate) fn weight_revoked_received_htlc(channel_type_features: &ChannelTypeFeatures) -> u64 {
+pub(crate) fn weight_revoked_received_htlc(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	// number_of_witness_elements + sig_length + revocation_sig + pubkey_length + revocationpubkey + witness_script_length + witness_script
 	const WEIGHT_REVOKED_RECEIVED_HTLC: u64 = 1 + 1 + 73 + 1 + 33 + 1 +  139;
 	const WEIGHT_REVOKED_RECEIVED_HTLC_ANCHORS: u64 = WEIGHT_REVOKED_RECEIVED_HTLC + 3; // + OP_1 + OP_CSV + OP_DROP
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_REVOKED_RECEIVED_HTLC_ANCHORS } else { WEIGHT_REVOKED_RECEIVED_HTLC }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_REVOKED_RECEIVED_HTLC_ANCHORS } else { WEIGHT_REVOKED_RECEIVED_HTLC };
+	base + crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 #[rustfmt::skip]
-pub(crate) fn weight_offered_htlc(channel_type_features: &ChannelTypeFeatures) -> u64 {
+pub(crate) fn weight_offered_htlc(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	// number_of_witness_elements + sig_length + counterpartyhtlc_sig  + preimage_length + preimage + witness_script_length + witness_script
 	const WEIGHT_OFFERED_HTLC: u64 = 1 + 1 + 73 + 1 + 32 + 1 + 133;
 	const WEIGHT_OFFERED_HTLC_ANCHORS: u64 = WEIGHT_OFFERED_HTLC + 3; // + OP_1 + OP_CSV + OP_DROP
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_OFFERED_HTLC_ANCHORS } else { WEIGHT_OFFERED_HTLC }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_OFFERED_HTLC_ANCHORS } else { WEIGHT_OFFERED_HTLC };
+	// Ark HTLC scripts include an extra `<delta> OP_CSV OP_DROP` suffix on the success branch;
+	// the witness always carries the full witness script so the extra bytes apply to every
+	// spend path (success or timeout) that uses this script shape.
+	base + crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 #[rustfmt::skip]
-pub(crate) fn weight_received_htlc(channel_type_features: &ChannelTypeFeatures) -> u64 {
+pub(crate) fn weight_received_htlc(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	// number_of_witness_elements + sig_length + counterpartyhtlc_sig + empty_vec_length + empty_vec + witness_script_length + witness_script
 	const WEIGHT_RECEIVED_HTLC: u64 = 1 + 1 + 73 + 1 + 1 + 1 + 139;
 	const WEIGHT_RECEIVED_HTLC_ANCHORS: u64 = WEIGHT_RECEIVED_HTLC + 3; // + OP_1 + OP_CSV + OP_DROP
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_RECEIVED_HTLC_ANCHORS } else { WEIGHT_RECEIVED_HTLC }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_RECEIVED_HTLC_ANCHORS } else { WEIGHT_RECEIVED_HTLC };
+	base + crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 /// Verifies deserializable channel type features
@@ -217,9 +224,9 @@ impl RevokedHTLCOutput {
 		outpoint_confirmation_height: u32,
 	) -> Self {
 		let weight = if htlc.offered {
-			weight_revoked_offered_htlc(&channel_parameters.channel_type_features)
+			weight_revoked_offered_htlc(&channel_parameters.channel_type_features, htlc.ark_htlc_success_csv_delta)
 		} else {
-			weight_revoked_received_htlc(&channel_parameters.channel_type_features)
+			weight_revoked_received_htlc(&channel_parameters.channel_type_features, htlc.ark_htlc_success_csv_delta)
 		};
 		let directed_params = channel_parameters.as_counterparty_broadcastable();
 		let counterparty_keys = directed_params.broadcaster_pubkeys();
@@ -769,17 +776,19 @@ impl PackageSolvingData {
 		match self {
 			PackageSolvingData::RevokedOutput(ref outp) => outp.weight as usize,
 			PackageSolvingData::RevokedHTLCOutput(ref outp) => outp.weight as usize,
-			PackageSolvingData::CounterpartyOfferedHTLCOutput(ref outp) => weight_offered_htlc(&outp.channel_type_features) as usize,
-			PackageSolvingData::CounterpartyReceivedHTLCOutput(ref outp) => weight_received_htlc(&outp.channel_type_features) as usize,
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(ref outp) => weight_offered_htlc(&outp.channel_type_features, outp.htlc.ark_htlc_success_csv_delta) as usize,
+			PackageSolvingData::CounterpartyReceivedHTLCOutput(ref outp) => weight_received_htlc(&outp.channel_type_features, outp.htlc.ark_htlc_success_csv_delta) as usize,
 			PackageSolvingData::HolderHTLCOutput(ref outp) => {
 				let free_htlcs = outp.channel_type_features.supports_anchors_zero_fee_htlc_tx();
 				let free_commitments =
 					outp.channel_type_features.supports_anchor_zero_fee_commitments();
 				debug_assert!(free_htlcs || free_commitments);
+				let ark_delta = outp.htlc_descriptor.as_ref()
+					.and_then(|d| d.htlc.ark_htlc_success_csv_delta);
 				if outp.preimage.is_none() {
-					weight_offered_htlc(&outp.channel_type_features) as usize
+					weight_offered_htlc(&outp.channel_type_features, ark_delta) as usize
 				} else {
-					weight_received_htlc(&outp.channel_type_features) as usize
+					weight_received_htlc(&outp.channel_type_features, ark_delta) as usize
 				}
 			},
 			// Since HolderFundingOutput maps to an untractable package that is already signed, its
@@ -2194,7 +2203,7 @@ mod tests {
 			for channel_type_features in [ChannelTypeFeatures::only_static_remote_key(), ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies()].iter() {
 				let counterparty_outp = dumb_counterparty_received_output!(1_000_000, 1000, channel_type_features.clone());
 				let package = PackageTemplate::build_package(fake_txid(1), 0, counterparty_outp, 1000);
-				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_received_htlc(channel_type_features));
+				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_received_htlc(channel_type_features, None));
 			}
 		}
 
@@ -2202,7 +2211,7 @@ mod tests {
 			for channel_type_features in [ChannelTypeFeatures::only_static_remote_key(), ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies()].iter() {
 				let counterparty_outp = dumb_counterparty_offered_output!(1_000_000, channel_type_features.clone());
 				let package = PackageTemplate::build_package(fake_txid(1), 0, counterparty_outp, 1000);
-				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_offered_htlc(channel_type_features));
+				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_offered_htlc(channel_type_features, None));
 			}
 		}
 	}

@@ -7345,7 +7345,7 @@ mod tests {
 		macro_rules! sign_input {
 			($sighash_parts: expr, $idx: expr, $amount: expr, $weight: expr, $sum_actual_sigs: expr, $opt_anchors: expr) => {
 				let htlc = HTLCOutputInCommitment {
-					offered: if *$weight == weight_revoked_offered_htlc($opt_anchors) || *$weight == weight_offered_htlc($opt_anchors) { true } else { false },
+					offered: if *$weight == weight_revoked_offered_htlc($opt_anchors, None) || *$weight == weight_offered_htlc($opt_anchors, None) { true } else { false },
 					amount_msat: 0,
 					cltv_expiry: 2 << 16,
 					payment_hash: PaymentHash([1; 32]),
@@ -7362,9 +7362,9 @@ mod tests {
 				witness.push(ser_sig);
 				if *$weight == WEIGHT_REVOKED_OUTPUT {
 					witness.push(vec!(1));
-				} else if *$weight == weight_revoked_offered_htlc($opt_anchors) || *$weight == weight_revoked_received_htlc($opt_anchors) {
+				} else if *$weight == weight_revoked_offered_htlc($opt_anchors, None) || *$weight == weight_revoked_received_htlc($opt_anchors, None) {
 					witness.push(pubkey.clone().serialize().to_vec());
-				} else if *$weight == weight_received_htlc($opt_anchors) {
+				} else if *$weight == weight_received_htlc($opt_anchors, None) {
 					witness.push(vec![0]);
 				} else {
 					witness.push(PaymentPreimage([1; 32]).0.to_vec());
@@ -7400,7 +7400,7 @@ mod tests {
 				value: Amount::ZERO,
 			});
 			let base_weight = claim_tx.weight().to_wu();
-			let inputs_weight = [WEIGHT_REVOKED_OUTPUT, weight_revoked_offered_htlc(channel_type_features), weight_revoked_offered_htlc(channel_type_features), weight_revoked_received_htlc(channel_type_features)];
+			let inputs_weight = [WEIGHT_REVOKED_OUTPUT, weight_revoked_offered_htlc(channel_type_features, None), weight_revoked_offered_htlc(channel_type_features, None), weight_revoked_received_htlc(channel_type_features, None)];
 			let mut inputs_total_weight = 2; // count segwit flags
 			{
 				let mut sighash_parts = sighash::SighashCache::new(&mut claim_tx);
@@ -7432,7 +7432,7 @@ mod tests {
 				value: Amount::ZERO,
 			});
 			let base_weight = claim_tx.weight().to_wu();
-			let inputs_weight = [weight_offered_htlc(channel_type_features), weight_received_htlc(channel_type_features), weight_received_htlc(channel_type_features), weight_received_htlc(channel_type_features)];
+			let inputs_weight = [weight_offered_htlc(channel_type_features, None), weight_received_htlc(channel_type_features, None), weight_received_htlc(channel_type_features, None), weight_received_htlc(channel_type_features, None)];
 			let mut inputs_total_weight = 2; // count segwit flags
 			{
 				let mut sighash_parts = sighash::SighashCache::new(&mut claim_tx);
