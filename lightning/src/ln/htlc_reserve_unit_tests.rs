@@ -27,10 +27,21 @@ use crate::types::payment::{PaymentHash, PaymentPreimage};
 use crate::util::config::UserConfig;
 use crate::util::errors::APIError;
 
+use musig_secp::musig::PublicNonce;
+
 use lightning_macros::xtest;
 
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::{Amount, Transaction};
+
+const PUBLIC_NONCE: [u8; 66] = [
+	0x03, 0xf4, 0xa3, 0x61, 0xab, 0xd3, 0xd5, 0x05, 0x35, 0xbe, 0x08,
+	0x42, 0x1d, 0xbc, 0x73, 0xb0, 0xa8, 0xf5, 0x95, 0x65, 0x4a, 0xe3,
+	0x23, 0x8a, 0xfc, 0xaf, 0x25, 0x99, 0xf9, 0x4e, 0x25, 0x20, 0x4c,
+	0x03, 0x6b, 0xa1, 0x74, 0x21, 0x44, 0x33, 0xe2, 0x1f, 0x5c, 0xd0,
+	0xfc, 0xb1, 0x4b, 0x03, 0x8e, 0xb4, 0x0b, 0x05, 0xb7, 0xe7, 0xc8,
+	0x20, 0xdd, 0x21, 0xaa, 0x56, 0x8f, 0xdb, 0x0a, 0x9d, 0xe4, 0xd7,
+];
 
 fn do_test_counterparty_no_reserve(send_from_initiator: bool) {
 	// A peer providing a channel_reserve_satoshis of 0 (or less than our dust limit) is insecure,
@@ -875,13 +886,15 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 			chan_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - 2, &secp_ctx).unwrap(),
 		)
 	};
-	let remote_point = {
+	let (remote_point, remote_nonce) = {
 		let per_peer_lock;
 		let mut peer_state_lock;
 
 		let channel = get_channel_ref!(nodes[1], nodes[0], per_peer_lock, peer_state_lock, chan.2);
 		let chan_signer = channel.as_funded().unwrap().get_signer();
-		chan_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - 1, &secp_ctx).unwrap()
+		let remote_point = chan_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER - 1, &secp_ctx).unwrap();
+		let remote_nonce = chan_signer.generate_local_nonce_pair(&channel.funding().channel_transaction_parameters, INITIAL_COMMITMENT_NUMBER - 1, &secp_ctx);
+		(remote_point, remote_nonce)
 	};
 
 	// Build the remote commitment transaction so we can sign it, and then later use the
@@ -918,7 +931,7 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 		);
 		let params = &channel.funding().channel_transaction_parameters;
 		chan_signer
-			.sign_counterparty_commitment(params, &commitment_tx, Vec::new(), Vec::new(), &secp_ctx)
+			.partially_sign_counterparty_commitment(params, remote_nonce, &commitment_tx, Vec::new(), Vec::new(), &secp_ctx)
 			.unwrap()
 	};
 
@@ -933,12 +946,15 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 	nodes[1].node.handle_commitment_signed(node_a_id, &commit_signed_msg);
 	let _ = nodes[1].node.get_and_clear_pending_msg_events();
 
+	let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
+
 	// Send the RAA to nodes[1].
 	let raa_msg = msgs::RevokeAndACK {
 		channel_id: chan.2,
 		per_commitment_secret: local_secret,
 		next_per_commitment_point: next_local_point,
 		release_htlc_message_paths: Vec::new(),
+		next_local_nonces: vec![public_nonce],
 	};
 	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);
 	expect_and_process_pending_htlcs(&nodes[1], false);
@@ -2231,19 +2247,26 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 					.unwrap(),
 			)
 		};
-		let remote_point = {
+		let (remote_point, remote_nonce) = {
 			let per_peer_lock;
 			let mut peer_state_lock;
 
 			let channel =
 				get_channel_ref!(nodes[1], nodes[0], per_peer_lock, peer_state_lock, chan_id);
 			let chan_signer = channel.as_funded().unwrap().get_signer();
-			chan_signer
+			let remote_point = chan_signer
 				.get_per_commitment_point(
 					INITIAL_COMMITMENT_NUMBER - MIN_AFFORDABLE_HTLC_COUNT as u64,
 					&secp_ctx,
 				)
-				.unwrap()
+				.unwrap();
+			let remote_nonce = chan_signer
+				.generate_local_nonce_pair(
+					&channel.funding().channel_transaction_parameters,
+					INITIAL_COMMITMENT_NUMBER - MIN_AFFORDABLE_HTLC_COUNT as u64,
+					&secp_ctx,
+				);
+			(remote_point, remote_nonce)
 		};
 
 		// Build the remote commitment transaction so we can sign it, and then later use the
@@ -2288,8 +2311,9 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 			);
 			let params = &channel.funding().channel_transaction_parameters;
 			chan_signer
-				.sign_counterparty_commitment(
+				.partially_sign_counterparty_commitment(
 					params,
+					remote_nonce,
 					&commitment_tx,
 					Vec::new(),
 					Vec::new(),
@@ -2309,12 +2333,15 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 		nodes[1].node.handle_commitment_signed(node_a_id, &commit_signed_msg);
 		let _ = nodes[1].node.get_and_clear_pending_msg_events();
 
+		let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
+
 		// Send the RAA to nodes[1].
 		let raa_msg = msgs::RevokeAndACK {
 			channel_id: chan_id,
 			per_commitment_secret: local_secret,
 			next_per_commitment_point: next_local_point,
 			release_htlc_message_paths: Vec::new(),
+			next_local_nonces: vec![public_nonce],
 		};
 		nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);
 
@@ -2669,7 +2696,7 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 			chan_signer.get_per_commitment_point(commit_number - 2, &secp_ctx).unwrap(),
 		)
 	};
-	let (remote_commit_number, remote_point) = {
+	let (remote_commit_number, remote_point, remote_nonce) = {
 		let per_peer_lock;
 		let mut peer_state_lock;
 
@@ -2679,7 +2706,8 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 		let commit_number = chan_signer.get_enforcement_state().last_holder_commitment;
 		let remote_point =
 			chan_signer.get_per_commitment_point(commit_number - 1, &secp_ctx).unwrap();
-		(commit_number - 1, remote_point)
+		let remote_nonce = chan_signer.generate_local_nonce_pair(&channel.funding().channel_transaction_parameters, commit_number - 1, &secp_ctx);
+		(commit_number - 1, remote_point, remote_nonce)
 	};
 
 	// Build the remote commitment transaction so we can sign it, and then later use the
@@ -2706,7 +2734,7 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 		);
 		let params = &channel.funding().channel_transaction_parameters;
 		chan_signer
-			.sign_counterparty_commitment(params, &commitment_tx, Vec::new(), Vec::new(), &secp_ctx)
+			.partially_sign_counterparty_commitment(params, remote_nonce, &commitment_tx, Vec::new(), Vec::new(), &secp_ctx)
 			.unwrap()
 	};
 
@@ -2721,12 +2749,15 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 	nodes[1].node.handle_commitment_signed(node_a_id, &commit_signed_msg);
 	let _ = nodes[1].node.get_and_clear_pending_msg_events();
 
+	let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
+
 	// Send the RAA to nodes[1].
 	let raa_msg = msgs::RevokeAndACK {
 		channel_id,
 		per_commitment_secret: local_secret,
 		next_per_commitment_point: next_local_point,
 		release_htlc_message_paths: Vec::new(),
+		next_local_nonces: vec![public_nonce],
 	};
 	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);
 	expect_and_process_pending_htlcs(&nodes[1], false);

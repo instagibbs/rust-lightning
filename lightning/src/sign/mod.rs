@@ -35,6 +35,8 @@ use bitcoin::secp256k1::All;
 use bitcoin::secp256k1::{Keypair, PublicKey, Scalar, Secp256k1, SecretKey, Signing};
 use bitcoin::{secp256k1, Psbt, Sequence, Txid, WPubkeyHash, Witness};
 
+use musig_secp::musig::{PartialSignature, PublicNonce};
+
 use lightning_invoice::RawBolt11Invoice;
 
 use crate::chain::transaction::OutPoint;
@@ -51,7 +53,7 @@ use crate::ln::channel_keys::{
 	RevocationBasepoint, RevocationKey,
 };
 use crate::ln::inbound_payment::ExpandedKey;
-use crate::ln::msgs::{UnsignedChannelAnnouncement, UnsignedGossipMessage};
+use crate::ln::msgs::{PartialSignatureWithNonce, UnsignedChannelAnnouncement, UnsignedGossipMessage};
 use crate::ln::script::ShutdownScript;
 use crate::offers::invoice::UnsignedBolt12Invoice;
 use crate::types::features::ChannelTypeFeatures;
@@ -1288,6 +1290,8 @@ pub struct InMemorySigner {
 	channel_keys_id: [u8; 32],
 	/// A source of random bytes.
 	entropy_source: RandomBytes,
+	/// Shutdown nonce cache
+	shutdown_nonce: Option<(SecretNonce, PublicNonce)>,
 }
 
 impl PartialEq for InMemorySigner {
@@ -1317,6 +1321,7 @@ impl Clone for InMemorySigner {
 			commitment_seed: self.commitment_seed.clone(),
 			channel_keys_id: self.channel_keys_id,
 			entropy_source: RandomBytes::new(self.get_secure_random_bytes()),
+			shutdown_nonce: None,
 		}
 	}
 }
@@ -1340,6 +1345,7 @@ impl InMemorySigner {
 			commitment_seed,
 			channel_keys_id,
 			entropy_source: RandomBytes::new(rand_bytes_unique_start),
+			shutdown_nonce: None,
 		}
 	}
 
@@ -1361,6 +1367,7 @@ impl InMemorySigner {
 			commitment_seed,
 			channel_keys_id,
 			entropy_source: RandomBytes::new(rand_bytes_unique_start),
+			shutdown_nonce: None,
 		}
 	}
 
@@ -1594,6 +1601,31 @@ impl ChannelSigner for InMemorySigner {
 const MISSING_PARAMS_ERR: &'static str =
 	"ChannelTransactionParameters must be populated before signing operations";
 
+fn get_stateless_nonces(
+	commitment_seed: &[u8; 32], signing_key: musig_secp::PublicKey, channel_parameters: &ChannelTransactionParameters, commitment_number: u64,
+) -> (musig_secp::musig::SecretNonce, musig_secp::musig::PublicNonce) {
+	use bitcoin::hashes::hmac::{Hmac, HmacEngine};
+	use bitcoin::hashes::sha256::Hash as Sha256;
+	use bitcoin::hashes::Hash;
+	let funding_txid = if commitment_number == 0 {
+		Txid::all_zeros()
+	} else {
+		channel_parameters.funding_outpoint.unwrap().txid
+	};
+	let shachain_root_hash = Sha256::hash(&commitment_seed[..]);
+	let key = format!("taproot-rev-root{}", funding_txid);
+	let mut engine: HmacEngine<Sha256> = HmacEngine::new(key.as_bytes());
+	engine.input(shachain_root_hash.as_byte_array());
+	let musig2_shachain_root = Hmac::from_engine(engine).to_byte_array();
+
+	let rand = chan_utils::build_commitment_secret(&musig2_shachain_root, commitment_number);
+
+	let session_secret_rand = SessionSecretRand::assume_unique_per_nonce_gen(rand);
+	new_nonce_pair(session_secret_rand, None, None, signing_key, None, None)
+}
+
+use musig_secp::musig::*;
+
 impl EcdsaChannelSigner for InMemorySigner {
 	fn sign_counterparty_commitment(
 		&self, channel_parameters: &ChannelTransactionParameters,
@@ -1661,6 +1693,244 @@ impl EcdsaChannelSigner for InMemorySigner {
 		}
 
 		Ok((commitment_sig, htlc_sigs))
+	}
+
+	fn partially_sign_counterparty_commitment(
+		&self, channel_parameters: &ChannelTransactionParameters,
+		counterparty_nonce: PublicNonce,
+		commitment_tx: &CommitmentTransaction,
+		_inbound_htlc_preimages: Vec<PaymentPreimage>,
+		_outbound_htlc_preimages: Vec<PaymentPreimage>,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<(crate::ln::msgs::PartialSignatureWithNonce, Vec<Signature>), ()> {
+		let funding_key = self.funding_key(channel_parameters.splice_parent_funding_txid);
+		let funding_key_bytes = funding_key.secret_bytes();
+		let funding_pubkey_bytes = funding_key.public_key(&secp_ctx).serialize();
+		let counterparty_pubkey_bytes = channel_parameters.counterparty_pubkeys().unwrap().funding_pubkey.serialize();
+		let funding_pubkey = musig_secp::PublicKey::from_byte_array_compressed(funding_pubkey_bytes).unwrap();
+		let counterparty_pubkey = musig_secp::PublicKey::from_byte_array_compressed(counterparty_pubkey_bytes).unwrap();
+
+		let keypair = musig_secp::Keypair::from_secret_key(&musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap());
+
+		let mut key_agg_cache = KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
+		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
+
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
+		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
+		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
+		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
+
+		let session_secret_rand = SessionSecretRand::assume_unique_per_nonce_gen(self.get_secure_random_bytes());
+
+		let msg = commitment_tx.trust().built_transaction().get_sighash_default(&funding_txout);
+		let (secret_nonce, public_nonce) = key_agg_cache.nonce_gen(session_secret_rand, funding_pubkey, msg.as_ref(), None);
+		let agg_nonce = AggregatedNonce::new(&[&public_nonce, &counterparty_nonce]);
+
+		let session = Session::new(&key_agg_cache, agg_nonce, msg.as_ref());
+		let partial_signature = session.partial_sign(secret_nonce, &keypair, &key_agg_cache);
+
+		let trusted_tx = commitment_tx.trust();
+		let keys = trusted_tx.keys();
+		let commitment_txid = trusted_tx.built_transaction().txid;
+
+		let mut htlc_sigs = Vec::with_capacity(commitment_tx.nondust_htlcs().len());
+		for htlc in commitment_tx.nondust_htlcs() {
+			let holder_selected_contest_delay = channel_parameters.holder_selected_contest_delay;
+			let chan_type = &channel_parameters.channel_type_features;
+			let htlc_tx = chan_utils::build_htlc_transaction(
+				&commitment_txid,
+				commitment_tx.negotiated_feerate_per_kw(),
+				holder_selected_contest_delay,
+				htlc,
+				chan_type,
+				&keys.broadcaster_delayed_payment_key,
+				&keys.revocation_key,
+			);
+			let htlc_redeemscript = chan_utils::get_htlc_redeemscript(&htlc, chan_type, &keys);
+			let htlc_sighashtype = if chan_type.supports_anchors_zero_fee_htlc_tx()
+				|| chan_type.supports_anchor_zero_fee_commitments()
+			{
+				EcdsaSighashType::SinglePlusAnyoneCanPay
+			} else {
+				EcdsaSighashType::All
+			};
+			let htlc_sighash = hash_to_message!(
+				&sighash::SighashCache::new(&htlc_tx)
+					.p2wsh_signature_hash(
+						0,
+						&htlc_redeemscript,
+						htlc.to_bitcoin_amount(),
+						htlc_sighashtype
+					)
+					.unwrap()
+					.as_byte_array()[..]
+			);
+			let holder_htlc_key = chan_utils::derive_private_key(
+				&secp_ctx,
+				&keys.per_commitment_point,
+				&self.htlc_base_key,
+			);
+			htlc_sigs.push(sign(secp_ctx, &htlc_sighash, &holder_htlc_key));
+		}
+
+		Ok((PartialSignatureWithNonce {
+			public_nonce,
+			partial_signature,
+		}, htlc_sigs))
+	}
+
+	fn partially_sign_closing_transaction(
+		&self, channel_parameters: &ChannelTransactionParameters,
+		counterparty_nonce: PublicNonce,
+		closing_tx: &ClosingTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<PartialSignatureWithNonce, ()> {
+		let funding_key = self.funding_key(channel_parameters.splice_parent_funding_txid);
+		let funding_key_bytes = funding_key.secret_bytes();
+		let funding_pubkey_bytes = funding_key.public_key(&secp_ctx).serialize();
+		let counterparty_pubkey_bytes = channel_parameters.counterparty_pubkeys().unwrap().funding_pubkey.serialize();
+		let funding_pubkey = musig_secp::PublicKey::from_byte_array_compressed(funding_pubkey_bytes).unwrap();
+		let counterparty_pubkey = musig_secp::PublicKey::from_byte_array_compressed(counterparty_pubkey_bytes).unwrap();
+
+		let keypair = musig_secp::Keypair::from_secret_key(&musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap());
+
+		let mut key_agg_cache = KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
+		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
+
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
+		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
+		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
+		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
+
+		let session_secret_rand = SessionSecretRand::assume_unique_per_nonce_gen(self.get_secure_random_bytes());
+
+		let msg = closing_tx.trust().get_sighash_default(&funding_txout);
+		let (secret_nonce, public_nonce) = key_agg_cache.nonce_gen(session_secret_rand, funding_pubkey, msg.as_ref(), None);
+		let agg_nonce = AggregatedNonce::new(&[&public_nonce, &counterparty_nonce]);
+
+		let session = Session::new(&key_agg_cache, agg_nonce, msg.as_ref());
+		let partial_signature = session.partial_sign(secret_nonce, &keypair, &key_agg_cache);
+
+		Ok(PartialSignatureWithNonce {
+			public_nonce,
+			partial_signature,
+		})
+	}
+
+	fn finalize_closing_transaction(
+		&mut self, channel_parameters: &ChannelTransactionParameters,
+		local_nonce: PublicNonce,
+		counterparty_sig: PartialSignatureWithNonce,
+		closing_tx: &ClosingTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<PartialSignature, ()> {
+		let (secret_nonce, public_nonce) = self.shutdown_nonce.take().unwrap();
+		assert_eq!(public_nonce, local_nonce);
+
+		let funding_key = self.funding_key(channel_parameters.splice_parent_funding_txid);
+		let funding_key_bytes = funding_key.secret_bytes();
+		let funding_pubkey_bytes = funding_key.public_key(&secp_ctx).serialize();
+		let counterparty_pubkey_bytes = channel_parameters.counterparty_pubkeys().unwrap().funding_pubkey.serialize();
+		let funding_pubkey = musig_secp::PublicKey::from_byte_array_compressed(funding_pubkey_bytes).unwrap();
+		let counterparty_pubkey = musig_secp::PublicKey::from_byte_array_compressed(counterparty_pubkey_bytes).unwrap();
+
+		let keypair = musig_secp::Keypair::from_secret_key(&musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap());
+
+		let mut key_agg_cache = KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
+		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
+
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
+		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
+		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
+		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
+
+		let agg_nonce = AggregatedNonce::new(&[&local_nonce, &counterparty_sig.public_nonce]);
+		let msg = closing_tx.trust().get_sighash_default(&funding_txout);
+
+		let session = Session::new(&key_agg_cache, agg_nonce, msg.as_ref());
+		let partial_sig = session.partial_sign(secret_nonce, &keypair, &key_agg_cache);
+
+		Ok(partial_sig)
+	}
+
+	fn generate_local_nonce_pair(
+		&self, channel_parameters: &ChannelTransactionParameters, commitment_number: u64, _secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> musig_secp::musig::PublicNonce {
+		let funding_key_bytes = self.funding_key(channel_parameters.splice_parent_funding_txid).secret_bytes();
+		let funding_key = musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap();
+		let funding_pubkey = funding_key.public_key();
+
+		let(_secret_nonce, public_nonce) = get_stateless_nonces(&self.commitment_seed, funding_pubkey, channel_parameters, commitment_number);
+		public_nonce
+	}
+
+	fn generate_shutdown_nonce_pair(&mut self, channel_parameters: &ChannelTransactionParameters, _secp_ctx: &Secp256k1<secp256k1::All>) -> musig_secp::musig::PublicNonce {
+		let funding_key_bytes = self.funding_key(channel_parameters.splice_parent_funding_txid).secret_bytes();
+		let funding_key = musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap();
+		let funding_pubkey = funding_key.public_key();
+
+		let session_secret_rand = SessionSecretRand::assume_unique_per_nonce_gen(self.get_secure_random_bytes());
+		let (secret_nonce, public_nonce) = new_nonce_pair(session_secret_rand, None, None, funding_pubkey, None, None);
+		self.shutdown_nonce = Some((secret_nonce, public_nonce));
+		public_nonce
+	}
+
+	fn finalize_holder_commitment(
+		&self,
+		channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<secp256k1::schnorr::Signature, ()> {
+		let funding_key_bytes = self.funding_key(channel_parameters.splice_parent_funding_txid).secret_bytes();
+		let funding_key = musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap();
+		let funding_pubkey = funding_key.public_key();
+
+		let commitment_number = commitment_tx.commitment_number();
+
+		let (secret_nonce, local_nonce) = get_stateless_nonces(&self.commitment_seed, funding_pubkey, channel_parameters, commitment_number);
+
+		let funding_key = self.funding_key(channel_parameters.splice_parent_funding_txid);
+		let funding_key_bytes = funding_key.secret_bytes();
+		let funding_pubkey_bytes = funding_key.public_key(&secp_ctx).serialize();
+		let counterparty_pubkey_bytes = channel_parameters.counterparty_pubkeys().unwrap().funding_pubkey.serialize();
+		let funding_pubkey = musig_secp::PublicKey::from_byte_array_compressed(funding_pubkey_bytes).unwrap();
+		let counterparty_pubkey = musig_secp::PublicKey::from_byte_array_compressed(counterparty_pubkey_bytes).unwrap();
+
+		let keypair = musig_secp::Keypair::from_secret_key(&musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap());
+
+		let mut key_agg_cache = KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
+		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
+
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
+		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
+		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
+		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
+
+		let agg_nonce = AggregatedNonce::new(&[&local_nonce, &commitment_tx.counterparty_sig.public_nonce]);
+		let msg = commitment_tx.trust().built_transaction().get_sighash_default(&funding_txout);
+
+		let session = Session::new(&key_agg_cache, agg_nonce, msg.as_ref());
+		let partial_sig = session.partial_sign(secret_nonce, &keypair, &key_agg_cache);
+
+		let agg_sig = session.partial_sig_agg(&[&partial_sig, &commitment_tx.counterparty_sig.partial_signature]);
+
+		let sig_bytes = agg_sig.verify(&key_agg_cache.agg_pk(), msg.as_ref()).unwrap().to_byte_array();
+
+		Ok(secp256k1::schnorr::Signature::from_slice(&sig_bytes).unwrap())
+	}
+
+	#[cfg(any(test, feature = "_test_utils", feature = "unsafe_revoked_tx_signing"))]
+	fn unsafe_finalize_holder_commitment(
+		&self,
+		_channel_parameters: &ChannelTransactionParameters,
+		_commitment_tx: &HolderCommitmentTransaction,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<secp256k1::schnorr::Signature, ()> {
+	    todo!();
 	}
 
 	fn sign_holder_commitment(

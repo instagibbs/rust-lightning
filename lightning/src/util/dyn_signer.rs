@@ -9,7 +9,7 @@ use crate::ln::chan_utils::{
 	HTLCOutputInCommitment, HolderCommitmentTransaction,
 };
 use crate::ln::inbound_payment::ExpandedKey;
-use crate::ln::msgs::{UnsignedChannelAnnouncement, UnsignedGossipMessage};
+use crate::ln::msgs::{PartialSignatureWithNonce, UnsignedChannelAnnouncement, UnsignedGossipMessage};
 use crate::ln::script::ShutdownScript;
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::InMemorySigner;
@@ -26,6 +26,8 @@ use lightning_invoice::RawBolt11Invoice;
 use secp256k1::ecdsa::RecoverableSignature;
 use secp256k1::{ecdh::SharedSecret, ecdsa::Signature, PublicKey, Scalar, Secp256k1, SecretKey};
 use types::payment::PaymentPreimage;
+
+use musig_secp::musig::PartialSignature;
 
 /// A super-trait for all the traits that a dyn signer backing implements
 pub trait DynSignerTrait: EcdsaChannelSigner + Send + Sync {}
@@ -58,6 +60,54 @@ impl Clone for DynSigner {
 }
 
 delegate!(DynSigner, EcdsaChannelSigner, inner,
+	fn partially_sign_counterparty_commitment(
+		,
+		channel_parameters: &ChannelTransactionParameters,
+		counterparty_nonce: musig_secp::musig::PublicNonce,
+		commitment_tx: &CommitmentTransaction,
+		inbound_htlc_preimages: Vec<PaymentPreimage>,
+		outbound_htlc_preimages: Vec<PaymentPreimage>,
+		secp_ctx: &Secp256k1<secp256k1::All>
+	) -> Result<(crate::ln::msgs::PartialSignatureWithNonce, Vec<Signature>), ()>,
+	fn partially_sign_closing_transaction(
+		,
+		channel_parameters: &ChannelTransactionParameters,
+		counterparty_nonce: musig_secp::musig::PublicNonce,
+		closing_tx: &ClosingTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>
+	) -> Result<PartialSignatureWithNonce, ()>,
+	fn finalize_closing_transaction(
+		mut,
+		channel_parameters: &ChannelTransactionParameters,
+		local_nonce: musig_secp::musig::PublicNonce,
+		counterparty_sig: PartialSignatureWithNonce,
+		closing_tx: &ClosingTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>
+	) -> Result<PartialSignature, ()>,
+	fn generate_local_nonce_pair(
+		,
+		channel_parameters: &ChannelTransactionParameters,
+		commitment_number: u64,
+		secp_ctx: &Secp256k1<secp256k1::All>
+	) -> musig_secp::musig::PublicNonce,
+	fn generate_shutdown_nonce_pair(
+		mut,
+		channel_parameters: &ChannelTransactionParameters,
+		secp_ctx: &Secp256k1<secp256k1::All>
+	) -> musig_secp::musig::PublicNonce,
+	fn finalize_holder_commitment(
+		,
+		channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>
+	) -> Result<secp256k1::schnorr::Signature, ()>,
+	#[cfg(any(test, feature = "_test_utils", feature = "unsafe_revoked_tx_signing"))]
+	fn unsafe_finalize_holder_commitment(
+		,
+		channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>
+	) -> Result<secp256k1::schnorr::Signature, ()>,
 	fn sign_holder_commitment(, channel_parameters: &ChannelTransactionParameters,
 		commitment_tx: &HolderCommitmentTransaction,
 		secp_ctx: &Secp256k1<secp256k1::All>) -> Result<Signature, ()>,

@@ -42,6 +42,9 @@ bech32 = { version = "0.11.0", default-features = false }
 bitcoin = { version = "0.32.4", default-features = false, features = ["secp-recovery"] }
 chacha20-poly1305 = { version = "0.2.0", default-features = false }
 
+musig-secp = { package = "secp256k1", version = "0.32.0-beta.2", default-features = false }
+musig-bitcoin = { package = "bitcoin", version = "0.33.0-beta", default-features = false }
+
 dnssec-prover = { version = "0.6", default-features = false }
 hashbrown = { version = "0.13", default-features = false }
 possiblyrandom = { version = "0.2", path = "../possiblyrandom", default-features = false }

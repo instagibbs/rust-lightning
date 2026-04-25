@@ -665,9 +665,9 @@ impl HolderFundingOutput {
 		let commitment_tx = self.commitment_tx.as_ref()
 			.unwrap_or(onchain_tx_handler.current_holder_commitment_tx());
 		let maybe_signed_tx = onchain_tx_handler.signer
-			.sign_holder_commitment(channel_parameters, commitment_tx, &onchain_tx_handler.secp_ctx)
-			.map(|holder_sig| {
-				commitment_tx.add_holder_sig(&self.funding_redeemscript, holder_sig)
+			.finalize_holder_commitment(channel_parameters, commitment_tx, &onchain_tx_handler.secp_ctx)
+			.map(|agg_sig| {
+				commitment_tx.add_holder_sig(agg_sig)
 			})
 			.unwrap_or_else(|_| {
 				commitment_tx.trust().built_transaction().transaction.clone()

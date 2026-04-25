@@ -13,7 +13,7 @@ use crate::ln::chan_utils::{
 };
 use crate::ln::channel::{ANCHOR_OUTPUT_VALUE_SATOSHI, MIN_CHAN_DUST_LIMIT_SATOSHIS};
 use crate::ln::channel_keys::HtlcKey;
-use crate::ln::msgs;
+use crate::ln::msgs::{self, PartialSignatureWithNonce};
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::ChannelSigner;
 use crate::types::payment::PaymentPreimage;
@@ -253,6 +253,64 @@ impl ChannelSigner for TestChannelSigner {
 }
 
 impl EcdsaChannelSigner for TestChannelSigner {
+	fn partially_sign_counterparty_commitment(
+		&self, _channel_parameters: &ChannelTransactionParameters,
+		_counterparty_nonce: musig_secp::musig::PublicNonce,
+		_commitment_tx: &CommitmentTransaction,
+		_inbound_htlc_preimages: Vec<PaymentPreimage>,
+		_outbound_htlc_preimages: Vec<PaymentPreimage>,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<(crate::ln::msgs::PartialSignatureWithNonce, Vec<Signature>), ()> {
+	    todo!();
+	}
+
+	fn partially_sign_closing_transaction(
+		&self, _channel_parameters: &ChannelTransactionParameters,
+		_counterparty_nonce: musig_secp::musig::PublicNonce,
+		_closing_tx: &ClosingTransaction,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<PartialSignatureWithNonce, ()> {
+	    todo!();
+	}
+
+	fn finalize_closing_transaction(
+		&mut self, _channel_parameters: &ChannelTransactionParameters,
+		_local_nonce: musig_secp::musig::PublicNonce,
+		_counterparty_sig: PartialSignatureWithNonce,
+		_closing_tx: &ClosingTransaction,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<musig_secp::musig::PartialSignature, ()> {
+	    todo!();
+	}
+
+	fn generate_local_nonce_pair(
+		&self, _channel_parameters: &ChannelTransactionParameters, _commitment_number: u64, _secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> musig_secp::musig::PublicNonce {
+	    todo!();
+	}
+
+	fn generate_shutdown_nonce_pair(&mut self, _channel_parameters: &ChannelTransactionParameters, _secp_ctx: &Secp256k1<secp256k1::All>) -> musig_secp::musig::PublicNonce {
+	    todo!();
+	}
+
+	fn finalize_holder_commitment(
+		&self,
+		_channel_parameters: &ChannelTransactionParameters,
+		_commitment_tx: &HolderCommitmentTransaction,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<secp256k1::schnorr::Signature, ()> {
+	    todo!();
+	}
+
+	fn unsafe_finalize_holder_commitment(
+		&self,
+		_channel_parameters: &ChannelTransactionParameters,
+		_commitment_tx: &HolderCommitmentTransaction,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<secp256k1::schnorr::Signature, ()> {
+	    todo!();
+	}
+
 	fn sign_counterparty_commitment(
 		&self, channel_parameters: &ChannelTransactionParameters,
 		commitment_tx: &CommitmentTransaction, inbound_htlc_preimages: Vec<PaymentPreimage>,

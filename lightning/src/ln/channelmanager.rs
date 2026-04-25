@@ -32,6 +32,8 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::{secp256k1, Sequence, SignedAmount};
 
+use musig_secp::musig::PublicNonce;
+
 use crate::blinded_path::message::{
 	AsyncPaymentsContext, BlindedMessagePath, MessageForwardNode, OffersContext,
 };
@@ -6577,7 +6579,7 @@ impl<
 					is_batch_funding,
 					|chan| {
 						let mut output_index = None;
-						let expected_spk = chan.funding.get_funding_redeemscript().to_p2wsh();
+						let expected_spk = chan.funding.get_funding_output(&self.secp_ctx).unwrap().script_pubkey;
 						let outpoint = match &funding {
 							FundingType::Checked(tx) | FundingType::CheckedManualBroadcast(tx) => {
 								for (idx, outp) in tx.output.iter().enumerate() {
@@ -11696,7 +11698,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 								&peer_state.latest_features,
 							);
 							try_channel_entry!(self, peer_state, res, chan);
-							(unfunded_chan.funding.get_value_satoshis(), unfunded_chan.funding.get_funding_redeemscript().to_p2wsh(), unfunded_chan.context.get_user_id())
+							(unfunded_chan.funding.get_value_satoshis(), unfunded_chan.funding.get_funding_output(&self.secp_ctx).unwrap().script_pubkey, unfunded_chan.context.get_user_id())
 						},
 						None => {
 							return Err(MsgHandleErrInternal::send_err_msg_no_close(format!("Got an unexpected accept_channel message from peer with counterparty_node_id {}", counterparty_node_id), msg.common_fields.temporary_channel_id));
@@ -13542,6 +13544,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							my_current_per_commitment_point: PublicKey::from_slice(&[2u8; 33]).unwrap(),
 							next_funding: None,
 							my_current_funding_locked: None,
+							next_local_nonces: vec![PublicNonce::from_byte_array(&[0u8; 66]).unwrap()],
 						},
 					});
 					return Err(MsgHandleErrInternal::no_such_channel_for_peer(counterparty_node_id, msg.channel_id)
@@ -17243,8 +17246,8 @@ impl<
 							if peer_state_mutex_opt.is_none() { return NotifyOption::SkipPersistNoEvents; }
 							let mut peer_state = peer_state_mutex_opt.unwrap().lock().unwrap();
 							if let Some(chan) = peer_state.channel_by_id
-								.get(&msg.channel_id)
-								.and_then(Channel::as_funded)
+								.get_mut(&msg.channel_id)
+								.and_then(Channel::as_funded_mut)
 							{
 								if let Some(msg) = chan.get_outbound_shutdown() {
 									peer_state.pending_msg_events.push(MessageSendEvent::SendShutdown {

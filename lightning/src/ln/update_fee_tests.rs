@@ -466,14 +466,16 @@ pub fn do_test_update_fee_that_funder_cannot_afford(channel_type_features: Chann
 
 	const INITIAL_COMMITMENT_NUMBER: u64 = 281474976710654;
 
-	let remote_point = {
+	let (remote_point, remote_nonce) = {
 		let mut per_peer_lock;
 		let mut peer_state_lock;
 
 		let channel = get_channel_ref!(nodes[1], nodes[0], per_peer_lock, peer_state_lock, chan.2);
 		let chan_signer = channel.as_funded().unwrap().get_signer();
 		let point_number = INITIAL_COMMITMENT_NUMBER - 1;
-		chan_signer.get_per_commitment_point(point_number, &secp_ctx).unwrap()
+		let remote_point = chan_signer.get_per_commitment_point(point_number, &secp_ctx).unwrap();
+		let remote_nonce = chan_signer.generate_local_nonce_pair(&channel.funding().channel_transaction_parameters, point_number, &secp_ctx);
+		(remote_point, remote_nonce)
 	};
 
 	let res = {
@@ -499,7 +501,7 @@ pub fn do_test_update_fee_that_funder_cannot_afford(channel_type_features: Chann
 		);
 		let params = &local_chan.funding().channel_transaction_parameters;
 		local_chan_signer
-			.sign_counterparty_commitment(params, &commitment_tx, Vec::new(), Vec::new(), &secp_ctx)
+			.partially_sign_counterparty_commitment(params, remote_nonce, &commitment_tx, Vec::new(), Vec::new(), &secp_ctx)
 			.unwrap()
 	};
 
@@ -564,13 +566,15 @@ pub fn test_update_fee_that_saturates_subs() {
 	// We build a commitment transcation here only to pass node 1's check of node 0's signature
 	// in `commitment_signed`.
 
-	let remote_point = {
+	let (remote_point, remote_nonce) = {
 		let mut per_peer_lock;
 		let mut peer_state_lock;
 
 		let channel = get_channel_ref!(nodes[1], nodes[0], per_peer_lock, peer_state_lock, chan_id);
 		let chan_signer = channel.as_funded().unwrap().get_signer();
-		chan_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER, &secp_ctx).unwrap()
+		let remote_point = chan_signer.get_per_commitment_point(INITIAL_COMMITMENT_NUMBER, &secp_ctx).unwrap();
+		let remote_nonce = chan_signer.generate_local_nonce_pair(&channel.funding().channel_transaction_parameters, INITIAL_COMMITMENT_NUMBER, &secp_ctx);
+		(remote_point, remote_nonce)
 	};
 
 	let res = {
@@ -595,7 +599,7 @@ pub fn test_update_fee_that_saturates_subs() {
 		);
 		let params = &local_chan.funding().channel_transaction_parameters;
 		local_chan_signer
-			.sign_counterparty_commitment(params, &commitment_tx, Vec::new(), Vec::new(), &secp_ctx)
+			.partially_sign_counterparty_commitment(params, remote_nonce, &commitment_tx, Vec::new(), Vec::new(), &secp_ctx)
 			.unwrap()
 	};
 

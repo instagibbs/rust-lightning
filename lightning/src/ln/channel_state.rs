@@ -527,6 +527,8 @@ impl ChannelDetails {
 	/// was spent by the splice transaction) until the splice transaction reaches sufficient
 	/// confirmations to be locked (and we exchange `splice_locked` messages with our peer).
 	pub fn get_funding_output(&self) -> Option<bitcoin::TxOut> {
+		panic!("get_funding_output not supported");
+		/*
 		match self.funding_redeem_script.as_ref() {
 			None => None,
 			Some(redeem_script) => Some(bitcoin::TxOut {
@@ -534,6 +536,7 @@ impl ChannelDetails {
 				script_pubkey: redeem_script.to_p2wsh(),
 			}),
 		}
+		*/
 	}
 
 	pub(super) fn from_channel<SP: SignerProvider, F: FeeEstimator>(
