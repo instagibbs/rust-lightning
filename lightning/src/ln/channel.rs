@@ -2924,6 +2924,7 @@ impl FundingScope {
 			funding_tx_confirmation_height: 0,
 			short_channel_id: None,
 			minimum_depth_override: None,
+			signing_nonce: None,
 		}
 	}
 
@@ -7346,7 +7347,7 @@ where
 			QuiescentAction::Splice { contribution, .. } => {
 				QuiescentError::FailSplice(self.splice_funding_failed_for(contribution))
 			},
-			Some(QuiescentAction::Teleport { .. }) => None,
+			QuiescentAction::Teleport { .. } => QuiescentError::DoNothing,
 			#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 			QuiescentAction::DoNothing => QuiescentError::DoNothing,
 		}
@@ -15656,8 +15657,11 @@ where
 						debug_assert!(false);
 						self.quiescent_action =
 							Some(QuiescentAction::Teleport { new_funding_txo });
-						return Err(ChannelError::WarnAndDisconnect(
-							"Channel already has a teleport pending".to_owned(),
+						return Err((
+							ChannelError::WarnAndDisconnect(
+								"Channel already has a teleport pending".to_owned(),
+							),
+							QuiescentError::DoNothing,
 						));
 					}
 
