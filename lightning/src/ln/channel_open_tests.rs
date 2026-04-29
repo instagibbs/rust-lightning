@@ -2687,3 +2687,67 @@ fn test_error_if_0reserve_negotiates_down_to_legacy() {
 	);
 	check_closed_events(&nodes[0], &[expected_closing]);
 }
+
+#[xtest(feature = "_externalize_tests")]
+fn test_funding_created_signature_round_trip() {
+	// Minimal repro for "Invalid funding_created signature from peer" on the proto-taproot base.
+	//
+	// We drive the standard v1 channel-open handshake through to `funding_created`. The accepter
+	// then verifies the partial-sig-with-nonce in `check_counterparty_commitment_signature`. On
+	// the current proto-taproot signing path that verification fails, even though both sides
+	// nominally aggregate the same nonces and pubkeys against the same sighash. This test pins
+	// down the failure as a focused unit test (not buried inside an end-to-end integration test)
+	// so the divergence can be debugged with `RUST_LOG=trace` against a single open exchange.
+	//
+	// Expected (on a working signing path): no error, ChannelPending fires, monitor added.
+	// Today: get_and_clear_pending_msg_events on the accepter contains a HandleError with the
+	// "Invalid funding_created signature from peer" message and the channel is closed.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	nodes[0].node.create_channel(node_b_id, 100_000, 10_001, 42, None, None).unwrap();
+	let open_channel = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id);
+
+	handle_and_accept_open_channel(&nodes[1], node_a_id, &open_channel);
+	let accept_channel = get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id);
+
+	nodes[0].node.handle_accept_channel(node_b_id, &accept_channel);
+
+	let (temporary_channel_id, tx, _funding_outpoint) =
+		create_funding_transaction(&nodes[0], &node_b_id, 100_000, 42);
+	nodes[0]
+		.node
+		.funding_transaction_generated(temporary_channel_id, node_b_id, tx.clone())
+		.unwrap();
+	check_added_monitors(&nodes[0], 0);
+	let funding_created =
+		get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, node_b_id);
+
+	// The accepter verifies the partial-sig-with-nonce here. This previously failed with
+	// "Invalid funding_created signature from peer" because
+	// InMemorySigner::partially_sign_counterparty_commitment hardcoded a P2TR funding-output
+	// prevout while the verifier in check_counterparty_commitment_signature uses
+	// get_funding_output (which picks P2WSH 2-of-2 for non-Ark channels). The signer was fixed
+	// to also call get_funding_output so both sides agree on the prevout.
+	nodes[1].node.handle_funding_created(node_a_id, &funding_created);
+
+	let added = nodes[1]
+		.chain_monitor
+		.added_monitors
+		.lock()
+		.unwrap()
+		.split_off(0);
+	assert_eq!(
+		added.len(),
+		1,
+		"accepter should have added a monitor for the new channel; got {}. \
+		 Indicates a regression in the funding_created signing/verification round-trip.",
+		added.len(),
+	);
+	expect_channel_pending_event(&nodes[1], &node_a_id);
+	let _funding_signed = get_event_msg!(nodes[1], MessageSendEvent::SendFundingSigned, node_a_id);
+}
