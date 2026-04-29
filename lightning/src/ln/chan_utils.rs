@@ -1181,6 +1181,12 @@ pub struct ChannelTransactionParameters {
 	/// against the client's HTLC-Success path, so the Ark server never has to unroll the tree to
 	/// resolve an HTLC. `None` preserves the standard BOLT-3 channel semantics.
 	pub ark_htlc_success_csv_delta: Option<u16>,
+	/// Ark-on-Lightning: relative-blocks CSV applied to the commit-tx input's `nSequence` for
+	/// Ark channels. This replaces the high-bits-of-nSequence encoding of the obscured
+	/// commitment-number used by BOLT-3; the obscured number is moved to a dedicated OP_RETURN
+	/// output instead. Required when `channel_type_features.requires_ark_channel()`; ignored
+	/// otherwise.
+	pub ark_exit_delay: Option<u16>,
 }
 
 /// Late-bound per-channel counterparty data used to build transactions.
@@ -1292,6 +1298,7 @@ impl ChannelTransactionParameters {
 			channel_type_features: ChannelTypeFeatures::empty(),
 			channel_value_satoshis,
 			ark_htlc_success_csv_delta: None,
+			ark_exit_delay: None,
 		}
 	}
 }
@@ -1316,6 +1323,7 @@ impl Writeable for ChannelTransactionParameters {
 			(12, self.splice_parent_funding_txid, option),
 			(13, self.channel_value_satoshis, required),
 			(15, self.ark_htlc_success_csv_delta, option),
+			(17, self.ark_exit_delay, option),
 		});
 		Ok(())
 	}
@@ -1334,6 +1342,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 		let mut channel_type_features = None;
 		let mut channel_value_satoshis = None;
 		let mut ark_htlc_success_csv_delta: Option<u16> = None;
+		let mut ark_exit_delay: Option<u16> = None;
 
 		read_tlv_fields!(reader, {
 			(0, holder_pubkeys, required),
@@ -1346,6 +1355,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			(12, splice_parent_funding_txid, option),
 			(13, channel_value_satoshis, option),
 			(15, ark_htlc_success_csv_delta, option),
+			(17, ark_exit_delay, option),
 		});
 
 		let channel_value_satoshis = match read_args {
@@ -1374,6 +1384,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			channel_type_features: channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key()),
 			channel_value_satoshis,
 			ark_htlc_success_csv_delta,
+			ark_exit_delay,
 		})
 	}
 }
@@ -1527,6 +1538,7 @@ impl HolderCommitmentTransaction {
 			channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 			channel_value_satoshis,
 			ark_htlc_success_csv_delta: None,
+			ark_exit_delay: None,
 		};
 		let mut counterparty_htlc_sigs = Vec::new();
 		for _ in 0..nondust_htlcs.len() {
@@ -2053,14 +2065,29 @@ impl CommitmentTransaction {
 
 	#[rustfmt::skip]
 	fn make_transaction(obscured_commitment_transaction_number: u64, txins: Vec<TxIn>, outputs: Vec<TxOut>, channel_parameters: &DirectedChannelTransactionParameters) -> Transaction {
-		let version = if channel_parameters.channel_type_features().supports_anchor_zero_fee_commitments() {
+		let channel_type = channel_parameters.channel_type_features();
+		let version = if channel_type.supports_anchor_zero_fee_commitments() || channel_type.requires_ark_channel() {
 			Version::non_standard(3)
 		} else {
 			Version::TWO
 		};
+		// For Ark channels, the obscured commitment number is moved out of the lock_time / input
+		// sequence encoding and into a dedicated OP_RETURN output, so the input sequence can carry
+		// the Ark exit-delay CSV instead. lock_time is set to zero.
+		let (lock_time, outputs) = if channel_type.requires_ark_channel() {
+			let mut outputs = outputs;
+			let op_return = ScriptBuf::new_op_return(&obscured_commitment_transaction_number.to_be_bytes());
+			outputs.push(TxOut { value: Amount::ZERO, script_pubkey: op_return });
+			(LockTime::ZERO, outputs)
+		} else {
+			(
+				LockTime::from_consensus(((0x20 as u32) << 8 * 3) | ((obscured_commitment_transaction_number & 0xffffffu64) as u32)),
+				outputs,
+			)
+		};
 		Transaction {
 			version,
-			lock_time: LockTime::from_consensus(((0x20 as u32) << 8 * 3) | ((obscured_commitment_transaction_number & 0xffffffu64) as u32)),
+			lock_time,
 			input: txins,
 			output: outputs,
 		}
@@ -2259,12 +2286,25 @@ impl CommitmentTransaction {
 		let obscured_commitment_transaction_number =
 			commitment_transaction_number_obscure_factor ^ (INITIAL_COMMITMENT_NUMBER - commitment_number);
 
+		// For Ark channels the input nSequence carries the exit-delay CSV (a real BIP68 relative
+		// timelock), not the high 24 bits of the obscured commitment number. The obscured number
+		// is emitted in a dedicated OP_RETURN output; see make_transaction.
+		let sequence = if channel_parameters.channel_type_features().requires_ark_channel() {
+			let exit_delay = channel_parameters
+				.inner
+				.ark_exit_delay
+				.expect("Ark channels must set ark_exit_delay on ChannelTransactionParameters");
+			Sequence::from_height(exit_delay)
+		} else {
+			Sequence(((0x80 as u32) << 8 * 3)
+				| ((obscured_commitment_transaction_number >> 3 * 8) as u32))
+		};
+
 		let txins = {
 			let ins: Vec<TxIn> = vec![TxIn {
 				previous_output: channel_parameters.funding_outpoint(),
 				script_sig: ScriptBuf::new(),
-				sequence: Sequence(((0x80 as u32) << 8 * 3)
-					| ((obscured_commitment_transaction_number >> 3 * 8) as u32)),
+				sequence,
 				witness: Witness::new(),
 			}];
 			ins
@@ -2561,6 +2601,7 @@ mod tests {
 				channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 				channel_value_satoshis: 4000,
 				ark_htlc_success_csv_delta: None,
+				ark_exit_delay: None,
 			};
 
 			Self {
@@ -2852,6 +2893,55 @@ mod tests {
 		assert_eq!(justice_tx.output.len(), 1);
 		assert!(justice_tx.output[0].value.to_sat() < 1000);
 		assert_eq!(justice_tx.output[0].script_pubkey, destination_script);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn test_ark_channel_commit_tx_layout() {
+		// For an Ark channel the commit-TX input nSequence carries the exit-delay CSV (a real
+		// BIP68 relative timelock), the nLockTime is zero, and the obscured commitment number is
+		// emitted in a dedicated OP_RETURN output instead of being packed into nLockTime/nSequence.
+		use bitcoin::{Sequence, Witness};
+		use bitcoin::absolute::LockTime;
+
+		let mut builder = TestCommitmentTxBuilder::new();
+		builder.channel_parameters.channel_type_features = ChannelTypeFeatures::ark_channel();
+		let exit_delay: u16 = 144;
+		builder.channel_parameters.ark_exit_delay = Some(exit_delay);
+
+		let tx = builder.build(1000, 2000, Vec::new());
+		let built = builder.verify(&tx).expect("builder verify should succeed");
+		let commit_tx = built.built_transaction();
+
+		// Input sequence is exit_delay; nLockTime is zero.
+		assert_eq!(commit_tx.transaction.input.len(), 1);
+		assert_eq!(commit_tx.transaction.input[0].sequence, Sequence::from_height(exit_delay));
+		assert_eq!(commit_tx.transaction.input[0].witness, Witness::new());
+		assert_eq!(commit_tx.transaction.lock_time, LockTime::ZERO);
+
+		// Last output is the OP_RETURN carrying the obscured commitment number (8 bytes BE).
+		let op_return = commit_tx.transaction.output.last().expect("expect outputs");
+		assert_eq!(op_return.value.to_sat(), 0);
+		let mut iter = op_return.script_pubkey.instructions();
+		let first = iter.next().expect("op_return op").expect("instruction");
+		match first {
+			Instruction::Op(opcode) => assert_eq!(opcode, opcodes::all::OP_RETURN),
+			Instruction::PushBytes(_) => panic!("expected OP_RETURN opcode"),
+		}
+		let pushed = iter.next().expect("push").expect("instruction");
+		match pushed {
+			Instruction::PushBytes(bytes) => {
+				assert_eq!(bytes.len(), 8, "obscured number should be 8 bytes");
+				let mut buf = [0u8; 8];
+				buf.copy_from_slice(bytes.as_bytes());
+				let obscured = u64::from_be_bytes(buf);
+				// Sanity: obscured number is non-trivial — it XORs the obscure factor with
+				// (INITIAL_COMMITMENT_NUMBER - commitment_number). With commitment_number=0 this
+				// is the obscure factor XOR a fixed constant; it should not be 0.
+				assert_ne!(obscured, 0);
+			},
+			Instruction::Op(_) => panic!("expected push of obscured number"),
+		}
 	}
 
 	#[test]
