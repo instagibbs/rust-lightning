@@ -1273,6 +1273,23 @@ impl ChannelTransactionParameters {
 		Some(funding_txout)
 	}
 
+	/// Returns the funding output `TxOut` for this channel — taproot for Ark channels (using the
+	/// MuSig2-aggregated funding pubkey as the internal key), P2WSH 2-of-2 of the funding pubkeys
+	/// for everything else.
+	///
+	/// Returns `None` if `counterparty_parameters` isn't populated yet.
+	pub fn get_funding_output(&self, secp_ctx: &Secp256k1<secp256k1::All>) -> Option<TxOut> {
+		if self.channel_type_features.requires_ark_channel() {
+			self.get_taproot_output(secp_ctx)
+		} else {
+			let redeem = self.make_funding_redeemscript_opt()?;
+			Some(TxOut {
+				value: Amount::from_sat(self.channel_value_satoshis),
+				script_pubkey: redeem.to_p2wsh(),
+			})
+		}
+	}
+
 	#[cfg(test)]
 	#[rustfmt::skip]
 	pub fn test_dummy(channel_value_satoshis: u64) -> Self {
@@ -2893,6 +2910,30 @@ mod tests {
 		assert_eq!(justice_tx.output.len(), 1);
 		assert!(justice_tx.output[0].value.to_sat() < 1000);
 		assert_eq!(justice_tx.output[0].script_pubkey, destination_script);
+	}
+
+	#[test]
+	fn test_funding_output_shape_by_channel_type() {
+		// Non-Ark channels get a P2WSH 2-of-2 funding output. Ark channels get a P2TR
+		// funding output (MuSig2 of the funding pubkeys as the internal key).
+		let secp_ctx = Secp256k1::new();
+		let mut builder = TestCommitmentTxBuilder::new();
+
+		// Non-Ark.
+		let non_ark = builder
+			.channel_parameters
+			.get_funding_output(&secp_ctx)
+			.expect("counterparty parameters populated");
+		assert!(non_ark.script_pubkey.is_p2wsh());
+
+		// Ark.
+		builder.channel_parameters.channel_type_features = ChannelTypeFeatures::ark_channel();
+		builder.channel_parameters.ark_exit_delay = Some(144);
+		let ark = builder
+			.channel_parameters
+			.get_funding_output(&secp_ctx)
+			.expect("counterparty parameters populated");
+		assert!(ark.script_pubkey.is_p2tr());
 	}
 
 	#[test]

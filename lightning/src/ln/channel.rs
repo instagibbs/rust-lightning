@@ -2720,7 +2720,7 @@ impl FundingScope {
 	/// was spent by the splice transaction) until the splice transaction reaches sufficient
 	/// confirmations to be locked (and we exchange `splice_locked` messages with our peer).
 	pub fn get_funding_output(&self, secp_ctx: &Secp256k1<secp256k1::All>) -> Option<TxOut> {
-		self.channel_transaction_parameters.get_taproot_output(secp_ctx)
+		self.channel_transaction_parameters.get_funding_output(secp_ctx)
 	}
 
 	fn get_funding_txid(&self) -> Option<Txid> {
@@ -4232,7 +4232,11 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				channel_type_features: channel_type.clone(),
 				channel_value_satoshis,
 				ark_htlc_success_csv_delta: config.channel_handshake_config.ark_htlc_success_csv_delta,
-				ark_exit_delay: None,
+				ark_exit_delay: if channel_type.requires_ark_channel() {
+					config.channel_handshake_config.ark_exit_delay
+				} else {
+					None
+				},
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -4545,7 +4549,11 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				// We'll add our counterparty's `funding_satoshis` when we receive `accept_channel2`.
 				channel_value_satoshis,
 				ark_htlc_success_csv_delta: config.channel_handshake_config.ark_htlc_success_csv_delta,
-				ark_exit_delay: None,
+				ark_exit_delay: if channel_type.requires_ark_channel() {
+					config.channel_handshake_config.ark_exit_delay
+				} else {
+					None
+				},
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
