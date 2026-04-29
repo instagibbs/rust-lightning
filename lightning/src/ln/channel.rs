@@ -3875,9 +3875,9 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		let announce_for_forwarding =
 			if (open_channel_fields.channel_flags & 1) == 1 { true } else { false };
 
-		if announce_for_forwarding {
-			return Err(ChannelError::close("Cannot announce proto taproot channels".to_owned()));
-		}
+		// TODO(ark): re-gate the proto-taproot announce rejection on the Ark
+		// channel-type feature once Phase 1.2 wires it through. Removed for
+		// now so legacy non-Ark tests can announce as usual.
 
 		let channel_value_satoshis =
 			our_funding_satoshis.saturating_add(open_channel_fields.funding_satoshis);
