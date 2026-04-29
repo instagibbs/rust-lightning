@@ -2930,6 +2930,7 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 		cltv_expiry: htlc_cltv,
 		payment_hash,
 		transaction_output_index: Some(1),
+		ark_htlc_success_csv_delta: None,
 	};
 
 	let local_chan_balance_msat = channel_value_sat * 1000;
