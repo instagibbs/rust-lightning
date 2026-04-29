@@ -2717,8 +2717,6 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 		(commit_number - 1, remote_point, remote_nonce)
 	};
 
-	// Build the remote commitment transaction so we can sign it, and then later use the
-	// signature for the commitment_signed message.
 	let res = {
 		let per_peer_lock;
 		let mut peer_state_lock;
@@ -3528,6 +3526,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash: payment_hashes.iter().find(|hash| hash.0[0] == 0x75).unwrap().clone(),
 			amount_msat: 688_000,
 			transaction_output_index: Some(0),
+			ark_htlc_success_csv_delta: None,
 		},
 		HTLCOutputInCommitment {
 			offered: false,
@@ -3535,6 +3534,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash: payment_hashes.iter().find(|hash| hash.0[0] == 0x64).unwrap().clone(),
 			amount_msat: 688_000,
 			transaction_output_index: Some(1),
+			ark_htlc_success_csv_delta: None,
 		},
 		HTLCOutputInCommitment {
 			offered: false,
@@ -3542,6 +3542,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash,
 			amount_msat: 688_000,
 			transaction_output_index: Some(2),
+			ark_htlc_success_csv_delta: None,
 		},
 		HTLCOutputInCommitment {
 			offered: false,
@@ -3549,6 +3550,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash: payment_hashes.iter().find(|hash| hash.0[0] == 0x72).unwrap().clone(),
 			amount_msat: 688_000,
 			transaction_output_index: Some(3),
+			ark_htlc_success_csv_delta: None,
 		},
 		HTLCOutputInCommitment {
 			offered: false,
@@ -3556,6 +3558,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash: payment_hashes.iter().find(|hash| hash.0[0] == 0x66).unwrap().clone(),
 			amount_msat: 688_000,
 			transaction_output_index: Some(4),
+			ark_htlc_success_csv_delta: None,
 		},
 	];
 
