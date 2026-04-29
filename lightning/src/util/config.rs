@@ -252,6 +252,22 @@ pub struct ChannelHandshakeConfig {
 	///
 	/// Default value: `None` (standard BOLT-3 HTLC script shape).
 	pub ark_htlc_success_csv_delta: Option<u16>,
+	/// Ark-on-Lightning: if true, advertise and prefer the `ArkChannel` channel type when both
+	/// sides support it. The Ark channel type bundles taproot funding, commitment-state-number
+	/// in `OP_RETURN`, an exit-delay CSV in the commit-TX input nSequence, and (when set)
+	/// HTLC success-path CSV protection via [`ark_htlc_success_csv_delta`].
+	///
+	/// Default value: `false`.
+	///
+	/// [`ark_htlc_success_csv_delta`]: ChannelHandshakeConfig::ark_htlc_success_csv_delta
+	pub negotiate_ark_channel: bool,
+	/// Ark-on-Lightning: when negotiating an Ark channel, the exit-delay CSV in relative blocks
+	/// to enforce on the commit-TX input. Required when [`negotiate_ark_channel`] is true.
+	///
+	/// Default value: `None`.
+	///
+	/// [`negotiate_ark_channel`]: ChannelHandshakeConfig::negotiate_ark_channel
+	pub ark_exit_delay: Option<u16>,
 }
 
 impl Default for ChannelHandshakeConfig {
@@ -269,6 +285,8 @@ impl Default for ChannelHandshakeConfig {
 			negotiate_anchor_zero_fee_commitments: false,
 			our_max_accepted_htlcs: 50,
 			ark_htlc_success_csv_delta: None,
+			negotiate_ark_channel: false,
+			ark_exit_delay: None,
 		}
 	}
 }
@@ -292,6 +310,8 @@ impl Readable for ChannelHandshakeConfig {
 			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
 			ark_htlc_success_csv_delta: Readable::read(reader)?,
+			negotiate_ark_channel: Readable::read(reader)?,
+			ark_exit_delay: Readable::read(reader)?,
 		})
 	}
 }
