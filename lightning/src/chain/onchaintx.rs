@@ -1363,6 +1363,7 @@ mod tests {
 			channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 			channel_value_satoshis: 0,
 			ark_htlc_success_csv_delta: None,
+			ark_exit_delay: None,
 		};
 
 		// Create an OnchainTxHandler for a commitment containing HTLCs with CLTV expiries of 0, 1,

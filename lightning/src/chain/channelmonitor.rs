@@ -6958,6 +6958,7 @@ pub(super) fn dummy_monitor<S: EcdsaChannelSigner + 'static>(
 		channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 		channel_value_satoshis: 0,
 		ark_htlc_success_csv_delta: None,
+		ark_exit_delay: None,
 	};
 	let shutdown_script = crate::ln::script::ShutdownScript::new_p2wpkh_from_pubkey(dummy_key);
 	let best_block = BestBlock::from_network(Network::Testnet);

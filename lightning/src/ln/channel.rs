@@ -2817,6 +2817,7 @@ impl FundingScope {
 			channel_type_features: channel_parameters.channel_type_features.clone(),
 			channel_value_satoshis: post_channel_value,
 			ark_htlc_success_csv_delta: channel_parameters.ark_htlc_success_csv_delta,
+			ark_exit_delay: channel_parameters.ark_exit_delay,
 		};
 		post_channel_transaction_parameters
 			.counterparty_parameters
@@ -4231,6 +4232,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				channel_type_features: channel_type.clone(),
 				channel_value_satoshis,
 				ark_htlc_success_csv_delta: config.channel_handshake_config.ark_htlc_success_csv_delta,
+				ark_exit_delay: None,
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -4543,6 +4545,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				// We'll add our counterparty's `funding_satoshis` when we receive `accept_channel2`.
 				channel_value_satoshis,
 				ark_htlc_success_csv_delta: config.channel_handshake_config.ark_htlc_success_csv_delta,
+				ark_exit_delay: None,
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
