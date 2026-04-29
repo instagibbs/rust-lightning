@@ -2938,6 +2938,48 @@ mod tests {
 
 	#[test]
 	#[rustfmt::skip]
+	fn test_ark_channel_obscured_number_roundtrip() {
+		// Building an Ark commit TX at a particular commitment_number must produce an OP_RETURN
+		// whose payload, XORed with the obscure factor, recovers the original commitment number.
+		use crate::ln::chan_utils::get_commitment_transaction_number_obscure_factor;
+
+		let mut builder = TestCommitmentTxBuilder::new();
+		builder.channel_parameters.channel_type_features = ChannelTypeFeatures::ark_channel();
+		builder.channel_parameters.ark_exit_delay = Some(144);
+		// Pick a commitment_number well into the backwards-counting range to exercise the obscure
+		// XOR over interesting bits.
+		let commitment_number: u64 = 0xabcde;
+		builder.commitment_number = commitment_number;
+
+		let tx = builder.build(1000, 2000, Vec::new());
+		let built = builder.verify(&tx).expect("verify");
+		let commit_tx = built.built_transaction();
+
+		// Obscure factor matches what build_inputs computes internally.
+		let directed = builder.channel_parameters.as_holder_broadcastable();
+		let factor = get_commitment_transaction_number_obscure_factor(
+			&directed.broadcaster_pubkeys().payment_point,
+			&directed.countersignatory_pubkeys().payment_point,
+			directed.is_outbound(),
+		);
+
+		let op_return = commit_tx.transaction.output.last().expect("op_return output");
+		let mut iter = op_return.script_pubkey.instructions();
+		iter.next();
+		let pushed = match iter.next().unwrap().unwrap() {
+			Instruction::PushBytes(bytes) => bytes,
+			_ => panic!("expected push of obscured number"),
+		};
+		let mut buf = [0u8; 8];
+		buf.copy_from_slice(pushed.as_bytes());
+		let obscured = u64::from_be_bytes(buf);
+
+		let decoded = 0xffffffffffff - (obscured ^ factor);
+		assert_eq!(decoded, commitment_number);
+	}
+
+	#[test]
+	#[rustfmt::skip]
 	fn test_ark_channel_commit_tx_layout() {
 		// For an Ark channel the commit-TX input nSequence carries the exit-delay CSV (a real
 		// BIP68 relative timelock), the nLockTime is zero, and the obscured commitment number is
