@@ -70,6 +70,27 @@ fn test_option_zero_fee_commitments_initial() {
 }
 
 #[test]
+fn test_option_ark_channel_initial() {
+	// When both sides advertise the Ark channel type and the local node opts into it,
+	// get_initial_channel_type should return the Ark channel type (not anchors / static-remote-key).
+	let expected_type = ChannelTypeFeatures::ark_channel();
+
+	do_test_get_initial_channel_type(
+		UserConfig::default(),
+		InitFeatures::empty(),
+		ChannelTypeFeatures::only_static_remote_key(),
+		|cfg: &mut UserConfig| {
+			cfg.channel_handshake_config.negotiate_ark_channel = true;
+			cfg.channel_handshake_config.ark_exit_delay = Some(144);
+		},
+		|their_features: &mut InitFeatures| {
+			their_features.set_ark_channel_optional();
+		},
+		expected_type,
+	)
+}
+
+#[test]
 fn test_option_zero_fee_commitments_from_zero_htlc_anchors_initial() {
 	let mut start_cfg = UserConfig::default();
 	start_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;

@@ -256,6 +256,19 @@ pub struct ChannelHandshakeConfig {
 	///
 	/// [`max_htlcs`]: crate::ln::chan_utils::max_htlcs
 	pub our_max_accepted_htlcs: u16,
+	/// Ark-on-Lightning: if true, advertise and prefer the `ArkChannel` channel type when both
+	/// sides support it. The Ark channel type bundles taproot funding, commitment-state-number
+	/// in `OP_RETURN`, and an exit-delay CSV in the commit-TX input nSequence.
+	///
+	/// Default value: `false`.
+	pub negotiate_ark_channel: bool,
+	/// Ark-on-Lightning: when negotiating an Ark channel, the exit-delay CSV in relative blocks
+	/// to enforce on the commit-TX input. Required when [`negotiate_ark_channel`] is true.
+	///
+	/// Default value: `None`.
+	///
+	/// [`negotiate_ark_channel`]: ChannelHandshakeConfig::negotiate_ark_channel
+	pub ark_exit_delay: Option<u16>,
 }
 
 impl Default for ChannelHandshakeConfig {
@@ -273,6 +286,8 @@ impl Default for ChannelHandshakeConfig {
 			negotiate_anchors_zero_fee_htlc_tx: true,
 			negotiate_anchor_zero_fee_commitments: false,
 			our_max_accepted_htlcs: 50,
+			negotiate_ark_channel: false,
+			ark_exit_delay: None,
 		}
 	}
 }
@@ -305,6 +320,8 @@ impl Readable for ChannelHandshakeConfig {
 			negotiate_anchors_zero_fee_htlc_tx: Readable::read(reader)?,
 			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
+			negotiate_ark_channel: Readable::read(reader)?,
+			ark_exit_delay: Readable::read(reader)?,
 		})
 	}
 }
