@@ -4831,7 +4831,30 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		}
 
 		let funding_txid_spent = commitment_tx.input[0].previous_output.txid;
-		let commitment_number = 0xffffffffffff - ((((commitment_tx.input[0].sequence.0 as u64 & 0xffffff) << 3*8) | (commitment_tx.lock_time.to_consensus_u32() as u64 & 0xffffff)) ^ self.commitment_transaction_number_obscure_factor);
+		// For Ark channels the obscured commitment number lives in a dedicated OP_RETURN output
+		// instead of being packed across nLockTime / input nSequence (the input nSequence carries
+		// the exit-delay CSV instead). Decode accordingly.
+		let obscured_number = if funding_spent.channel_parameters.channel_type_features.requires_ark_channel() {
+			commitment_tx.output.iter().find_map(|out| {
+				if !out.script_pubkey.is_op_return() {
+					return None;
+				}
+				let mut iter = out.script_pubkey.instructions();
+				iter.next();
+				match iter.next() {
+					Some(Ok(bitcoin::script::Instruction::PushBytes(bytes))) if bytes.len() == 8 => {
+						let mut buf = [0u8; 8];
+						buf.copy_from_slice(bytes.as_bytes());
+						Some(u64::from_be_bytes(buf))
+					},
+					_ => None,
+				}
+			}).unwrap_or(0)
+		} else {
+			((commitment_tx.input[0].sequence.0 as u64 & 0xffffff) << 3*8)
+				| (commitment_tx.lock_time.to_consensus_u32() as u64 & 0xffffff)
+		};
+		let commitment_number = 0xffffffffffff - (obscured_number ^ self.commitment_transaction_number_obscure_factor);
 		if commitment_number >= self.get_min_seen_secret() {
 			assert_eq!(funding_spent.funding_txid(), funding_txid_spent);
 
