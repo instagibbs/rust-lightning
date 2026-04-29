@@ -175,6 +175,10 @@ mod sealed {
 			,
 			// Byte 19
 			HtlcHold,
+			// Byte 20 - 49
+			,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+			// Byte 50
+			ArkChannel,
 		]
 	);
 	define_context!(
@@ -208,6 +212,10 @@ mod sealed {
 			,,,,,,,,,,,,
 			// Byte 32
 			DnsResolver,
+			// Byte 33 - 49
+			,,,,,,,,,,,,,,,,,
+			// Byte 50
+			ArkChannel,
 		]
 	);
 	define_context!(ChannelContext, []);
@@ -271,6 +279,10 @@ mod sealed {
 		,,,,,,,,,,
 		// Byte 17
 		AnchorZeroFeeCommitmentsStaging,
+		// Byte 18 - 49
+		,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+		// Byte 50
+		ArkChannel,
 	]);
 
 	/// Defines a feature with the given bits for the specified [`Context`]s. The generated trait is
@@ -732,6 +744,19 @@ mod sealed {
 		supports_dns_resolution,
 		requires_dns_resolution
 	);
+	define_feature!(
+		401, // Experimental: Ark channel type. No BOLT proposal; bit chosen well clear of any
+		ArkChannel,
+		[InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for Ark channels: taproot funding output, obscured commitment state \
+		 number moved to an OP_RETURN output, commit TX input nSequence carries the Ark \
+		 exit-delay CSV, and Ark HTLC success-path CSV protection.",
+		set_ark_channel_optional,
+		set_ark_channel_required,
+		clear_ark_channel,
+		supports_ark_channel,
+		requires_ark_channel
+	);
 
 	// Note: update the module-level docs when a new feature bit is added!
 
@@ -1089,6 +1114,17 @@ impl ChannelTypeFeatures {
 		<sealed::ChannelTypeContext as sealed::AnchorZeroFeeCommitmentsStaging>::set_required_bit(
 			&mut ret,
 		);
+		ret
+	}
+
+	/// Constructs a ChannelTypeFeatures for the Ark channel type.
+	///
+	/// Bundles taproot funding output, the obscured commitment state number relocated to an
+	/// `OP_RETURN` output (so the commit TX input nSequence can carry the Ark exit-delay CSV),
+	/// and Ark HTLC success-path CSV protection.
+	pub fn ark_channel() -> Self {
+		let mut ret = Self::empty();
+		<sealed::ChannelTypeContext as sealed::ArkChannel>::set_required_bit(&mut ret);
 		ret
 	}
 }
@@ -1524,6 +1560,23 @@ mod tests {
 		assert_eq!(converted_features, ChannelTypeFeatures::only_static_remote_key());
 		assert!(!converted_features.supports_any_optional_bits());
 		assert!(converted_features.requires_static_remote_key());
+	}
+
+	#[test]
+	fn test_ark_channel_feature() {
+		let ark = ChannelTypeFeatures::ark_channel();
+		assert!(ark.requires_ark_channel());
+		assert!(ark.supports_ark_channel());
+
+		// from_init promotes optional bits to required.
+		let mut init = InitFeatures::empty();
+		init.set_ark_channel_optional();
+		let converted = ChannelTypeFeatures::from_init(&init);
+		assert_eq!(converted, ark);
+
+		// Distinct from other channel types.
+		assert_ne!(ark, ChannelTypeFeatures::only_static_remote_key());
+		assert_ne!(ark, ChannelTypeFeatures::anchors_zero_fee_commitments());
 	}
 
 	#[test]
