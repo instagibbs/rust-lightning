@@ -1825,9 +1825,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
 		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
-		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
-		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
+		// Use the channel-type-aware funding-output picker so the prevout matches the verifier's
+		// view (P2TR for Ark channels, P2WSH 2-of-2 otherwise). Hardcoding P2TR here yields a
+		// sighash mismatch and "Invalid signature from peer" on non-Ark channels.
+		let _ = internal_key_bytes; // retained above for the key_agg_cache tweak path
+		let funding_txout = channel_parameters
+			.get_funding_output(secp_ctx)
+			.expect("counterparty parameters must be populated");
 
 		let session_secret_rand = SessionSecretRand::assume_unique_per_nonce_gen(self.get_secure_random_bytes());
 
@@ -1870,9 +1874,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
 		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
-		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
-		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
+		// Use the channel-type-aware funding-output picker so the prevout matches the verifier's
+		// view (P2TR for Ark channels, P2WSH 2-of-2 otherwise). Hardcoding P2TR here yields a
+		// sighash mismatch and "Invalid signature from peer" on non-Ark channels.
+		let _ = internal_key_bytes; // retained above for the key_agg_cache tweak path
+		let funding_txout = channel_parameters
+			.get_funding_output(secp_ctx)
+			.expect("counterparty parameters must be populated");
 
 		let agg_nonce = AggregatedNonce::new(&[&local_nonce, &counterparty_sig.public_nonce]);
 		let msg = closing_tx.trust().get_sighash_default(&funding_txout);
@@ -1935,9 +1943,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
 		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
-		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
-		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
+		// Use the channel-type-aware funding-output picker so the prevout matches the verifier's
+		// view (P2TR for Ark channels, P2WSH 2-of-2 otherwise). Hardcoding P2TR here yields a
+		// sighash mismatch and "Invalid signature from peer" on non-Ark channels.
+		let _ = internal_key_bytes; // retained above for the key_agg_cache tweak path
+		let funding_txout = channel_parameters
+			.get_funding_output(secp_ctx)
+			.expect("counterparty parameters must be populated");
 
 		let agg_nonce = AggregatedNonce::new(&[&local_nonce, &commitment_tx.counterparty_sig.public_nonce]);
 		let msg = commitment_tx.trust().built_transaction().get_sighash_default(&funding_txout);
