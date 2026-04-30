@@ -1712,11 +1712,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 
 		let keypair = musig_secp::Keypair::from_secret_key(&musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap());
 
-		let mut key_agg_cache = KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let mut pubkeys = [&funding_pubkey, &counterparty_pubkey];
+		musig_secp::sort_pubkeys(&mut pubkeys);
+		let mut key_agg_cache = KeyAggCache::new(&pubkeys);
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
 		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
 		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
 		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
@@ -1724,11 +1726,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 		let session_secret_rand = SessionSecretRand::assume_unique_per_nonce_gen(self.get_secure_random_bytes());
 
 		let msg = commitment_tx.trust().built_transaction().get_sighash_default(&funding_txout);
+
 		let (secret_nonce, public_nonce) = key_agg_cache.nonce_gen(session_secret_rand, funding_pubkey, msg.as_ref(), None);
 		let agg_nonce = AggregatedNonce::new(&[&public_nonce, &counterparty_nonce]);
 
 		let session = Session::new(&key_agg_cache, agg_nonce, msg.as_ref());
 		let partial_signature = session.partial_sign(secret_nonce, &keypair, &key_agg_cache);
+
 
 		let trusted_tx = commitment_tx.trust();
 		let keys = trusted_tx.keys();
@@ -1795,11 +1799,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 
 		let keypair = musig_secp::Keypair::from_secret_key(&musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap());
 
-		let mut key_agg_cache = KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let mut pubkeys = [&funding_pubkey, &counterparty_pubkey];
+		musig_secp::sort_pubkeys(&mut pubkeys);
+		let mut key_agg_cache = KeyAggCache::new(&pubkeys);
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
 		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
 		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
 		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
@@ -1838,11 +1844,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 
 		let keypair = musig_secp::Keypair::from_secret_key(&musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap());
 
-		let mut key_agg_cache = KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let mut pubkeys = [&funding_pubkey, &counterparty_pubkey];
+		musig_secp::sort_pubkeys(&mut pubkeys);
+		let mut key_agg_cache = KeyAggCache::new(&pubkeys);
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
 		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
 		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
 		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };
@@ -1901,11 +1909,13 @@ impl EcdsaChannelSigner for InMemorySigner {
 
 		let keypair = musig_secp::Keypair::from_secret_key(&musig_secp::SecretKey::from_secret_bytes(funding_key_bytes).unwrap());
 
-		let mut key_agg_cache = KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let mut pubkeys = [&funding_pubkey, &counterparty_pubkey];
+		musig_secp::sort_pubkeys(&mut pubkeys);
+		let mut key_agg_cache = KeyAggCache::new(&pubkeys);
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
 		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
 		let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis);
 		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };

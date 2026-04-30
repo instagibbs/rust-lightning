@@ -1199,11 +1199,13 @@ impl ChannelTransactionParameters {
 		let funding_pubkey = musig_secp::PublicKey::from_byte_array_compressed(funding_pubkey_bytes).unwrap();
 		let counterparty_pubkey = musig_secp::PublicKey::from_byte_array_compressed(counterparty_pubkey_bytes).unwrap();
 
-		let mut key_agg_cache = musig_secp::musig::KeyAggCache::new(&[&funding_pubkey, &counterparty_pubkey]);
+		let mut pubkeys = [&funding_pubkey, &counterparty_pubkey];
+		musig_secp::sort_pubkeys(&mut pubkeys);
+		let mut key_agg_cache = musig_secp::musig::KeyAggCache::new(&pubkeys);
+		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(key_agg_cache.agg_pk(), None);
 		key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-		let internal_key_bytes = key_agg_cache.agg_pk().serialize();
 		let spk = ScriptBuf::new_p2tr(secp_ctx, bitcoin::key::UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap(), None);
 		let channel_value_satoshis = Amount::from_sat(self.channel_value_satoshis);
 		let funding_txout = TxOut { value: channel_value_satoshis, script_pubkey: spk };

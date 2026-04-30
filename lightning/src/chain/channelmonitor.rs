@@ -6578,7 +6578,6 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 		let prev_counterparty_commitment_txid = Readable::read(reader)?;
 
 		let counterparty_commitment_params = Readable::read(reader)?;
-		let _funding_redeemscript: ScriptBuf = Readable::read(reader)?;
 		let channel_value_satoshis = Readable::read(reader)?;
 
 		let their_cur_per_commitment_points = {

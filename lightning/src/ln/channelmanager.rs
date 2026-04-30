@@ -18005,7 +18005,6 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 	features.set_zero_conf_optional();
 	features.set_route_blinding_optional();
 	features.set_provide_storage_optional();
-	#[cfg(simple_close)]
 	features.set_simple_close_optional();
 	features.set_quiescence_optional();
 	features.set_splicing_optional();

@@ -2972,6 +2972,7 @@ impl Writeable for AcceptChannel {
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
+			(4, self.next_local_nonce, required),
 		});
 		Ok(())
 	}
@@ -3406,6 +3407,7 @@ impl Writeable for OpenChannel {
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
+			(4, self.next_local_nonce, required),
 		});
 		Ok(())
 	}
