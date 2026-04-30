@@ -254,61 +254,61 @@ impl ChannelSigner for TestChannelSigner {
 
 impl EcdsaChannelSigner for TestChannelSigner {
 	fn partially_sign_counterparty_commitment(
-		&self, _channel_parameters: &ChannelTransactionParameters,
-		_counterparty_nonce: musig_secp::musig::PublicNonce,
-		_commitment_tx: &CommitmentTransaction,
-		_inbound_htlc_preimages: Vec<PaymentPreimage>,
-		_outbound_htlc_preimages: Vec<PaymentPreimage>,
-		_secp_ctx: &Secp256k1<secp256k1::All>,
+		&self, channel_parameters: &ChannelTransactionParameters,
+		counterparty_nonce: musig_secp::musig::PublicNonce,
+		commitment_tx: &CommitmentTransaction,
+		inbound_htlc_preimages: Vec<PaymentPreimage>,
+		outbound_htlc_preimages: Vec<PaymentPreimage>,
+		secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<(crate::ln::msgs::PartialSignatureWithNonce, Vec<Signature>), ()> {
-	    todo!();
+		Ok(self.inner.partially_sign_counterparty_commitment(channel_parameters, counterparty_nonce, commitment_tx, inbound_htlc_preimages, outbound_htlc_preimages, secp_ctx).unwrap())
 	}
 
 	fn partially_sign_closing_transaction(
-		&self, _channel_parameters: &ChannelTransactionParameters,
-		_counterparty_nonce: musig_secp::musig::PublicNonce,
-		_closing_tx: &ClosingTransaction,
-		_secp_ctx: &Secp256k1<secp256k1::All>,
+		&self, channel_parameters: &ChannelTransactionParameters,
+		counterparty_nonce: musig_secp::musig::PublicNonce,
+		closing_tx: &ClosingTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<PartialSignatureWithNonce, ()> {
-	    todo!();
+		Ok(self.inner.partially_sign_closing_transaction(channel_parameters, counterparty_nonce, closing_tx, secp_ctx).unwrap())
 	}
 
 	fn finalize_closing_transaction(
-		&mut self, _channel_parameters: &ChannelTransactionParameters,
-		_local_nonce: musig_secp::musig::PublicNonce,
-		_counterparty_sig: PartialSignatureWithNonce,
-		_closing_tx: &ClosingTransaction,
-		_secp_ctx: &Secp256k1<secp256k1::All>,
+		&mut self, channel_parameters: &ChannelTransactionParameters,
+		local_nonce: musig_secp::musig::PublicNonce,
+		counterparty_sig: PartialSignatureWithNonce,
+		closing_tx: &ClosingTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<musig_secp::musig::PartialSignature, ()> {
-	    todo!();
+		Ok(self.inner.finalize_closing_transaction(channel_parameters, local_nonce, counterparty_sig, closing_tx, secp_ctx).unwrap())
 	}
 
 	fn generate_local_nonce_pair(
-		&self, _channel_parameters: &ChannelTransactionParameters, _commitment_number: u64, _secp_ctx: &Secp256k1<secp256k1::All>,
+		&self, channel_parameters: &ChannelTransactionParameters, commitment_number: u64, secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> musig_secp::musig::PublicNonce {
-	    todo!();
+		self.inner.generate_local_nonce_pair(channel_parameters, commitment_number, secp_ctx)
 	}
 
-	fn generate_shutdown_nonce_pair(&mut self, _channel_parameters: &ChannelTransactionParameters, _secp_ctx: &Secp256k1<secp256k1::All>) -> musig_secp::musig::PublicNonce {
-	    todo!();
+	fn generate_shutdown_nonce_pair(&mut self, channel_parameters: &ChannelTransactionParameters, secp_ctx: &Secp256k1<secp256k1::All>) -> musig_secp::musig::PublicNonce {
+		self.inner.generate_shutdown_nonce_pair(channel_parameters, secp_ctx)
 	}
 
 	fn finalize_holder_commitment(
 		&self,
-		_channel_parameters: &ChannelTransactionParameters,
-		_commitment_tx: &HolderCommitmentTransaction,
-		_secp_ctx: &Secp256k1<secp256k1::All>,
+		channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<secp256k1::schnorr::Signature, ()> {
-	    todo!();
+		Ok(self.inner.finalize_holder_commitment(channel_parameters, commitment_tx, secp_ctx).unwrap())
 	}
 
 	fn unsafe_finalize_holder_commitment(
 		&self,
-		_channel_parameters: &ChannelTransactionParameters,
-		_commitment_tx: &HolderCommitmentTransaction,
-		_secp_ctx: &Secp256k1<secp256k1::All>,
+		channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<secp256k1::schnorr::Signature, ()> {
-	    todo!();
+		self.finalize_holder_commitment(channel_parameters, commitment_tx, secp_ctx)
 	}
 
 	fn sign_counterparty_commitment(

@@ -1926,11 +1926,11 @@ impl EcdsaChannelSigner for InMemorySigner {
 	#[cfg(any(test, feature = "_test_utils", feature = "unsafe_revoked_tx_signing"))]
 	fn unsafe_finalize_holder_commitment(
 		&self,
-		_channel_parameters: &ChannelTransactionParameters,
-		_commitment_tx: &HolderCommitmentTransaction,
-		_secp_ctx: &Secp256k1<secp256k1::All>,
+		channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction,
+		secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<secp256k1::schnorr::Signature, ()> {
-	    todo!();
+		self.finalize_holder_commitment(channel_parameters, commitment_tx, secp_ctx)
 	}
 
 	fn sign_holder_commitment(
