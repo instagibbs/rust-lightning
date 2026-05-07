@@ -3658,7 +3658,7 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 		let holder_funding_pubkey = musig_secp::PublicKey::from_byte_array_compressed(holder_funding_pubkey_bytes).unwrap();
 		let counterparty_funding_pubkey = musig_secp::PublicKey::from_byte_array_compressed(counterparty_funding_pubkey_bytes).unwrap();
 
-		let verification_nonce = self.context().holder_signer.generate_local_nonce_pair(&self.funding().channel_transaction_parameters, 0, &self.context().secp_ctx);
+		let verification_nonce = self.context().holder_signer.generate_local_nonce_pair(&self.funding().channel_transaction_parameters, INITIAL_COMMITMENT_NUMBER, &self.context().secp_ctx);
 
 		let mut pubkeys = [&holder_funding_pubkey, &counterparty_funding_pubkey];
 		musig_secp::sort_pubkeys(&mut pubkeys);
@@ -15910,7 +15910,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 		};
 		let keys = self.funding.get_holder_pubkeys();
 
-		let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(&self.funding.channel_transaction_parameters, 0, &self.context.secp_ctx);
+		let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(&self.funding.channel_transaction_parameters, INITIAL_COMMITMENT_NUMBER, &self.context.secp_ctx);
 
 		Some(msgs::OpenChannel {
 			common_fields: msgs::CommonOpenChannelFields {
@@ -16227,7 +16227,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 		};
 		let keys = self.funding.get_holder_pubkeys();
 
-		let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(&self.funding.channel_transaction_parameters, 0, &self.context.secp_ctx);
+		let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(&self.funding.channel_transaction_parameters, INITIAL_COMMITMENT_NUMBER, &self.context.secp_ctx);
 
 		Some(msgs::AcceptChannel {
 			common_fields: msgs::CommonAcceptChannelFields {
