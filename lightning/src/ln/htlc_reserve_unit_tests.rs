@@ -937,9 +937,10 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 
 	let commit_signed_msg = msgs::CommitmentSigned {
 		channel_id: chan.2,
-		signature: res.0,
+		signature: None,
 		htlc_signatures: res.1,
 		funding_txid: None,
+		partial_signature_with_nonce: Some(res.0),
 	};
 
 	// Send the commitment_signed message to the nodes[1].
@@ -2324,9 +2325,10 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 
 		let commit_signed_msg = msgs::CommitmentSigned {
 			channel_id: chan_id,
-			signature: res.0,
+			signature: None,
 			htlc_signatures: res.1,
 			funding_txid: None,
+			partial_signature_with_nonce: Some(res.0),
 		};
 
 		// Send the commitment_signed message to the nodes[1].
@@ -2740,9 +2742,10 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 
 	let commit_signed_msg = msgs::CommitmentSigned {
 		channel_id,
-		signature: res.0,
+		signature: None,
 		htlc_signatures: res.1,
 		funding_txid: None,
+		partial_signature_with_nonce: Some(res.0),
 	};
 
 	// Send the commitment_signed message to the nodes[1].

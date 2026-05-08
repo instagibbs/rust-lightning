@@ -5774,7 +5774,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			let sighash = bitcoin_tx.get_sighash_default(&funding.get_funding_output(&self.secp_ctx).unwrap());
 
 			log_trace!(logger, "Checking commitment tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}",
-				log_bytes!(msg.signature.serialize_compact()[..]),
+				log_bytes!(msg.partial_signature_with_nonce.unwrap().serialize_compact()[..]),
 				log_bytes!(funding.counterparty_funding_pubkey().serialize()),
 				encode::serialize_hex(&bitcoin_tx.transaction),
 				log_bytes!(sighash[..]), encode::serialize_hex(&funding.get_funding_output(&self.secp_ctx).unwrap()),
@@ -5795,10 +5795,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			let tweak = musig_bitcoin::TapTweakHash::from_key_and_merkle_root(internal_key, None);
 			key_agg_cache.pubkey_xonly_tweak_add(&tweak.to_scalar()).unwrap();
 
-			let agg_nonce = AggregatedNonce::new(&[&verification_nonce, &msg.signature.public_nonce]);
+			let agg_nonce = AggregatedNonce::new(&[&verification_nonce, &msg.partial_signature_with_nonce.unwrap().public_nonce]);
 			let sighash = bitcoin_tx.get_sighash_default(&funding.get_funding_output(&self.secp_ctx).unwrap());
 			let session = Session::new(&key_agg_cache, agg_nonce, sighash.as_ref());
-			if !session.partial_verify(&key_agg_cache, &msg.signature.partial_signature, &msg.signature.public_nonce, counterparty_funding_pubkey) {
+			if !session.partial_verify(&key_agg_cache, &msg.partial_signature_with_nonce.unwrap().partial_signature, &msg.partial_signature_with_nonce.unwrap().public_nonce, counterparty_funding_pubkey) {
 				return Err(ChannelError::close(
 					"Invalid commitment tx signature from peer".to_owned(),
 				));
@@ -5877,7 +5877,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 
 		let holder_commitment_tx = HolderCommitmentTransaction::new(
 			commitment_data.tx,
-			msg.signature,
+			msg.partial_signature_with_nonce.unwrap(),
 			msg.htlc_signatures.clone(),
 			&funding.get_holder_pubkeys().funding_pubkey,
 			funding.counterparty_funding_pubkey(),
@@ -6652,7 +6652,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 
 		partial_signature_with_nonce.map(|signature| msgs::FundingSigned {
 			channel_id: self.channel_id(),
-			partial_signature_with_nonce: signature,
+			partial_signature_with_nonce: Some(signature),
 		})
 	}
 
@@ -6767,7 +6767,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		&mut self, funding: &FundingScope, logger: &L,
 	) -> Option<msgs::CommitmentSigned> {
 		let signatures = self.get_initial_counterparty_commitment_signatures(funding, logger);
-		if let Some((signature, htlc_signatures)) = signatures {
+		if let Some((partial_signature_with_nonce, htlc_signatures)) = signatures {
 			log_info!(logger, "Generated commitment_signed for peer",);
 			if matches!(self.channel_state, ChannelState::FundingNegotiated(_)) {
 				// We shouldn't expect any HTLCs before `ChannelReady`.
@@ -6776,8 +6776,9 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			self.signer_pending_funding = false;
 			Some(msgs::CommitmentSigned {
 				channel_id: self.channel_id,
+				signature: None,
 				htlc_signatures,
-				signature,
+				partial_signature_with_nonce: Some(partial_signature_with_nonce),
 				funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
 			})
 		} else {
@@ -8252,7 +8253,7 @@ where
 		self.context.counterparty_current_commitment_point = self.context.counterparty_next_commitment_point;
 		self.context.counterparty_next_commitment_point = Some(msg.next_per_commitment_point);
 		self.context.interactive_tx_signing_session = None;
-		self.funding.signing_nonce = Some(msg.next_local_nonce);
+		self.funding.signing_nonce = msg.next_local_nonce;
 
 		log_info!(logger, "Received channel_ready from peer for channel {}", &self.context.channel_id());
 
@@ -8615,7 +8616,7 @@ where
 
 		let (channel_monitor, _) = self.initial_commitment_signed(
 			self.context.channel_id(),
-			msg.signature,
+			msg.partial_signature_with_nonce.unwrap(),
 			holder_commitment_point,
 			best_block,
 			signer_provider,
@@ -10694,7 +10695,7 @@ where
 			Some(msgs::Shutdown {
 				channel_id: self.context.channel_id,
 				scriptpubkey: self.get_closing_scriptpubkey(),
-				shutdown_nonce,
+				shutdown_nonce: Some(shutdown_nonce),
 			})
 		} else {
 			None
@@ -11595,7 +11596,7 @@ where
 
 		self.context.channel_state.set_remote_shutdown_sent();
 		self.context.update_time_counter += 1;
-		self.context.remote_shutdown_nonce = Some(msg.shutdown_nonce);
+		self.context.remote_shutdown_nonce = msg.shutdown_nonce;
 
 		let monitor_update = if update_shutdown_script {
 			self.context.latest_monitor_update_id += 1;
@@ -11625,7 +11626,7 @@ where
 			Some(msgs::Shutdown {
 				channel_id: self.context.channel_id,
 				scriptpubkey: self.get_closing_scriptpubkey(),
-				shutdown_nonce,
+				shutdown_nonce: Some(shutdown_nonce),
 			})
 		} else {
 			None
@@ -12149,7 +12150,7 @@ where
 				SelectedField::CloserAndCloseeOutputs => Some(our_sig),
 				_ => None,
 			},
-			public_nonce: local_shutdown_nonce,
+			next_closee_nonce: Some(local_shutdown_nonce),
 		};
 
 		// State transitions.
@@ -12357,7 +12358,7 @@ where
 		// State transitions.
 		self.context.channel_state = ChannelState::ShutdownComplete;
 		self.context.update_time_counter += 1;
-		self.context.remote_shutdown_nonce = Some(msg.public_nonce);
+		self.context.remote_shutdown_nonce = msg.next_closee_nonce;
 
 		let v2_closing_negotiation = self.context.v2_closing_negotiation.as_mut().unwrap();
 		v2_closing_negotiation.last_sent_closing_complete = None;
@@ -12699,7 +12700,7 @@ where
 				channel_id: self.context.channel_id(),
 				next_per_commitment_point: self.holder_commitment_point.next_point(),
 				short_channel_id_alias: Some(self.context.outbound_scid_alias),
-				next_local_nonce,
+				next_local_nonce: Some(next_local_nonce),
 			})
 		} else {
 			log_debug!(logger, "Not producing channel_ready: the holder commitment point is not available.");
@@ -15119,9 +15120,10 @@ where
 
 		Ok(msgs::CommitmentSigned {
 			channel_id: self.context.channel_id,
-			signature,
+			signature: None,
 			htlc_signatures,
 			funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
+			partial_signature_with_nonce: Some(signature),
 		})
 	}
 
@@ -15302,7 +15304,7 @@ where
 		let shutdown = msgs::Shutdown {
 			channel_id: self.context.channel_id,
 			scriptpubkey: self.get_closing_scriptpubkey(),
-			shutdown_nonce,
+			shutdown_nonce: Some(shutdown_nonce),
 		};
 
 		// Go ahead and drop holding cell updates as we'd rather fail payments than wait to send
@@ -15814,7 +15816,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			temporary_channel_id: self.context.temporary_channel_id.unwrap(),
 			funding_txid: self.funding.channel_transaction_parameters.funding_outpoint.as_ref().unwrap().txid,
 			funding_output_index: self.funding.channel_transaction_parameters.funding_outpoint.as_ref().unwrap().index,
-			partial_signature_with_nonce: signature,
+			partial_signature_with_nonce: Some(signature),
 		})
 	}
 
@@ -15935,10 +15937,10 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				next_local_nonce: Some(next_local_nonce),
 			},
 			push_msat: self.funding.get_value_satoshis() * 1000 - self.funding.value_to_self_msat,
 			channel_reserve_satoshis: self.funding.holder_selected_channel_reserve_satoshis,
-			next_local_nonce,
 		})
 	}
 
@@ -15954,7 +15956,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			&msg.common_fields,
 			msg.channel_reserve_satoshis,
 		)?;
-		self.funding.signing_nonce = Some(msg.next_local_nonce);
+		self.funding.signing_nonce = msg.common_fields.next_local_nonce;
 		Ok(())
 	}
 
@@ -15989,7 +15991,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 
 		let (channel_monitor, _) = match self.initial_commitment_signed(
 			self.context.channel_id(),
-			msg.partial_signature_with_nonce,
+			msg.partial_signature_with_nonce.unwrap(),
 			&mut holder_commitment_point,
 			best_block,
 			signer_provider,
@@ -16170,7 +16172,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 			msg.channel_reserve_satoshis,
 			msg.push_msat,
 			msg.common_fields.clone(),
-			msg.next_local_nonce,
+			msg.common_fields.next_local_nonce.unwrap(),
 		)?;
 		let unfunded_context = UnfundedChannelContext {
 			unfunded_channel_age_ticks: 0,
@@ -16249,9 +16251,9 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				next_local_nonce: Some(next_local_nonce),
 			},
 			channel_reserve_satoshis: self.funding.holder_selected_channel_reserve_satoshis,
-			next_local_nonce,
 		})
 	}
 
@@ -16306,7 +16308,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 		let (channel_monitor, counterparty_initial_commitment_tx) = match self
 			.initial_commitment_signed(
 				ChannelId::v1_from_funding_outpoint(funding_txo),
-				msg.partial_signature_with_nonce,
+				msg.partial_signature_with_nonce.unwrap(),
 				&mut holder_commitment_point,
 				best_block,
 				signer_provider,
@@ -16498,6 +16500,8 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 				.expect("TODO: async signing is not yet supported for commitment points in v2 channel establishment");
 		let keys = self.funding.get_holder_pubkeys();
 
+		let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(&self.funding.channel_transaction_parameters, INITIAL_COMMITMENT_NUMBER, &self.context.secp_ctx);
+
 		msgs::OpenChannelV2 {
 			common_fields: msgs::CommonOpenChannelFields {
 				chain_hash,
@@ -16521,6 +16525,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				next_local_nonce: Some(next_local_nonce),
 			},
 			funding_feerate_sat_per_1000_weight: self.context.feerate_per_kw,
 			second_per_commitment_point,
@@ -16686,6 +16691,8 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			.expect("TODO: async signing is not yet supported for commitment points in v2 channel establishment");
 		let keys = self.funding.get_holder_pubkeys();
 
+		let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(&self.funding.channel_transaction_parameters, INITIAL_COMMITMENT_NUMBER, &self.context.secp_ctx);
+
 		msgs::AcceptChannelV2 {
 			common_fields: msgs::CommonAcceptChannelFields {
 				temporary_channel_id: self.context.temporary_channel_id.unwrap(),
@@ -16706,6 +16713,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				next_local_nonce: Some(next_local_nonce),
 			},
 			funding_satoshis: self.funding_negotiation_context.our_funding_contribution.to_sat()
 				as u64,

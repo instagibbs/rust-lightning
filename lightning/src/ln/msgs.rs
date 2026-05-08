@@ -26,6 +26,7 @@
 
 use bitcoin::constants::ChainHash;
 use bitcoin::hash_types::Txid;
+use bitcoin::key::constants::COMPACT_SIGNATURE_SIZE;
 use bitcoin::script::ScriptBuf;
 use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::PublicKey;
@@ -307,6 +308,8 @@ pub struct CommonOpenChannelFields {
 	/// The channel type that this channel will represent. As defined in the latest
 	/// specification, this field is required. However, it is an `Option` for legacy reasons.
 	pub channel_type: Option<ChannelTypeFeatures>,
+	/// The next local nonce
+	pub next_local_nonce: Option<PublicNonce>,
 }
 
 impl CommonOpenChannelFields {
@@ -357,8 +360,6 @@ pub struct OpenChannel {
 	pub push_msat: u64,
 	/// The minimum value unencumbered by HTLCs for the counterparty to keep in the channel
 	pub channel_reserve_satoshis: u64,
-	/// The next local nonce
-	pub next_local_nonce: PublicNonce,
 }
 
 /// An [`open_channel2`] message to be sent by or received from the channel initiator.
@@ -426,6 +427,8 @@ pub struct CommonAcceptChannelFields {
 	/// This is required to match the equivalent field in [`OpenChannel`] or [`OpenChannelV2`]'s
 	/// [`CommonOpenChannelFields::channel_type`].
 	pub channel_type: Option<ChannelTypeFeatures>,
+	/// The next local nonce
+	pub next_local_nonce: Option<PublicNonce>,
 }
 
 /// An [`accept_channel`] message to be sent to or received from a peer.
@@ -439,8 +442,6 @@ pub struct AcceptChannel {
 	pub common_fields: CommonAcceptChannelFields,
 	/// The minimum value unencumbered by HTLCs for the counterparty to keep in the channel
 	pub channel_reserve_satoshis: u64,
-	/// The next local nonce
-	pub next_local_nonce: PublicNonce,
 }
 
 /// An [`accept_channel2`] message to be sent by or received from the channel accepter.
@@ -476,7 +477,7 @@ pub struct FundingCreated {
 	/// The specific output index funding this channel
 	pub funding_output_index: u16,
 	/// Partial signature with nonce
-	pub partial_signature_with_nonce: PartialSignatureWithNonce,
+	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
 }
 
 /// A [`funding_signed`] message to be sent to or received from a peer.
@@ -489,7 +490,7 @@ pub struct FundingSigned {
 	/// The channel ID
 	pub channel_id: ChannelId,
 	/// Partial signature with nonce
-	pub partial_signature_with_nonce: PartialSignatureWithNonce,
+	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
 }
 
 /// A [`channel_ready`] message to be sent to or received from a peer.
@@ -507,7 +508,7 @@ pub struct ChannelReady {
 	/// messages' recipient.
 	pub short_channel_id_alias: Option<u64>,
 	/// The next local nonce
-	pub next_local_nonce: PublicNonce,
+	pub next_local_nonce: Option<PublicNonce>,
 }
 
 /// A randomly chosen number that is used to identify inputs within an interactive transaction
@@ -710,7 +711,7 @@ pub struct Shutdown {
 	/// Must be in one of these forms: P2PKH, P2SH, P2WPKH, P2WSH, P2TR.
 	pub scriptpubkey: ScriptBuf,
 	/// shutdown_nonce
-	pub shutdown_nonce: PublicNonce,
+	pub shutdown_nonce: Option<PublicNonce>,
 }
 
 /// The minimum and maximum fees which the sender is willing to place on the closing transaction.
@@ -788,7 +789,7 @@ pub struct ClosingSig {
 	/// A signature on the closing transaction covering both `closer` and `closee` outputs.
 	pub closer_and_closee_outputs: Option<PartialSignature>,
 	/// The next closee nonce
-	pub public_nonce: PublicNonce,
+	pub next_closee_nonce: Option<PublicNonce>,
 }
 
 /// A [`start_batch`] message to be sent to group together multiple channel messages as a single
@@ -967,12 +968,14 @@ pub struct UpdateFailMalformedHTLC {
 pub struct CommitmentSigned {
 	/// The channel ID
 	pub channel_id: ChannelId,
-	/// A signature on the commitment transaction
-	pub signature: PartialSignatureWithNonce,
+	/// The ECDSA signature
+	pub signature: Option<Signature>,
 	/// Signatures on the HTLC transactions
 	pub htlc_signatures: Vec<Signature>,
 	/// The funding transaction, to discriminate among multiple pending funding transactions (e.g. in case of splicing)
 	pub funding_txid: Option<Txid>,
+	/// A signature on the commitment transaction
+	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
 }
 
 /// A [`revoke_and_ack`] message to be sent to or received from a peer.
@@ -2972,7 +2975,7 @@ impl Writeable for AcceptChannel {
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
-			(4, self.next_local_nonce, required),
+			(4, self.common_fields.next_local_nonce, option),
 		});
 		Ok(())
 	}
@@ -2980,7 +2983,6 @@ impl Writeable for AcceptChannel {
 
 impl LengthReadable for AcceptChannel {
 	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
-		use crate::util::ser::RequiredWrapper;
 		let temporary_channel_id: ChannelId = Readable::read(r)?;
 		let dust_limit_satoshis: u64 = Readable::read(r)?;
 		let max_htlc_value_in_flight_msat: u64 = Readable::read(r)?;
@@ -2998,11 +3000,11 @@ impl LengthReadable for AcceptChannel {
 
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
-		let mut next_local_nonce = RequiredWrapper(None);
+		let mut next_local_nonce: Option<PublicNonce> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
-			(4, next_local_nonce, required),
+			(4, next_local_nonce, option),
 		});
 
 		Ok(AcceptChannel {
@@ -3022,9 +3024,9 @@ impl LengthReadable for AcceptChannel {
 				first_per_commitment_point,
 				shutdown_scriptpubkey,
 				channel_type,
+				next_local_nonce,
 			},
 			channel_reserve_satoshis,
-			next_local_nonce: next_local_nonce.0.unwrap(),
 		})
 	}
 }
@@ -3051,6 +3053,7 @@ impl Writeable for AcceptChannelV2 {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
 			(2, self.require_confirmed_inputs, option),
+			(4, self.common_fields.next_local_nonce, option),
 			(103, self.disable_channel_reserve, option),
 		});
 		Ok(())
@@ -3078,11 +3081,13 @@ impl LengthReadable for AcceptChannelV2 {
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
 		let mut require_confirmed_inputs: Option<()> = None;
+		let mut next_local_nonce: Option<PublicNonce> = None;
 		let mut disable_channel_reserve: Option<()> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
 			(2, require_confirmed_inputs, option),
+			(4, next_local_nonce, option),
 			(103, disable_channel_reserve, option),
 		});
 
@@ -3103,6 +3108,7 @@ impl LengthReadable for AcceptChannelV2 {
 				first_per_commitment_point,
 				shutdown_scriptpubkey,
 				channel_type,
+				next_local_nonce,
 			},
 			funding_satoshis,
 			second_per_commitment_point,
@@ -3253,10 +3259,10 @@ impl_writeable_msg!(ChannelReestablish, {
 	next_remote_commitment_number,
 	your_last_per_commitment_secret,
 	my_current_per_commitment_point,
-	next_local_nonces,
 }, {
 	(1, next_funding, option),
 	(5, my_current_funding_locked, option),
+	(22, next_local_nonces, optional_vec),
 });
 
 impl_writeable!(NextFunding, {
@@ -3277,19 +3283,19 @@ impl_writeable_msg!(ClosingSigned,
 impl_writeable_msg!(ClosingComplete,
 	{ channel_id, closer_scriptpubkey, closee_scriptpubkey, fee_satoshis, locktime },
 	{
-		(1, closer_output_only, option),
-		(2, closee_output_only, option),
-		(3, closer_and_closee_outputs, option)
+		(5, closer_output_only, option),
+		(6, closee_output_only, option),
+		(7, closer_and_closee_outputs, option)
 	}
 );
 
 impl_writeable_msg!(ClosingSig,
 	{ channel_id, closer_scriptpubkey, closee_scriptpubkey, fee_satoshis, locktime },
 	{
-		(1, closer_output_only, option),
-		(2, closee_output_only, option),
-		(3, closer_and_closee_outputs, option),
-		(22, public_nonce, required),
+		(5, closer_output_only, option),
+		(6, closee_output_only, option),
+		(7, closer_and_closee_outputs, option),
+		(22, next_closee_nonce, option),
 
 	}
 );
@@ -3299,13 +3305,50 @@ impl_writeable!(ClosingSignedFeeRange, {
 	max_fee_satoshis
 });
 
-impl_writeable_msg!(CommitmentSigned, {
-	channel_id,
-	signature,
-	htlc_signatures
-}, {
-	(1, funding_txid, option),
-});
+impl LengthReadable for CommitmentSigned {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
+		let channel_id: ChannelId = Readable::read(r)?;
+		let sig_bytes: [u8; COMPACT_SIGNATURE_SIZE] = Readable::read(r)?;
+		let signature = if sig_bytes == [0u8; COMPACT_SIGNATURE_SIZE] {
+			None
+		} else {
+			Some(Signature::from_compact(&sig_bytes).map_err(|_| DecodeError::InvalidValue)?)
+		};
+		let htlc_signatures: Vec<Signature> = Readable::read(r)?;
+
+		let mut funding_txid: Option<Txid> = None;
+		let mut partial_signature_with_nonce: Option<PartialSignatureWithNonce> = None;
+		decode_tlv_stream!(r, {
+			(1, funding_txid, option),
+			(2, partial_signature_with_nonce, option),
+		});
+
+		Ok(CommitmentSigned {
+			channel_id,
+			signature,
+			htlc_signatures,
+			funding_txid,
+			partial_signature_with_nonce,
+		})
+	}
+}
+
+impl Writeable for CommitmentSigned {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.channel_id.write(w)?;
+		match self.signature {
+			Some(sig) => sig.write(w)?,
+			None => [0u8; COMPACT_SIGNATURE_SIZE].write(w)?,
+		}
+		self.htlc_signatures.write(w)?;
+
+		encode_tlv_stream!(w, {
+			(1, self.funding_txid, option),
+			(2, self.partial_signature_with_nonce, option),
+		});
+		Ok(())
+	}
+}
 
 impl_writeable!(DecodedOnionErrorPacket, {
 	hmac,
@@ -3318,13 +3361,13 @@ impl_writeable_msg!(FundingCreated, {
 	funding_txid,
 	funding_output_index,
 }, {
-	(2, partial_signature_with_nonce, required),
+	(2, partial_signature_with_nonce, option),
 });
 
 impl_writeable_msg!(FundingSigned, {
 	channel_id,
 }, {
-	(2, partial_signature_with_nonce, required),
+	(2, partial_signature_with_nonce, option),
 });
 
 impl_writeable_msg!(ChannelReady, {
@@ -3332,7 +3375,7 @@ impl_writeable_msg!(ChannelReady, {
 	next_per_commitment_point,
 }, {
 	(1, short_channel_id_alias, option),
-	(4, next_local_nonce, required),
+	(4, next_local_nonce, option),
 });
 
 pub(crate) fn write_features_up_to_13<W: Writer>(
@@ -3407,7 +3450,7 @@ impl Writeable for OpenChannel {
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
-			(4, self.next_local_nonce, required),
+			(4, self.common_fields.next_local_nonce, option),
 		});
 		Ok(())
 	}
@@ -3415,7 +3458,6 @@ impl Writeable for OpenChannel {
 
 impl LengthReadable for OpenChannel {
 	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
-		use crate::util::ser::RequiredWrapper;
 		let chain_hash: ChainHash = Readable::read(r)?;
 		let temporary_channel_id: ChannelId = Readable::read(r)?;
 		let funding_satoshis: u64 = Readable::read(r)?;
@@ -3437,11 +3479,11 @@ impl LengthReadable for OpenChannel {
 
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
-		let mut next_local_nonce = RequiredWrapper(None);
+		let mut next_local_nonce: Option<PublicNonce> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
-			(4, next_local_nonce, required),
+			(4, next_local_nonce, option),
 		});
 		Ok(OpenChannel {
 			common_fields: CommonOpenChannelFields {
@@ -3463,10 +3505,10 @@ impl LengthReadable for OpenChannel {
 				channel_flags,
 				shutdown_scriptpubkey,
 				channel_type,
+				next_local_nonce,
 			},
 			push_msat,
 			channel_reserve_satoshis,
-			next_local_nonce: next_local_nonce.0.unwrap(),
 		})
 	}
 }
@@ -3496,6 +3538,7 @@ impl Writeable for OpenChannelV2 {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
 			(2, self.require_confirmed_inputs, option),
+			(4, self.common_fields.next_local_nonce, option),
 			(103, self.disable_channel_reserve, option),
 		});
 		Ok(())
@@ -3527,11 +3570,13 @@ impl LengthReadable for OpenChannelV2 {
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
 		let mut require_confirmed_inputs: Option<()> = None;
+		let mut next_local_nonce: Option<PublicNonce> = None;
 		let mut disable_channel_reserve: Option<()> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
 			(2, require_confirmed_inputs, option),
+			(4, next_local_nonce, option),
 			(103, disable_channel_reserve, option),
 		});
 		Ok(OpenChannelV2 {
@@ -3554,6 +3599,7 @@ impl LengthReadable for OpenChannelV2 {
 				channel_flags,
 				shutdown_scriptpubkey,
 				channel_type,
+				next_local_nonce,
 			},
 			funding_feerate_sat_per_1000_weight,
 			locktime,
@@ -3568,16 +3614,17 @@ impl_writeable_msg!(RevokeAndACK, {
 	channel_id,
 	per_commitment_secret,
 	next_per_commitment_point,
-	next_local_nonces,
 }, {
+	(22, next_local_nonces, optional_vec),
 	(75537, release_htlc_message_paths, optional_vec)
 });
 
 impl_writeable_msg!(Shutdown, {
 	channel_id,
 	scriptpubkey,
-	shutdown_nonce,
-}, {});
+}, {
+	(8, shutdown_nonce, option),
+});
 
 impl_writeable_msg!(UpdateFailHTLC, {
 	channel_id,
@@ -5282,10 +5329,10 @@ mod tests {
 				} else {
 					None
 				},
+				next_local_nonce: Some(PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap()),
 			},
 			push_msat: 2536655962884945560,
 			channel_reserve_satoshis: 8665828695742877976,
-			next_local_nonce: PublicNonce::from_byte_array(&[0xab; 66]).unwrap(),
 		};
 		let encoded_value = open_channel.encode();
 		let mut target_value = Vec::new();
@@ -5392,6 +5439,7 @@ mod tests {
 				} else {
 					None
 				},
+				next_local_nonce: Some(PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap()),
 			},
 			funding_feerate_sat_per_1000_weight: 821716,
 			locktime: 305419896,
@@ -5577,9 +5625,9 @@ mod tests {
 					None
 				},
 				channel_type: None,
+				next_local_nonce: Some(PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap()),
 			},
 			channel_reserve_satoshis: 3608586615801332854,
-			next_local_nonce: PublicNonce::from_byte_array(&[0xab; 66]).unwrap(),
 		};
 		let encoded_value = accept_channel.encode();
 		let mut target_value = <Vec<u8>>::from_hex("020202020202020202020202020202020202020202020202020202020202020212345678901234562334032891223698321446687011447600083a840000034d000c89d4c0bcc0bc031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076602531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0362c0a046dacce86ddd0343c6d3c7c79c2208ba0d9c9cf24a6d046d21d21f90f703f006a18d5653c4edf5391ff23a61f03ff83d237e880ee61187fa9f379a028e0a").unwrap();
@@ -5662,6 +5710,7 @@ mod tests {
 				} else {
 					None
 				},
+				next_local_nonce: Some(PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap()),
 			},
 			funding_satoshis: 1311768467284833366,
 			second_per_commitment_point: pubkey_7,
@@ -5769,11 +5818,11 @@ mod tests {
 			)
 			.unwrap(),
 			funding_output_index: 255,
-			partial_signature_with_nonce: PartialSignatureWithNonce {
+			partial_signature_with_nonce: Some(PartialSignatureWithNonce {
 				partial_signature: PartialSignature::from_byte_array(&PARTIAL_SIGNATURE).unwrap(),
 				public_nonce: PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap(),
 
-			},
+			}),
 		};
 		let encoded_value = funding_created.encode();
 		let target_value = <Vec<u8>>::from_hex("02020202020202020202020202020202020202020202020202020202020202026e96fe9f8b0ddcd729ba03cfafa5a27b050b39d354dd980814268dfa9a44d4c200ffd977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
@@ -5785,10 +5834,10 @@ mod tests {
 		let _secp_ctx = Secp256k1::new();
 		let funding_signed = msgs::FundingSigned {
 			channel_id: ChannelId::from_bytes([2; 32]),
-			partial_signature_with_nonce: PartialSignatureWithNonce {
+			partial_signature_with_nonce: Some(PartialSignatureWithNonce {
 				partial_signature: PartialSignature::from_byte_array(&PARTIAL_SIGNATURE).unwrap(),
 				public_nonce: PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap(),
-			},
+			}),
 		};
 		let encoded_value = funding_signed.encode();
 		let target_value = <Vec<u8>>::from_hex("0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
@@ -5806,7 +5855,7 @@ mod tests {
 			channel_id: ChannelId::from_bytes([2; 32]),
 			next_per_commitment_point: pubkey_1,
 			short_channel_id_alias: None,
-			next_local_nonce: PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap(),
+			next_local_nonce: Some(PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap()),
 		};
 		let encoded_value = channel_ready.encode();
 		let target_value = <Vec<u8>>::from_hex("0202020202020202020202020202020202020202020202020202020202020202031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f").unwrap();
@@ -6129,7 +6178,6 @@ mod tests {
 			secp_ctx
 		);
 		let script = Builder::new().push_opcode(opcodes::OP_TRUE).into_script();
-		let shutdown_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
 		let shutdown = msgs::Shutdown {
 			channel_id: ChannelId::from_bytes([2; 32]),
 			scriptpubkey: if script_type == 1 {
@@ -6146,7 +6194,7 @@ mod tests {
 			} else {
 				Address::p2wsh(&script, Network::Testnet).script_pubkey()
 			},
-			shutdown_nonce,
+			shutdown_nonce: Some(PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap()),
 		};
 		let encoded_value = shutdown.encode();
 		let mut target_value =
@@ -6327,12 +6375,13 @@ mod tests {
 			get_sig_on!(privkey_4, secp_ctx, String::from("01010101010101010101010101010101"));
 		let commitment_signed = msgs::CommitmentSigned {
 			channel_id: ChannelId::from_bytes([2; 32]),
-			signature: sig_1,
+			signature: Some(sig_2),
 			htlc_signatures: if htlcs { vec![sig_2, sig_3, sig_4] } else { Vec::new() },
 			funding_txid: Some(
 				Txid::from_str("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e")
 					.unwrap(),
 			),
+			partial_signature_with_nonce: Some(sig_1),
 		};
 		let encoded_value = commitment_signed.encode();
 		let mut target_value = "0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a".to_string();

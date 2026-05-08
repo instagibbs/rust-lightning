@@ -507,9 +507,10 @@ pub fn do_test_update_fee_that_funder_cannot_afford(channel_type_features: Chann
 
 	let commit_signed_msg = msgs::CommitmentSigned {
 		channel_id: chan.2,
-		signature: res.0,
+		signature: None,
 		htlc_signatures: res.1,
 		funding_txid: None,
+		partial_signature_with_nonce: Some(res.0),
 	};
 
 	let update_fee = msgs::UpdateFee { channel_id: chan.2, feerate_per_kw: non_buffer_feerate + 4 };
@@ -605,9 +606,10 @@ pub fn test_update_fee_that_saturates_subs() {
 
 	let commit_signed_msg = msgs::CommitmentSigned {
 		channel_id: chan_id,
-		signature: res.0,
+		signature: None,
 		htlc_signatures: res.1,
 		funding_txid: None,
+		partial_signature_with_nonce: Some(res.0),
 	};
 
 	let update_fee = msgs::UpdateFee { channel_id: chan_id, feerate_per_kw: FEERATE };

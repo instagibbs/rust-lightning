@@ -4527,13 +4527,13 @@ fn test_splice_buffer_invalid_commitment_signed_closes_channel() {
 
 	// Invalidate the signature by modifying one byte. This will cause signature verification
 	// to fail when the buffered message is processed.
-	let original_sig = acceptor_commit_sig.commitment_signed[0].signature;
-	let mut sig_bytes = original_sig.serialize_compact();
+	let original_sig = acceptor_commit_sig.commitment_signed[0].partial_signature_with_nonce;
+	let mut sig_bytes = original_sig.unwrap().serialize_compact();
 	sig_bytes[0] ^= 0x01; // Flip a bit to corrupt the signature
 	let partial_signature = PartialSignature::from_byte_array((&sig_bytes[..32]).try_into().unwrap()).unwrap();
 	let public_nonce = PublicNonce::from_byte_array((&sig_bytes[32..]).try_into().unwrap()).unwrap();
-	acceptor_commit_sig.commitment_signed[0].signature =
-		PartialSignatureWithNonce { partial_signature, public_nonce };
+	acceptor_commit_sig.commitment_signed[0].partial_signature_with_nonce =
+		Some(PartialSignatureWithNonce { partial_signature, public_nonce });
 
 	// Deliver the acceptor's invalid commitment_signed to the initiator BEFORE the initiator has
 	// called funding_transaction_signed. The message should be buffered, not processed.
