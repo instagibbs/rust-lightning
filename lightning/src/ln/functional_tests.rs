@@ -6710,6 +6710,7 @@ pub fn test_counterparty_raa_skip_no_crash() {
 		next_per_commitment_point = PublicKey::from_secret_key(&Secp256k1::new(), &key);
 	}
 
+	let funding_txid = nodes[0].node.list_channels()[0].funding_txo.unwrap().txid;
 	let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
 
 	let raa = msgs::RevokeAndACK {
@@ -6717,7 +6718,7 @@ pub fn test_counterparty_raa_skip_no_crash() {
 		per_commitment_secret,
 		next_per_commitment_point,
 		release_htlc_message_paths: Vec::new(),
-		next_local_nonces: vec![public_nonce],
+		next_local_nonces: vec![(funding_txid, public_nonce)],
 	};
 	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa);
 	assert_eq!(

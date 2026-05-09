@@ -997,7 +997,7 @@ pub struct RevokeAndACK {
 	/// [`HeldHtlcAvailable`]: crate::onion_message::async_payments::HeldHtlcAvailable
 	pub release_htlc_message_paths: Vec<(u64, BlindedMessagePath)>,
 	/// next_local_nonces
-	pub next_local_nonces: Vec<PublicNonce>,
+	pub next_local_nonces: Vec<(Txid, PublicNonce)>,
 }
 
 /// An [`update_fee`] message to be sent to or received from a peer
@@ -1050,7 +1050,7 @@ pub struct ChannelReestablish {
 	pub my_current_funding_locked: Option<FundingLocked>,
 
 	/// next_local_nonces
-	pub next_local_nonces: Vec<PublicNonce>,
+	pub next_local_nonces: Vec<(Txid, PublicNonce)>,
 }
 
 /// Information exchanged during channel reestablishment about the next funding from interactive
@@ -4790,8 +4790,6 @@ mod tests {
 			)
 		};
 
-		let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
-
 		let cr = msgs::ChannelReestablish {
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
@@ -4803,7 +4801,7 @@ mod tests {
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
 			my_current_funding_locked: None,
-			next_local_nonces: vec![public_nonce, public_nonce, public_nonce],
+			next_local_nonces: Vec::new(),
 		};
 
 		let encoded_value = cr.encode();
@@ -4839,8 +4837,6 @@ mod tests {
 			)
 		};
 
-		let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
-
 		let cr = msgs::ChannelReestablish {
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
@@ -4861,7 +4857,7 @@ mod tests {
 				retransmit_flags: 1,
 			}),
 			my_current_funding_locked: None,
-			next_local_nonces: vec![public_nonce, public_nonce, public_nonce],
+			next_local_nonces: Vec::new(),
 		};
 
 		let encoded_value = cr.encode();
@@ -4901,8 +4897,6 @@ mod tests {
 			)
 		};
 
-		let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
-
 		let cr = msgs::ChannelReestablish {
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
@@ -4923,7 +4917,7 @@ mod tests {
 				),
 				retransmit_flags: 1,
 			}),
-			next_local_nonces: vec![public_nonce, public_nonce, public_nonce],
+			next_local_nonces: Vec::new(),
 		};
 
 		let encoded_value = cr.encode();
@@ -6410,8 +6404,6 @@ mod tests {
 			secp_ctx
 		);
 
-		let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
-
 		let raa = msgs::RevokeAndACK {
 			channel_id: ChannelId::from_bytes([2; 32]),
 			per_commitment_secret: [
@@ -6420,7 +6412,7 @@ mod tests {
 			],
 			next_per_commitment_point: pubkey_1,
 			release_htlc_message_paths: Vec::new(),
-			next_local_nonces: vec![public_nonce, public_nonce, public_nonce],
+			next_local_nonces: Vec::new(),
 		};
 		let encoded_value = raa.encode();
 		let target_value = <Vec<u8>>::from_hex("02020202020202020202020202020202020202020202020202020202020202020101010101010101010101010101010101010101010101010101010101010101031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f").unwrap();

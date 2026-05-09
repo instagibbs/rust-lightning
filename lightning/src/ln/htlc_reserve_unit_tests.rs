@@ -947,6 +947,7 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 	nodes[1].node.handle_commitment_signed(node_a_id, &commit_signed_msg);
 	let _ = nodes[1].node.get_and_clear_pending_msg_events();
 
+	let funding_txid = nodes[0].node.list_channels()[0].funding_txo.unwrap().txid;
 	let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
 
 	// Send the RAA to nodes[1].
@@ -955,7 +956,7 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 		per_commitment_secret: local_secret,
 		next_per_commitment_point: next_local_point,
 		release_htlc_message_paths: Vec::new(),
-		next_local_nonces: vec![public_nonce],
+		next_local_nonces: vec![(funding_txid, public_nonce)],
 	};
 	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);
 	expect_and_process_pending_htlcs(&nodes[1], false);
@@ -2335,6 +2336,7 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 		nodes[1].node.handle_commitment_signed(node_a_id, &commit_signed_msg);
 		let _ = nodes[1].node.get_and_clear_pending_msg_events();
 
+		let funding_txid = nodes[0].node.list_channels()[0].funding_txo.unwrap().txid;
 		let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
 
 		// Send the RAA to nodes[1].
@@ -2343,7 +2345,7 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 			per_commitment_secret: local_secret,
 			next_per_commitment_point: next_local_point,
 			release_htlc_message_paths: Vec::new(),
-			next_local_nonces: vec![public_nonce],
+			next_local_nonces: vec![(funding_txid, public_nonce)],
 		};
 		nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);
 
@@ -2752,6 +2754,7 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 	nodes[1].node.handle_commitment_signed(node_a_id, &commit_signed_msg);
 	let _ = nodes[1].node.get_and_clear_pending_msg_events();
 
+	let funding_txid = nodes[0].node.list_channels()[0].funding_txo.unwrap().txid;
 	let public_nonce = PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap();
 
 	// Send the RAA to nodes[1].
@@ -2760,7 +2763,7 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 		per_commitment_secret: local_secret,
 		next_per_commitment_point: next_local_point,
 		release_htlc_message_paths: Vec::new(),
-		next_local_nonces: vec![public_nonce],
+		next_local_nonces: vec![(funding_txid, public_nonce)],
 	};
 	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);
 	expect_and_process_pending_htlcs(&nodes[1], false);

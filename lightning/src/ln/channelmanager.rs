@@ -13553,7 +13553,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							my_current_per_commitment_point: PublicKey::from_slice(&[2u8; 33]).unwrap(),
 							next_funding: None,
 							my_current_funding_locked: None,
-							next_local_nonces: vec![PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap()],
+							next_local_nonces: vec![(Txid::all_zeros(), PublicNonce::from_byte_array(&PUBLIC_NONCE).unwrap())],
 						},
 					});
 					return Err(MsgHandleErrInternal::no_such_channel_for_peer(counterparty_node_id, msg.channel_id)
