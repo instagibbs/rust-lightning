@@ -3649,7 +3649,7 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 		let sighash = initial_commitment_bitcoin_tx.get_sighash_default(&funding_txout);
 		let funding_spk = self.funding().get_funding_output(&self.context().secp_ctx).unwrap();
 		log_trace!(logger, "Checking {} tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} for channel {}.",
-			self.received_msg(), log_bytes!(sig.serialize_compact()[..]), log_bytes!(self.funding().counterparty_funding_pubkey().serialize()),
+			self.received_msg(), log_bytes!(sig.serialize()[..]), log_bytes!(self.funding().counterparty_funding_pubkey().serialize()),
 			encode::serialize_hex(&initial_commitment_bitcoin_tx.transaction), log_bytes!(sighash[..]),
 			encode::serialize_hex(&funding_spk), &self.context().channel_id());
 
@@ -5774,7 +5774,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			let sighash = bitcoin_tx.get_sighash_default(&funding.get_funding_output(&self.secp_ctx).unwrap());
 
 			log_trace!(logger, "Checking commitment tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}",
-				log_bytes!(msg.partial_signature_with_nonce.unwrap().serialize_compact()[..]),
+				log_bytes!(msg.partial_signature_with_nonce.unwrap().serialize()[..]),
 				log_bytes!(funding.counterparty_funding_pubkey().serialize()),
 				encode::serialize_hex(&bitcoin_tx.transaction),
 				log_bytes!(sighash[..]), encode::serialize_hex(&funding.get_funding_output(&self.secp_ctx).unwrap()),
@@ -15105,7 +15105,7 @@ where
 			log_trace!(logger, "Signed remote commitment tx {} (txid {}) with redeemscript {} -> {}",
 				encode::serialize_hex(&trusted_tx.built_transaction().transaction),
 				&trusted_tx.txid(), encode::serialize_hex(&funding.get_funding_output(&self.context.secp_ctx).unwrap()),
-				log_bytes!(signature.serialize_compact()[..]));
+				log_bytes!(signature.serialize()[..]));
 
 			let counterparty_keys = trusted_tx.keys();
 			debug_assert_eq!(htlc_signatures.len(), trusted_tx.nondust_htlcs().len());

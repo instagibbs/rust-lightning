@@ -4528,7 +4528,7 @@ fn test_splice_buffer_invalid_commitment_signed_closes_channel() {
 	// Invalidate the signature by modifying one byte. This will cause signature verification
 	// to fail when the buffered message is processed.
 	let original_sig = acceptor_commit_sig.commitment_signed[0].partial_signature_with_nonce;
-	let mut sig_bytes = original_sig.unwrap().serialize_compact();
+	let mut sig_bytes = original_sig.unwrap().serialize();
 	sig_bytes[0] ^= 0x01; // Flip a bit to corrupt the signature
 	let partial_signature = PartialSignature::from_byte_array((&sig_bytes[..32]).try_into().unwrap()).unwrap();
 	let public_nonce = PublicNonce::from_byte_array((&sig_bytes[32..]).try_into().unwrap()).unwrap();

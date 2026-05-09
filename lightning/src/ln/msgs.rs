@@ -113,7 +113,7 @@ pub struct PartialSignatureWithNonce {
 }
 
 impl PartialSignatureWithNonce {
-	pub(crate) fn serialize_compact(&self) -> [u8; 98] {
+	pub(crate) fn serialize(&self) -> [u8; 98] {
 		let mut buf = [0u8; 98];
 		let partial_sig = self.partial_signature.serialize();
 		buf[..32].copy_from_slice(&partial_sig);
