@@ -18534,6 +18534,12 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 		features.set_anchor_zero_fee_commitments_optional();
 	}
 
+	if config.channel_handshake_config.negotiate_ark_channel {
+		// Ark channels imply anchor_zero_fee_commitments — see `ChannelTypeFeatures::ark_channel`.
+		features.set_ark_channel_optional();
+		features.set_anchor_zero_fee_commitments_optional();
+	}
+
 	if config.enable_htlc_hold {
 		features.set_htlc_hold_optional();
 	}

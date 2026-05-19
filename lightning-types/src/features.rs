@@ -1122,10 +1122,18 @@ impl ChannelTypeFeatures {
 	/// Bundles taproot funding output, the obscured commitment state number relocated to an
 	/// `OP_RETURN` output (so the commit TX input nSequence can carry the Ark exit-delay CSV),
 	/// and Ark HTLC success-path CSV protection. `static_remote_key` is implied (Ark inherits
-	/// the static-remote-key payment script).
+	/// the static-remote-key payment script). `anchor_zero_fee_commitments` is also implied —
+	/// Ark channels use the same v3/TRUC commit TX with a P2A anchor and 0-fee shape, so they
+	/// inherit every code path gated on `supports_anchor_zero_fee_commitments()` (BumpTransaction
+	/// event emission, witness-weight predictors, anchor input handling, etc.). The Ark-specific
+	/// gates (`get_funding_output`, `make_transaction` shape) check `requires_ark_channel()`
+	/// directly, so places that need to distinguish Ark from zero-fee-commit channels still can.
 	pub fn ark_channel() -> Self {
 		let mut ret = Self::only_static_remote_key();
 		<sealed::ChannelTypeContext as sealed::ArkChannel>::set_required_bit(&mut ret);
+		<sealed::ChannelTypeContext as sealed::AnchorZeroFeeCommitmentsStaging>::set_required_bit(
+			&mut ret,
+		);
 		ret
 	}
 }
@@ -1570,12 +1578,19 @@ mod tests {
 		assert!(ark.supports_ark_channel());
 		// Ark builds on static_remote_key.
 		assert!(ark.requires_static_remote_key());
+		// Ark inherits anchor_zero_fee_commitments — same v3/TRUC + P2A commit-TX shape, and
+		// LDK's zero-fee-commit code paths (BumpTransactionEvent emission, witness predictors,
+		// anchor input handling) gate on supports_anchor_zero_fee_commitments().
+		assert!(ark.supports_anchor_zero_fee_commitments());
+		assert!(ark.requires_anchor_zero_fee_commitments());
 
-		// from_init promotes optional bits to required, and we expect both ark_channel and
-		// static_remote_key to land in the resulting ChannelTypeFeatures.
+		// from_init promotes optional bits to required, and we expect both ark_channel,
+		// static_remote_key, and anchor_zero_fee_commitments to land in the resulting
+		// ChannelTypeFeatures.
 		let mut init = InitFeatures::empty();
 		init.set_ark_channel_optional();
 		init.set_static_remote_key_optional();
+		init.set_anchor_zero_fee_commitments_optional();
 		let converted = ChannelTypeFeatures::from_init(&init);
 		assert_eq!(converted, ark);
 
