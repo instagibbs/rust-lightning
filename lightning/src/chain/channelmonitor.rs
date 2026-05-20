@@ -5679,7 +5679,30 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 					let mut commitment_tx_to_counterparty_output = None;
 
 					// Is it a commitment transaction?
-					if (tx.input[0].sequence.0 >> 8*3) as u8 == 0x80 && (tx.lock_time.to_consensus_u32() >> 8*3) as u8 == 0x20 {
+					//
+					// Legacy: high bits of nSequence (0x80) and nLockTime (0x20) carry the obscured
+					// commitment number, which uniquely identifies commitment TXs.
+					//
+					// Ark channels (Phase 1): the obscured number lives in a dedicated OP_RETURN
+					// output; nSequence carries the exit-delay CSV instead. The funding output is a
+					// 2-of-2 keyspend P2TR with no alternative cooperative-close TX shape that spends
+					// it through this monitor path, so any spend that reaches here IS a commit TX.
+					let funding_scope_arc =
+						core::iter::once(&self.funding).chain(self.pending_funding.iter())
+							.find(|funding| {
+								funding.funding_outpoint().into_bitcoin_outpoint()
+									== tx.input[0].previous_output
+							});
+					let is_ark = funding_scope_arc
+						.map(|f| f.channel_parameters.channel_type_features.requires_ark_channel())
+						.unwrap_or(false);
+					let is_commitment_tx = if is_ark {
+						true
+					} else {
+						(tx.input[0].sequence.0 >> 8*3) as u8 == 0x80
+							&& (tx.lock_time.to_consensus_u32() >> 8*3) as u8 == 0x20
+					};
+					if is_commitment_tx {
 						if let Some((mut new_outpoints, new_outputs)) = self.check_spend_holder_transaction(txid, &tx, height, &block_hash, &logger) {
 							if !new_outputs.1.is_empty() {
 								watch_outputs.push(new_outputs);
