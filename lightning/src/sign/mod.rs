@@ -1380,6 +1380,29 @@ impl InMemorySigner {
 		self.funding_key.with_tweak(tweak)
 	}
 
+	/// Replace this signer's funding key with a caller-supplied one and return the resulting
+	/// signer.
+	///
+	/// Intended for integrations that need the channel's BOLT2 funding pubkey to equal a
+	/// long-term wallet key rather than the `KeysManager`-derived per-channel key — notably
+	/// the Ark channel type, whose vTXO output is keyspend-only with internal key
+	/// `MuSig2(holder_funding_pubkey, counterparty_funding_pubkey)` and which therefore
+	/// arranges those funding pubkeys to equal the cooperative-path MuSig2 partners
+	/// (`client_keypair`, `server_pubkey`) so refresh / offboard / forfeit ceremonies — which
+	/// keyspend-aggregate `vtxo.user_pubkey()` + `vtxo.server_pubkey()` — produce signatures
+	/// that verify against the vTXO output's tweaked output key. All other key material
+	/// (revocation, payment, htlc, delayed-payment basepoints, commitment_seed) stays
+	/// `KeysManager`-derived; only `funding_key` is replaced.
+	///
+	/// **Hot-key tradeoff**: BOLT2's per-channel ephemeral funding key gives leak isolation
+	/// per channel; using a long-term key as funding key means a leak affects every channel
+	/// signed with that key. Callers must accept this tradeoff explicitly.
+	#[must_use]
+	pub fn with_overridden_funding_key(mut self, funding_key: SecretKey) -> Self {
+		self.funding_key = sealed::MaybeTweakedSecretKey::from(funding_key);
+		self
+	}
+
 	/// Sign the single input of `spend_tx` at index `input_idx`, which spends the output described
 	/// by `descriptor`, returning the witness stack for the input.
 	///
