@@ -581,6 +581,15 @@ pub struct TeleportInit {
 	pub channel_id: ChannelId,
 	/// The outpoint of the replacement funding transaction agreed out of band.
 	pub new_funding_txo: OutPoint,
+	/// Per-funding-scope nonces the initiator will use for MuSig2 partial signing of the
+	/// counterparty's first commitment transaction against the new funding scope. Keyed by
+	/// the txid of the funding output being signed against (currently just `new_funding_txo.txid`
+	/// — the new teleport scope is the only one introduced here).
+	///
+	/// Empty on channel types that don't use MuSig2 partial sigs (legacy P2WSH 2-of-2 funding,
+	/// ECDSA signing); required for proto-taproot / Ark channels whose initial commitment
+	/// against the new funding scope cannot be signed without the counterparty's nonce.
+	pub next_local_nonces: Vec<(Txid, PublicNonce)>,
 }
 
 /// A `teleport_ack` message to be received by or sent to the teleport initiator.
@@ -588,6 +597,10 @@ pub struct TeleportInit {
 pub struct TeleportAck {
 	/// The channel ID where teleport is intended.
 	pub channel_id: ChannelId,
+	/// Per-funding-scope nonces the responder will use for MuSig2 partial signing of the
+	/// initiator's first commitment transaction against the new funding scope. See
+	/// [`TeleportInit::next_local_nonces`] for the full rationale.
+	pub next_local_nonces: Vec<(Txid, PublicNonce)>,
 }
 
 /// A `teleport_abort` message to be received by or sent to the teleport initiator.
@@ -3247,11 +3260,15 @@ impl_writeable_msg!(SpliceLocked, {
 impl_writeable_msg!(TeleportInit, {
 	channel_id,
 	new_funding_txo,
-}, {});
+}, {
+	(2, next_local_nonces, optional_vec),
+});
 
 impl_writeable_msg!(TeleportAck, {
 	channel_id,
-}, {});
+}, {
+	(2, next_local_nonces, optional_vec),
+});
 
 impl_writeable_msg!(TeleportAbort, {
 	channel_id,
