@@ -2407,6 +2407,7 @@ where
 					holder_commitment_point,
 					pending_splice: None,
 					pending_teleport: None,
+					pending_teleport_counterparty_nonce: None,
 					quiescent_action: None,
 				};
 				let res = funded_channel.initial_commitment_signed_v2(msg, best_block, signer_provider, logger)
@@ -2976,7 +2977,11 @@ impl FundingScope {
 	}
 
 	/// Constructs a `FundingScope` for teleporting a channel to a new funding outpoint.
-	fn for_teleport(prev_funding: &Self, new_funding_txo: OutPoint) -> Self {
+	fn for_teleport(
+		prev_funding: &Self,
+		new_funding_txo: OutPoint,
+		signing_nonce: Option<musig_secp::musig::PublicNonce>,
+	) -> Self {
 		let mut channel_transaction_parameters =
 			prev_funding.channel_transaction_parameters.clone();
 		channel_transaction_parameters.funding_outpoint = Some(new_funding_txo);
@@ -3009,7 +3014,7 @@ impl FundingScope {
 			funding_tx_confirmation_height: 0,
 			short_channel_id: None,
 			minimum_depth_override: None,
-			signing_nonce: None,
+			signing_nonce,
 		}
 	}
 
@@ -5933,7 +5938,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			let counterparty_funding_pubkey = musig_secp::PublicKey::from_byte_array_compressed(counterparty_funding_pubkey_bytes).unwrap();
 
 			let verification_nonce = self.holder_signer.generate_local_nonce_pair(&funding.channel_transaction_parameters, transaction_number, &self.secp_ctx);
-
+	
 			let mut pubkeys = [&holder_funding_pubkey, &counterparty_funding_pubkey];
 			musig_secp::sort_pubkeys(&mut pubkeys);
 			let mut key_agg_cache = KeyAggCache::new(&pubkeys);
@@ -7248,6 +7253,12 @@ pub(super) struct FundedChannel<SP: SignerProvider> {
 
 	/// Information about an in-flight teleport handshake.
 	pending_teleport: Option<PendingTeleport>,
+	/// Counterparty's MuSig2 nonce for the new teleport funding scope, learned from the
+	/// `next_local_nonces` field of `TeleportInit` (responder side) or `TeleportAck` (initiator
+	/// side). Plumbed into `FundingScope::for_teleport` so the first MuSig2 partial sign on
+	/// the new funding scope has the counterparty's nonce available. Cleared on promotion.
+	/// Always `None` for ECDSA-funded channels.
+	pending_teleport_counterparty_nonce: Option<musig_secp::musig::PublicNonce>,
 
 	/// Once we become quiescent, if we're the initiator, there's some action we'll want to take.
 	/// This keeps track of that action. Note that if we become quiescent and we're not the
@@ -7546,7 +7557,11 @@ where
 	}
 
 	fn teleport_funding(&self, new_funding_txo: OutPoint) -> FundingScope {
-		FundingScope::for_teleport(&self.funding, new_funding_txo)
+		FundingScope::for_teleport(
+			&self.funding,
+			new_funding_txo,
+			self.pending_teleport_counterparty_nonce,
+		)
 	}
 
 	fn get_pending_teleport_complete_ack(&self) -> Option<msgs::TeleportCompleteAck> {
@@ -14235,10 +14250,28 @@ where
 			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo }) => {
 				self.pending_teleport =
 					Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo });
+				// Generate our MuSig2 nonce for the new funding scope's first commitment so
+				// the initiator can partial-sign their commitment after handling our ack.
+				// See the equivalent comment in the TeleportInit construction path.
+				let teleport_funding_params_only = FundingScope::for_teleport(
+					&self.funding,
+					new_funding_txo,
+					None,
+				);
+				let next_commitment_number =
+					self.holder_commitment_point.current_transaction_number();
+				let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(
+					&teleport_funding_params_only.channel_transaction_parameters,
+					next_commitment_number,
+					&self.context.secp_ctx,
+				);
 				let commitment_signed =
 					self.get_initial_teleport_commitment_signed(new_funding_txo, logger);
 				Ok((
-					msgs::TeleportAck { channel_id: self.context.channel_id() },
+					msgs::TeleportAck {
+						channel_id: self.context.channel_id(),
+						next_local_nonces: vec![(new_funding_txo.txid, next_local_nonce)],
+					},
 					commitment_signed,
 				))
 			},
@@ -14333,17 +14366,33 @@ where
 			));
 		}
 
+		// MuSig2 channels: stash the initiator's nonce for the new funding scope so the
+		// first partial sign at `ack_teleport` time has the counterparty's nonce available.
+		// Empty for ECDSA channels.
+		self.pending_teleport_counterparty_nonce = msg
+			.next_local_nonces
+			.iter()
+			.find(|(txid, _)| *txid == msg.new_funding_txo.txid)
+			.map(|(_, nonce)| *nonce);
+
 		self.pending_teleport =
 			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo: msg.new_funding_txo });
 		Ok(msg.new_funding_txo)
 	}
 
 	pub(crate) fn teleport_ack<L: Logger>(
-		&mut self, _msg: &msgs::TeleportAck, logger: &L,
+		&mut self, msg: &msgs::TeleportAck, logger: &L,
 	) -> Result<Option<msgs::CommitmentSigned>, ChannelError> {
 		match self.pending_teleport.take() {
 			Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo }) => {
 				self.mark_response_received();
+				// Stash the responder's nonce for the new funding scope (mirrors what
+				// `teleport_init` does for the responder).
+				self.pending_teleport_counterparty_nonce = msg
+					.next_local_nonces
+					.iter()
+					.find(|(txid, _)| *txid == new_funding_txo.txid)
+					.map(|(_, nonce)| *nonce);
 				let commitment_signed =
 					self.get_initial_teleport_commitment_signed(new_funding_txo, logger);
 				self.pending_teleport =
@@ -16187,9 +16236,27 @@ where
 
 					self.pending_teleport =
 						Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo });
+					// Generate our MuSig2 nonce for the new funding scope's first commitment
+					// so the counterparty can partial-sign our commitment in ack_teleport
+					// without a missing-nonce panic. The new scope here has signing_nonce
+					// = None (we'll learn the counterparty's nonce from the TeleportAck
+					// response). Derive the nonce against the SAME commitment number that
+					// `get_initial_counterparty_commitment_signatures` will use (the
+					// "current" commitment number — same as `holder_commitment_point.current_transaction_number()`
+					// since both sides are in sync at quiescence).
+					let teleport_funding =
+						FundingScope::for_teleport(&self.funding, new_funding_txo, None);
+					let next_commitment_number =
+						self.holder_commitment_point.current_transaction_number();
+					let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(
+						&teleport_funding.channel_transaction_parameters,
+						next_commitment_number,
+						&self.context.secp_ctx,
+					);
 					return Ok(Some(StfuResponse::TeleportInit(msgs::TeleportInit {
 						channel_id: self.context.channel_id,
 						new_funding_txo,
+						next_local_nonces: vec![(new_funding_txo.txid, next_local_nonce)],
 					})));
 				},
 				#[cfg(any(test, fuzzing, feature = "_test_utils"))]
@@ -16653,6 +16720,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			holder_commitment_point,
 			pending_splice: None,
 			pending_teleport: None,
+			pending_teleport_counterparty_nonce: None,
 			quiescent_action: None,
 		};
 
@@ -16981,6 +17049,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 			holder_commitment_point,
 			pending_splice: None,
 			pending_teleport: None,
+			pending_teleport_counterparty_nonce: None,
 			quiescent_action: None,
 		};
 		let need_channel_ready = channel.check_get_channel_ready(0, logger).is_some()
@@ -18876,6 +18945,11 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			holder_commitment_point,
 			pending_splice,
 			pending_teleport,
+			// Not persisted: only meaningful between teleport_init/teleport_ack receipt and
+			// promotion of the new funding scope. A restart in this window will replay the
+			// teleport handshake from `pending_teleport` and re-derive the nonce from the
+			// next message exchange.
+			pending_teleport_counterparty_nonce: None,
 			quiescent_action: None,
 		})
 	}
