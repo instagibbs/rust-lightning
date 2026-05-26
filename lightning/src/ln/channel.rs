@@ -2408,6 +2408,7 @@ where
 					pending_splice: None,
 					pending_teleport: None,
 					pending_teleport_counterparty_nonce: None,
+					pending_teleport_previous_funding: None,
 					quiescent_action: None,
 				};
 				let res = funded_channel.initial_commitment_signed_v2(msg, best_block, signer_provider, logger)
@@ -7259,6 +7260,20 @@ pub(super) struct FundedChannel<SP: SignerProvider> {
 	/// the new funding scope has the counterparty's nonce available. Cleared on promotion.
 	/// Always `None` for ECDSA-funded channels.
 	pending_teleport_counterparty_nonce: Option<musig_secp::musig::PublicNonce>,
+	/// The pre-promote `ChannelTransactionParameters` of the funding scope that was active
+	/// when the responder processed `TeleportComplete`. Held across the
+	/// post-`TeleportComplete` / pre-`TeleportCompleteAck` window so that on
+	/// `channel_reestablish` the responder can still produce a MuSig2 nonce for the OLD
+	/// funding outpoint — the initiator hasn't promoted yet and its `next_local_nonces`
+	/// keying expects the OLD txid. Cleared once we observe peer activity past the
+	/// `TeleportCompleteAck` boundary
+	/// (see [`note_counterparty_post_teleport_complete_ack_activity`]).
+	///
+	/// We store just the `ChannelTransactionParameters` rather than the full `FundingScope`
+	/// because `FundingScope` holds `Mutex` fields and isn't `Clone`. Nonce generation
+	/// only needs the channel-transaction-parameters anyway
+	/// (see [`crate::sign::ChannelSigner::generate_local_nonce_pair`]).
+	pending_teleport_previous_funding: Option<ChannelTransactionParameters>,
 
 	/// Once we become quiescent, if we're the initiator, there's some action we'll want to take.
 	/// This keeps track of that action. Note that if we become quiescent and we're not the
@@ -11240,15 +11255,39 @@ where
 			}
 		}
 
+		// Teleport-ack window: peer may include a nonce for the "twin" funding scope (the
+		// one we haven't promoted to yet, or the one we just promoted away from). The
+		// strict count check used to be `!=`; relax to `<` so an extra twin-scope nonce
+		// is tolerated. Each of OUR scopes must still find a matching nonce; missing
+		// match is a real protocol error and closes the channel.
 		let signing_nonces_len = msg.next_local_nonces.len();
 		let funding_scopes_len = self.pending_funding().len() + 1;
-		if signing_nonces_len != funding_scopes_len {
+		if signing_nonces_len < funding_scopes_len {
 			return Err(ChannelError::close(format!("Nonces len {signing_nonces_len} does not match funding scopes len {funding_scopes_len}")));
 		}
 		for funding_mut in self.funding_and_pending_funding_iter_mut() {
 			let txid = funding_mut.get_funding_txid().unwrap();
-			let next_local_nonce = msg.next_local_nonces.iter().find_map(|(funding_txid, nonce)| (funding_txid == &txid).then_some(*nonce)).unwrap();
+			let next_local_nonce = msg.next_local_nonces.iter()
+				.find_map(|(funding_txid, nonce)| (funding_txid == &txid).then_some(*nonce))
+				.ok_or_else(|| ChannelError::close(format!(
+					"channel_reestablish next_local_nonces missing entry for funding txid {txid}"
+				)))?;
 			funding_mut.signing_nonce = Some(next_local_nonce);
+		}
+		// If peer included a nonce for the post-teleport funding scope (initiator side, in
+		// `AwaitingTeleportCompleteAck`), stash it as the counterparty nonce so it's
+		// plumbed into the new `FundingScope` when we eventually promote in
+		// `teleport_complete_ack`. Without this, the first MuSig2 partial sign after
+		// promote would use a stale nonce.
+		if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) =
+			self.pending_teleport.as_ref()
+		{
+			let new_txid = new_funding_txo.txid;
+			if let Some(nonce) = msg.next_local_nonces.iter()
+				.find_map(|(funding_txid, nonce)| (funding_txid == &new_txid).then_some(*nonce))
+			{
+				self.pending_teleport_counterparty_nonce = Some(nonce);
+			}
 		}
 
 		let teleport_complete_ack = self.get_pending_teleport_complete_ack();
@@ -13744,11 +13783,40 @@ where
 		let decrementing_local_number = self.holder_commitment_point.next_transaction_number();
 		let next_local_commitment_number = INITIAL_COMMITMENT_NUMBER - decrementing_local_number;
 		let funding_scopes = core::iter::once(&self.funding).chain(self.pending_funding().iter());
-		let next_local_nonces = funding_scopes.into_iter().map(|funding| {
-			let txid = funding.get_funding_txid().unwrap();
-			let nonce = self.context.holder_signer.generate_local_nonce_pair(&funding.channel_transaction_parameters, decrementing_local_number, &self.context.secp_ctx);
-			(txid, nonce)
-		}).collect();
+		// Teleport-ack window: the two peers temporarily disagree on which funding scope is
+		// current (responder has promoted on `TeleportComplete` receipt; initiator only
+		// promotes on `TeleportCompleteAck` receipt). To keep `channel_reestablish` keying
+		// symmetric, include a nonce for the "twin" scope as well:
+		// - responder side: the OLD funding stashed in `pending_teleport_previous_funding`
+		//   (matches the txid the initiator is still keying against)
+		// - initiator side: the NEW funding reconstructed from
+		//   `PendingTeleport::AwaitingTeleportCompleteAck::new_funding_txo`
+		//   (matches the txid the responder has already promoted to)
+		let teleport_twin_params: Option<ChannelTransactionParameters> =
+			if let Some(prev_params) = self.pending_teleport_previous_funding.as_ref() {
+				Some(prev_params.clone())
+			} else if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) =
+				self.pending_teleport.as_ref()
+			{
+				let mut params = self.funding.channel_transaction_parameters.clone();
+				params.funding_outpoint = Some(*new_funding_txo);
+				params.splice_parent_funding_txid = None;
+				Some(params)
+			} else {
+				None
+			};
+		let mut next_local_nonces: Vec<_> = funding_scopes
+			.map(|funding| {
+				let txid = funding.get_funding_txid().unwrap();
+				let nonce = self.context.holder_signer.generate_local_nonce_pair(&funding.channel_transaction_parameters, decrementing_local_number, &self.context.secp_ctx);
+				(txid, nonce)
+			})
+			.collect();
+		if let Some(twin_params) = teleport_twin_params.as_ref() {
+			let txid = twin_params.funding_outpoint.unwrap().txid;
+			let nonce = self.context.holder_signer.generate_local_nonce_pair(twin_params, decrementing_local_number, &self.context.secp_ctx);
+			next_local_nonces.push((txid, nonce));
+		}
 
 		msgs::ChannelReestablish {
 			channel_id: self.context.channel_id(),
@@ -14455,6 +14523,16 @@ where
 			Some(PendingTeleport::AwaitingRemoteComplete { new_funding_txo }) => {
 				self.pending_teleport =
 					Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo });
+				// Stash the pre-promote funding's `ChannelTransactionParameters` so that, if a
+				// `channel_reestablish` happens before the initiator has processed our
+				// `teleport_complete_ack`, we can still emit a MuSig2 nonce keyed by the
+				// OLD funding txid (which the initiator's `next_local_nonces` lookup will
+				// key against, since the initiator only promotes on `teleport_complete_ack`
+				// receipt). The stash is cleared in
+				// `note_counterparty_post_teleport_complete_ack_activity`.
+				debug_assert!(self.pending_teleport_previous_funding.is_none());
+				self.pending_teleport_previous_funding =
+					Some(self.funding.channel_transaction_parameters.clone());
 				Ok(self.promote_teleport_funding(new_funding_txo, logger))
 			},
 			Some(pending_teleport) => {
@@ -14499,6 +14577,10 @@ where
 			})
 		) {
 			self.pending_teleport = None;
+			// Peer has demonstrably moved past `teleport_complete_ack` receipt, so they've
+			// also promoted to the new funding. The OLD funding scope is no longer needed
+			// for reestablish keying.
+			self.pending_teleport_previous_funding = None;
 		}
 	}
 
@@ -16721,6 +16803,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			pending_splice: None,
 			pending_teleport: None,
 			pending_teleport_counterparty_nonce: None,
+			pending_teleport_previous_funding: None,
 			quiescent_action: None,
 		};
 
@@ -17050,6 +17133,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 			pending_splice: None,
 			pending_teleport: None,
 			pending_teleport_counterparty_nonce: None,
+			pending_teleport_previous_funding: None,
 			quiescent_action: None,
 		};
 		let need_channel_ready = channel.check_get_channel_ready(0, logger).is_some()
@@ -18031,6 +18115,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(77, holding_cell_accountable_flags, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
 			(81, pending_teleport, upgradable_option), // Added in 0.3
+			(83, self.pending_teleport_previous_funding, (option: ReadableArgs, None)), // Added by the Ark fork
 		});
 
 		Ok(())
@@ -18413,6 +18498,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 
 		let mut pending_splice: Option<PendingFunding> = None;
 		let mut pending_teleport: Option<PendingTeleport> = None;
+		let mut pending_teleport_previous_funding: Option<ChannelTransactionParameters> = None;
 
 		let mut pending_outbound_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
 		let mut holding_cell_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
@@ -18476,6 +18562,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(77, holding_cell_accountable, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
 			(81, pending_teleport, upgradable_option), // Added in 0.3
+			(83, pending_teleport_previous_funding, (option: ReadableArgs, None)), // Added by the Ark fork
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -18950,6 +19037,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			// teleport handshake from `pending_teleport` and re-derive the nonce from the
 			// next message exchange.
 			pending_teleport_counterparty_nonce: None,
+			pending_teleport_previous_funding,
 			quiescent_action: None,
 		})
 	}
