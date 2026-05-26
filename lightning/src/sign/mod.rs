@@ -1628,7 +1628,6 @@ const MISSING_PARAMS_ERR: &'static str =
 fn get_stateless_nonces(
 	commitment_seed: &[u8; 32], signing_key: musig_secp::PublicKey, channel_parameters: &ChannelTransactionParameters, commitment_number: u64,
 ) -> (musig_secp::musig::SecretNonce, musig_secp::musig::PublicNonce) {
-	dbg!(commitment_number);
 	use bitcoin::hashes::hmac::{Hmac, HmacEngine};
 	use bitcoin::hashes::sha256::Hash as Sha256;
 	use bitcoin::hashes::Hash;
