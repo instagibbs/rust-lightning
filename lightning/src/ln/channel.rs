@@ -2412,6 +2412,7 @@ where
 						if let PendingTeleport::AwaitingRemoteCommitmentSigned {
 							new_funding_txo,
 							is_initiator,
+							responder_value_removal_sat: _,
 						} = pending_teleport
 						{
 							Some((*new_funding_txo, *is_initiator))
@@ -3274,15 +3275,33 @@ pub(crate) enum QuiescentAction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingTeleport {
-	AwaitingTeleportAck { new_funding_txo: OutPoint },
-	AwaitingUserDecision { new_funding_txo: OutPoint },
-	AwaitingTeleportAckSend { new_funding_txo: OutPoint },
-	AwaitingRemoteCommitmentSigned { new_funding_txo: OutPoint, is_initiator: bool },
-	AwaitingLocalComplete { new_funding_txo: OutPoint },
-	AwaitingRemoteComplete { new_funding_txo: OutPoint },
-	AwaitingTeleportCompleteAck { new_funding_txo: OutPoint },
-	AwaitingTeleportCompleteAckSend { new_funding_txo: OutPoint },
-	AwaitingRemoteActivityAfterTeleportCompleteAckSend { new_funding_txo: OutPoint },
+	AwaitingTeleportAck { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingUserDecision { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingRemoteCommitmentSigned { new_funding_txo: OutPoint, is_initiator: bool, responder_value_removal_sat: u64 },
+	AwaitingLocalComplete { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingRemoteComplete { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportCompleteAck { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportCompleteAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingRemoteActivityAfterTeleportCompleteAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+}
+
+impl PendingTeleport {
+	/// Satoshis the responder is removing from the channel as part of this teleport.
+	/// `0` for value-preserving teleports (existing semantics).
+	pub(crate) fn responder_value_removal_sat(&self) -> u64 {
+		match self {
+			Self::AwaitingTeleportAck { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingUserDecision { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingTeleportAckSend { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingRemoteCommitmentSigned { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingLocalComplete { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingRemoteComplete { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingTeleportCompleteAck { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingTeleportCompleteAckSend { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+		}
+	}
 }
 
 impl PendingTeleport {
@@ -3302,31 +3321,40 @@ impl PendingTeleport {
 impl_writeable_tlv_based_enum_upgradable!(PendingTeleport,
 	(0, AwaitingTeleportAck) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(2, AwaitingUserDecision) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(4, AwaitingTeleportAckSend) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(6, AwaitingRemoteCommitmentSigned) => {
 		(0, new_funding_txo, required),
 		(2, is_initiator, required),
+		(4, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(8, AwaitingLocalComplete) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(10, AwaitingRemoteComplete) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(12, AwaitingTeleportCompleteAck) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(14, AwaitingTeleportCompleteAckSend) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(16, AwaitingRemoteActivityAfterTeleportCompleteAckSend) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 );
 
@@ -10980,7 +11008,7 @@ where
 		// plumbed into the new `FundingScope` when we eventually promote in
 		// `teleport_complete_ack`. Without this, the first MuSig2 partial sign after
 		// promote would use a stale nonce.
-		if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) =
+		if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, .. }) =
 			self.pending_teleport.as_ref()
 		{
 			let new_txid = new_funding_txo.txid;
@@ -13470,7 +13498,7 @@ where
 		let teleport_twin_params: Option<ChannelTransactionParameters> =
 			if let Some(prev_params) = self.pending_teleport_previous_funding.as_ref() {
 				Some(prev_params.clone())
-			} else if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) =
+			} else if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, .. }) =
 				self.pending_teleport.as_ref()
 			{
 				let mut params = self.funding.channel_transaction_parameters.clone();
@@ -13978,9 +14006,9 @@ where
 		&mut self, logger: &L,
 	) -> Result<(msgs::TeleportAck, Option<msgs::CommitmentSigned>), APIError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport =
-					Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo });
+					Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo, responder_value_removal_sat });
 				// Generate our MuSig2 nonce for the new funding scope's first commitment so
 				// the initiator can partial-sign their commitment after handling our ack.
 				// See the equivalent comment in the TeleportInit construction path.
@@ -14053,9 +14081,9 @@ where
 			});
 		}
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingLocalComplete { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingLocalComplete { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport =
-					Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo });
+					Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, responder_value_removal_sat });
 				Ok(msgs::TeleportComplete { channel_id: self.context.channel_id() })
 			},
 			Some(pending_teleport) => {
@@ -14107,7 +14135,10 @@ where
 			.map(|(_, nonce)| *nonce);
 
 		self.pending_teleport =
-			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo: msg.new_funding_txo });
+			Some(PendingTeleport::AwaitingUserDecision {
+				new_funding_txo: msg.new_funding_txo,
+				responder_value_removal_sat: msg.responder_value_removal_sat,
+			});
 		Ok(msg.new_funding_txo)
 	}
 
@@ -14115,7 +14146,7 @@ where
 		&mut self, msg: &msgs::TeleportAck, logger: &L,
 	) -> Result<Option<msgs::CommitmentSigned>, ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo, responder_value_removal_sat }) => {
 				self.mark_response_received();
 				// Stash the responder's nonce for the new funding scope (mirrors what
 				// `teleport_init` does for the responder).
@@ -14130,6 +14161,7 @@ where
 					Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
 						new_funding_txo,
 						is_initiator: true,
+						responder_value_removal_sat,
 					});
 				Ok(commitment_signed)
 			},
@@ -14145,11 +14177,12 @@ where
 
 	pub(crate) fn teleport_ack_sent(&mut self) -> Result<(), ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport =
 					Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
 						new_funding_txo,
 						is_initiator: false,
+						responder_value_removal_sat,
 					});
 				Ok(())
 			},
@@ -14183,9 +14216,9 @@ where
 		&mut self, _msg: &msgs::TeleportComplete, logger: &L,
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingRemoteComplete { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingRemoteComplete { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport =
-					Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo });
+					Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo, responder_value_removal_sat });
 				// Stash the pre-promote funding's `ChannelTransactionParameters` so that, if a
 				// `channel_reestablish` happens before the initiator has processed our
 				// `teleport_complete_ack`, we can still emit a MuSig2 nonce keyed by the
@@ -14210,10 +14243,11 @@ where
 
 	pub(crate) fn teleport_complete_ack_sent(&mut self) -> Result<bool, ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport = Some(
 					PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
 						new_funding_txo,
+						responder_value_removal_sat,
 					},
 				);
 				let exited_quiescence = self.context.channel_state.is_quiescent();
@@ -14251,7 +14285,7 @@ where
 		&mut self, _msg: &msgs::TeleportCompleteAck, logger: &L,
 	) -> Result<(bool, Option<ChannelMonitorUpdate>), ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, responder_value_removal_sat: _ }) => {
 				self.mark_response_received();
 				let exited_quiescence = self.context.channel_state.is_quiescent();
 				self.context.channel_state.clear_quiescent();
@@ -14292,10 +14326,15 @@ where
 			fee_estimator,
 			logger,
 		)?;
+		let responder_value_removal_sat = self
+			.pending_teleport
+			.as_ref()
+			.map(|pt| pt.responder_value_removal_sat())
+			.unwrap_or(0);
 		self.pending_teleport = Some(if is_initiator {
-			PendingTeleport::AwaitingLocalComplete { new_funding_txo }
+			PendingTeleport::AwaitingLocalComplete { new_funding_txo, responder_value_removal_sat }
 		} else {
-			PendingTeleport::AwaitingRemoteComplete { new_funding_txo }
+			PendingTeleport::AwaitingRemoteComplete { new_funding_txo, responder_value_removal_sat }
 		});
 		Ok(monitor_update)
 	}
@@ -15808,7 +15847,14 @@ where
 					}
 
 					self.pending_teleport =
-						Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo });
+						Some(PendingTeleport::AwaitingTeleportAck {
+							new_funding_txo,
+							// LDK-only quiescent-action path: no value change. Ark-side
+							// integration sets this through a different code path (the
+							// refresh coordinator's explicit `initiate_teleport_with_value`
+							// API, added when liquidity-removal lands end-to-end).
+							responder_value_removal_sat: 0,
+						});
 					// Generate our MuSig2 nonce for the new funding scope's first commitment
 					// so the counterparty can partial-sign our commitment in ack_teleport
 					// without a missing-nonce panic. The new scope here has signing_nonce
@@ -15830,6 +15876,10 @@ where
 						channel_id: self.context.channel_id,
 						new_funding_txo,
 						next_local_nonces: vec![(new_funding_txo.txid, next_local_nonce)],
+						// Default: no value change. Out-of-band agreement (Ark leaf-cosign)
+						// will populate this when ASP-side liquidity removal applies; for
+						// the current LDK-only quiescent-action path, always 0.
+						responder_value_removal_sat: 0,
 					})));
 				},
 				#[cfg(any(test, fuzzing, feature = "_test_utils"))]
