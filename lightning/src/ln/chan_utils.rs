@@ -1249,6 +1249,12 @@ impl ChannelTransactionParameters {
 	}
 
 	/// TODO TAPROOT See if we can drop the rust-bitcoin bump, and rely solely on the new secp crate
+	//
+	// FIXME(ark/asp-leaf-sweep-gap): for Ark channels this produces a keyspend-only P2TR
+	// matching `bark`'s `ChannelFundingVtxoPolicy`. Once we add the ASP-only `<expiry_height
+	// OP_CLTV asp_key>` tapleaf on the bark side (see the FIXME on `ChannelFundingVtxoPolicy`),
+	// this builder must take `expiry_height` + `asp_key` and produce the same taproot output,
+	// or the funding script_pubkey diverges between the two sides and channel open fails.
 	pub fn get_taproot_output(&self, secp_ctx: &Secp256k1<secp256k1::All>) -> Option<TxOut> {
 		let counterparty_parameters = self.counterparty_parameters.as_ref()?;
 
