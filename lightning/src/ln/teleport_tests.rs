@@ -21,7 +21,7 @@ fn start_teleport<'a, 'b, 'c>(
 	let initiator_id = initiator.node.get_our_node_id();
 	let responder_id = responder.node.get_our_node_id();
 
-	initiator.node.teleport_channel(&channel_id, &responder_id, new_funding_txo).unwrap();
+	initiator.node.teleport_channel(&channel_id, &responder_id, new_funding_txo, 0).unwrap();
 
 	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);
 	responder.node.handle_stfu(initiator_id, &stfu);
@@ -547,3 +547,101 @@ fn test_channel_teleport_disconnect_after_complete_ack_dequeued_before_delivery_
 		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script);
 }
 
+
+// Ark fork: responder-side liquidity removal in TeleportInit propagates through quiescence +
+// the TeleportInit wire message + the responder's pending_teleport state. Validates the
+// scaffold land — value flows from `teleport_channel(removal_sat=N)` all the way to the
+// responder's pending_teleport, end-to-end across the wire. Stops short of full ack/
+// commit_signed flow (that path has a pre-existing upstream LDK proto-taproot bug; barkd
+// E2E covers the full integration with the Ark refresh coordinator).
+#[test]
+fn test_teleport_responder_value_removal_carries_through_teleport_init() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	// 1M sat channel with 500k pushed to the responder — leaves enough headroom on the
+	// responder's value_to_self to pass the reserve check after a small removal.
+	let channel_id = create_announced_chan_between_nodes_with_value(
+		&nodes, 0, 1, 1_000_000, 500_000_000,
+	).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let new_funding_txo = test_outpoint(3, 1);
+
+	let removal_sat: u64 = 1_000;
+
+	initiator
+		.node
+		.teleport_channel(&channel_id, &responder_id, new_funding_txo, removal_sat)
+		.unwrap();
+
+	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);
+	responder.node.handle_stfu(initiator_id, &stfu);
+	let stfu = get_event_msg!(responder, MessageSendEvent::SendStfu, initiator_id);
+	initiator.node.handle_stfu(responder_id, &stfu);
+
+	let teleport_init =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportInit, responder_id);
+	assert_eq!(
+		teleport_init.responder_value_removal_sat, removal_sat,
+		"TeleportInit msg must carry the removal value declared at teleport_channel()",
+	);
+
+	responder.node.handle_teleport_init(initiator_id, &teleport_init);
+	match get_event!(responder, Event::ChannelTeleport) {
+		Event::ChannelTeleport { channel_id: ev_channel_id, .. } => {
+			assert_eq!(ev_channel_id, channel_id);
+		},
+		event => panic!("expected ChannelTeleport, got {event:?}"),
+	}
+}
+
+// Ark fork: the responder rejects (closes the channel on) a TeleportInit whose
+// responder_value_removal_sat would underflow / push the responder below its
+// counterparty-selected reserve.
+#[test]
+fn test_teleport_responder_value_removal_rejected_when_below_reserve() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let new_funding_txo = test_outpoint(4, 1);
+
+	// Excessive removal: clearly above any reasonable responder balance.
+	let removal_sat: u64 = 99_000_000;
+
+	initiator
+		.node
+		.teleport_channel(&channel_id, &responder_id, new_funding_txo, removal_sat)
+		.unwrap();
+
+	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);
+	responder.node.handle_stfu(initiator_id, &stfu);
+	let stfu = get_event_msg!(responder, MessageSendEvent::SendStfu, initiator_id);
+	initiator.node.handle_stfu(responder_id, &stfu);
+
+	let teleport_init =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportInit, responder_id);
+	responder.node.handle_teleport_init(initiator_id, &teleport_init);
+
+	let msg_events = responder.node.get_and_clear_pending_msg_events();
+	assert!(
+		msg_events.iter().any(|e| matches!(e, MessageSendEvent::HandleError { .. })),
+		"expected responder to close-on-error for excessive removal, got: {msg_events:?}",
+	);
+
+	// Drain the close-on-error ChannelClosed event + monitor update so the test-utils'
+	// end-of-test "no excess events / monitors" assertions are satisfied.
+	let _ = responder.node.get_and_clear_pending_events();
+	check_added_monitors(responder, 1);
+}

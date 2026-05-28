@@ -2445,6 +2445,7 @@ where
 						if let PendingTeleport::AwaitingRemoteCommitmentSigned {
 							new_funding_txo,
 							is_initiator,
+							responder_value_removal_sat: _,
 						} = pending_teleport
 						{
 							Some((*new_funding_txo, *is_initiator))
@@ -2978,18 +2979,35 @@ impl FundingScope {
 	}
 
 	/// Constructs a `FundingScope` for teleporting a channel to a new funding outpoint.
+	///
+	/// `channel_value_delta_sat` and `local_value_to_self_delta_msat` are signed deltas applied
+	/// on top of `prev_funding`'s values. For value-preserving teleports both are 0 (existing
+	/// behavior). For responder-side liquidity removal of X sats during a refresh:
+	/// - both sides pass `channel_value_delta_sat = -X`
+	/// - the responder passes `local_value_to_self_delta_msat = -X*1000`
+	/// - the initiator passes `local_value_to_self_delta_msat = 0`
+	///
+	/// See `teleport_funding` on the channel for the side-aware wiring.
 	fn for_teleport(
 		prev_funding: &Self,
 		new_funding_txo: OutPoint,
+		channel_value_delta_sat: i64,
+		local_value_to_self_delta_msat: i64,
 		signing_nonce: Option<musig_secp::musig::PublicNonce>,
 	) -> Self {
 		let mut channel_transaction_parameters =
 			prev_funding.channel_transaction_parameters.clone();
 		channel_transaction_parameters.funding_outpoint = Some(new_funding_txo);
 		channel_transaction_parameters.splice_parent_funding_txid = None;
+		channel_transaction_parameters.channel_value_satoshis = (channel_transaction_parameters
+			.channel_value_satoshis as i64
+			+ channel_value_delta_sat) as u64;
+
+		let new_value_to_self_msat =
+			(prev_funding.value_to_self_msat as i64 + local_value_to_self_delta_msat) as u64;
 
 		Self {
-			value_to_self_msat: prev_funding.value_to_self_msat,
+			value_to_self_msat: new_value_to_self_msat,
 			counterparty_selected_channel_reserve_satoshis:
 				prev_funding.counterparty_selected_channel_reserve_satoshis,
 			holder_selected_channel_reserve_satoshis:
@@ -3342,6 +3360,10 @@ pub(crate) enum QuiescentAction {
 	},
 	Teleport {
 		new_funding_txo: OutPoint,
+		/// Sats the responder is removing from their side of the channel as part of this
+		/// teleport. `0` for value-preserving teleports (existing behavior). The bark refresh
+		/// coordinator sets this from the leaf-cosign result.
+		responder_value_removal_sat: u64,
 	},
 	#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 	DoNothing,
@@ -3349,15 +3371,33 @@ pub(crate) enum QuiescentAction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingTeleport {
-	AwaitingTeleportAck { new_funding_txo: OutPoint },
-	AwaitingUserDecision { new_funding_txo: OutPoint },
-	AwaitingTeleportAckSend { new_funding_txo: OutPoint },
-	AwaitingRemoteCommitmentSigned { new_funding_txo: OutPoint, is_initiator: bool },
-	AwaitingLocalComplete { new_funding_txo: OutPoint },
-	AwaitingRemoteComplete { new_funding_txo: OutPoint },
-	AwaitingTeleportCompleteAck { new_funding_txo: OutPoint },
-	AwaitingTeleportCompleteAckSend { new_funding_txo: OutPoint },
-	AwaitingRemoteActivityAfterTeleportCompleteAckSend { new_funding_txo: OutPoint },
+	AwaitingTeleportAck { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingUserDecision { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingRemoteCommitmentSigned { new_funding_txo: OutPoint, is_initiator: bool, responder_value_removal_sat: u64 },
+	AwaitingLocalComplete { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingRemoteComplete { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportCompleteAck { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportCompleteAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingRemoteActivityAfterTeleportCompleteAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+}
+
+impl PendingTeleport {
+	/// Satoshis the responder is removing from the channel as part of this teleport.
+	/// `0` for value-preserving teleports (existing semantics).
+	pub(crate) fn responder_value_removal_sat(&self) -> u64 {
+		match self {
+			Self::AwaitingTeleportAck { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingUserDecision { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingTeleportAckSend { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingRemoteCommitmentSigned { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingLocalComplete { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingRemoteComplete { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingTeleportCompleteAck { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingTeleportCompleteAckSend { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+			Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend { responder_value_removal_sat, .. } => *responder_value_removal_sat,
+		}
+	}
 }
 
 impl PendingTeleport {
@@ -3377,31 +3417,40 @@ impl PendingTeleport {
 impl_writeable_tlv_based_enum_upgradable!(PendingTeleport,
 	(0, AwaitingTeleportAck) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(2, AwaitingUserDecision) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(4, AwaitingTeleportAckSend) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(6, AwaitingRemoteCommitmentSigned) => {
 		(0, new_funding_txo, required),
 		(2, is_initiator, required),
+		(4, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(8, AwaitingLocalComplete) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(10, AwaitingRemoteComplete) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(12, AwaitingTeleportCompleteAck) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(14, AwaitingTeleportCompleteAckSend) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 	(16, AwaitingRemoteActivityAfterTeleportCompleteAckSend) => {
 		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
 	},
 );
 
@@ -7571,10 +7620,25 @@ where
 		}
 	}
 
-	fn teleport_funding(&self, new_funding_txo: OutPoint) -> FundingScope {
+	fn teleport_funding(
+		&self, new_funding_txo: OutPoint, responder_value_removal_sat: u64,
+	) -> FundingScope {
+		// The teleport-initiator (refresh-initiator) is assumed to be the same side as
+		// the channel-open initiator in our refresh flow (client refreshes its own
+		// channel). If that ever changes, this needs revisiting.
+		let channel_value_delta_sat = -(responder_value_removal_sat as i64);
+		let local_value_to_self_delta_msat = if self.funding.is_outbound() {
+			// We are the channel-open + teleport initiator: our value_to_self is invariant.
+			0
+		} else {
+			// We are the responder: our value_to_self decreases by the removal.
+			-((responder_value_removal_sat as i64) * 1000)
+		};
 		FundingScope::for_teleport(
 			&self.funding,
 			new_funding_txo,
+			channel_value_delta_sat,
+			local_value_to_self_delta_msat,
 			self.pending_teleport_counterparty_nonce,
 		)
 	}
@@ -7594,17 +7658,18 @@ where
 	}
 
 	fn get_initial_teleport_commitment_signed<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
 	) -> Option<msgs::CommitmentSigned> {
-		let funding = self.teleport_funding(new_funding_txo);
+		let funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
 		self.context.get_initial_commitment_signed_v2(&funding, logger)
 	}
 
 	fn teleport_initial_commitment_signed<F: FeeEstimator, L: Logger>(
 		&mut self, msg: &msgs::CommitmentSigned, new_funding_txo: OutPoint,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+		responder_value_removal_sat: u64, fee_estimator: &LowerBoundedFeeEstimator<F>,
+		logger: &L,
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
-		let teleport_funding = self.teleport_funding(new_funding_txo);
+		let teleport_funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
 
 		let transaction_number = self.holder_commitment_point.current_transaction_number();
 		let commitment_point = self.holder_commitment_point.current_point().ok_or_else(|| {
@@ -7664,7 +7729,7 @@ where
 	}
 
 	fn promote_teleport_funding<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
 	) -> Option<ChannelMonitorUpdate> {
 		log_info!(
 			logger,
@@ -7675,7 +7740,7 @@ where
 		if let Some(scid) = self.funding.short_channel_id {
 			self.context.historical_scids.push(scid);
 		}
-		self.funding = self.teleport_funding(new_funding_txo);
+		self.funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
 		self.context.announcement_sigs = None;
 		self.context.announcement_sigs_state = AnnouncementSigsState::NotSent;
 
@@ -11279,7 +11344,7 @@ where
 		// plumbed into the new `FundingScope` when we eventually promote in
 		// `teleport_complete_ack`. Without this, the first MuSig2 partial sign after
 		// promote would use a stale nonce.
-		if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) =
+		if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, .. }) =
 			self.pending_teleport.as_ref()
 		{
 			let new_txid = new_funding_txo.txid;
@@ -13795,7 +13860,7 @@ where
 		let teleport_twin_params: Option<ChannelTransactionParameters> =
 			if let Some(prev_params) = self.pending_teleport_previous_funding.as_ref() {
 				Some(prev_params.clone())
-			} else if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) =
+			} else if let Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, .. }) =
 				self.pending_teleport.as_ref()
 			{
 				let mut params = self.funding.channel_transaction_parameters.clone();
@@ -14064,7 +14129,7 @@ where
 	}
 
 	pub fn teleport_channel<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
 	) -> Result<Option<msgs::Stfu>, APIError> {
 		if self.pending_teleport.is_some() {
 			return Err(APIError::APIMisuseError {
@@ -14099,10 +14164,13 @@ where
 			});
 		}
 
-		self.propose_quiescence(logger, QuiescentAction::Teleport { new_funding_txo })
-			.map_err(|_| APIError::APIMisuseError {
-				err: format!("Channel {} cannot begin teleport", self.context.channel_id()),
-			})
+		self.propose_quiescence(
+			logger,
+			QuiescentAction::Teleport { new_funding_txo, responder_value_removal_sat },
+		)
+		.map_err(|_| APIError::APIMisuseError {
+			err: format!("Channel {} cannot begin teleport", self.context.channel_id()),
+		})
 	}
 
 	pub fn funding_contributed<F: FeeEstimator, L: Logger>(
@@ -14315,15 +14383,20 @@ where
 		&mut self, logger: &L,
 	) -> Result<(msgs::TeleportAck, Option<msgs::CommitmentSigned>), APIError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport =
-					Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo });
+					Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo, responder_value_removal_sat });
 				// Generate our MuSig2 nonce for the new funding scope's first commitment so
 				// the initiator can partial-sign their commitment after handling our ack.
 				// See the equivalent comment in the TeleportInit construction path.
+				// Nonce-only — channel-value-delta args are immaterial here because
+				// `generate_local_nonce_pair` derives only from `funding_outpoint.txid` +
+				// `splice_parent_funding_txid`. Pass 0s.
 				let teleport_funding_params_only = FundingScope::for_teleport(
 					&self.funding,
 					new_funding_txo,
+					0,
+					0,
 					None,
 				);
 				let next_commitment_number =
@@ -14334,7 +14407,7 @@ where
 					&self.context.secp_ctx,
 				);
 				let commitment_signed =
-					self.get_initial_teleport_commitment_signed(new_funding_txo, logger);
+					self.get_initial_teleport_commitment_signed(new_funding_txo, responder_value_removal_sat, logger);
 				Ok((
 					msgs::TeleportAck {
 						channel_id: self.context.channel_id(),
@@ -14390,9 +14463,9 @@ where
 			});
 		}
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingLocalComplete { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingLocalComplete { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport =
-					Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo });
+					Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, responder_value_removal_sat });
 				Ok(msgs::TeleportComplete { channel_id: self.context.channel_id() })
 			},
 			Some(pending_teleport) => {
@@ -14434,6 +14507,50 @@ where
 			));
 		}
 
+		// Validate any responder-side value removal proposed by the initiator. The removal
+		// is "responder takes X sats off their own to_self"; the receiver of TeleportInit
+		// is by definition the responder, so the checks below are against THIS side's
+		// FundingScope values.
+		let removal_sat = msg.responder_value_removal_sat;
+		if removal_sat > 0 {
+			let removal_msat = removal_sat.checked_mul(1000).ok_or_else(|| {
+				ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} overflows when converted to msat",
+				))
+			})?;
+			if removal_msat > self.funding.value_to_self_msat {
+				return Err(ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} exceeds our value_to_self ({} msat)",
+					self.funding.value_to_self_msat,
+				)));
+			}
+			// Reserve check: post-removal value_to_self must remain at or above the reserve
+			// the counterparty selected for us (`counterparty_selected_channel_reserve_satoshis`).
+			if let Some(reserve_sat) = self.funding.counterparty_selected_channel_reserve_satoshis {
+				let reserve_msat = reserve_sat.saturating_mul(1000);
+				let new_value_to_self_msat = self.funding.value_to_self_msat - removal_msat;
+				if new_value_to_self_msat < reserve_msat {
+					return Err(ChannelError::close(format!(
+						"Teleport responder_value_removal_sat {removal_sat} would drop our value_to_self ({} msat) below the counterparty-selected reserve ({} msat)",
+						new_value_to_self_msat, reserve_msat,
+					)));
+				}
+			}
+			// Dust-floor check on the new channel value: must still hold both anchors + a
+			// non-zero balance per side. We accept this is a coarse lower bound; tighter
+			// HTLC-coverage checks are deferred (quiescence drains in-flight updates, so the
+			// only HTLCs present are already-committed, and BOLT3 already enforces dust
+			// on individual outputs).
+			let new_channel_value =
+				self.funding.get_value_satoshis().saturating_sub(removal_sat);
+			let min_viable_sat = 2 * ANCHOR_OUTPUT_VALUE_SATOSHI + MIN_CHAN_DUST_LIMIT_SATOSHIS;
+			if new_channel_value < min_viable_sat {
+				return Err(ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} would shrink channel_value to {new_channel_value} sat, below dust+anchors floor ({min_viable_sat} sat)",
+				)));
+			}
+		}
+
 		// MuSig2 channels: stash the initiator's nonce for the new funding scope so the
 		// first partial sign at `ack_teleport` time has the counterparty's nonce available.
 		// Empty for ECDSA channels.
@@ -14444,7 +14561,10 @@ where
 			.map(|(_, nonce)| *nonce);
 
 		self.pending_teleport =
-			Some(PendingTeleport::AwaitingUserDecision { new_funding_txo: msg.new_funding_txo });
+			Some(PendingTeleport::AwaitingUserDecision {
+				new_funding_txo: msg.new_funding_txo,
+				responder_value_removal_sat: msg.responder_value_removal_sat,
+			});
 		Ok(msg.new_funding_txo)
 	}
 
@@ -14452,7 +14572,7 @@ where
 		&mut self, msg: &msgs::TeleportAck, logger: &L,
 	) -> Result<Option<msgs::CommitmentSigned>, ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo, responder_value_removal_sat }) => {
 				self.mark_response_received();
 				// Stash the responder's nonce for the new funding scope (mirrors what
 				// `teleport_init` does for the responder).
@@ -14462,11 +14582,12 @@ where
 					.find(|(txid, _)| *txid == new_funding_txo.txid)
 					.map(|(_, nonce)| *nonce);
 				let commitment_signed =
-					self.get_initial_teleport_commitment_signed(new_funding_txo, logger);
+					self.get_initial_teleport_commitment_signed(new_funding_txo, responder_value_removal_sat, logger);
 				self.pending_teleport =
 					Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
 						new_funding_txo,
 						is_initiator: true,
+						responder_value_removal_sat,
 					});
 				Ok(commitment_signed)
 			},
@@ -14482,11 +14603,12 @@ where
 
 	pub(crate) fn teleport_ack_sent(&mut self) -> Result<(), ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingTeleportAckSend { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport =
 					Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
 						new_funding_txo,
 						is_initiator: false,
+						responder_value_removal_sat,
 					});
 				Ok(())
 			},
@@ -14520,9 +14642,9 @@ where
 		&mut self, _msg: &msgs::TeleportComplete, logger: &L,
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingRemoteComplete { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingRemoteComplete { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport =
-					Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo });
+					Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo, responder_value_removal_sat });
 				// Stash the pre-promote funding's `ChannelTransactionParameters` so that, if a
 				// `channel_reestablish` happens before the initiator has processed our
 				// `teleport_complete_ack`, we can still emit a MuSig2 nonce keyed by the
@@ -14533,7 +14655,7 @@ where
 				debug_assert!(self.pending_teleport_previous_funding.is_none());
 				self.pending_teleport_previous_funding =
 					Some(self.funding.channel_transaction_parameters.clone());
-				Ok(self.promote_teleport_funding(new_funding_txo, logger))
+				Ok(self.promote_teleport_funding(new_funding_txo, responder_value_removal_sat, logger))
 			},
 			Some(pending_teleport) => {
 				self.pending_teleport = Some(pending_teleport);
@@ -14547,10 +14669,11 @@ where
 
 	pub(crate) fn teleport_complete_ack_sent(&mut self) -> Result<bool, ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo, responder_value_removal_sat }) => {
 				self.pending_teleport = Some(
 					PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
 						new_funding_txo,
+						responder_value_removal_sat,
 					},
 				);
 				let exited_quiescence = self.context.channel_state.is_quiescent();
@@ -14588,13 +14711,13 @@ where
 		&mut self, _msg: &msgs::TeleportCompleteAck, logger: &L,
 	) -> Result<(bool, Option<ChannelMonitorUpdate>), ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo }) => {
+			Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, responder_value_removal_sat }) => {
 				self.mark_response_received();
 				let exited_quiescence = self.context.channel_state.is_quiescent();
 				self.context.channel_state.clear_quiescent();
 				Ok((
 					exited_quiescence,
-					self.promote_teleport_funding(new_funding_txo, logger),
+					self.promote_teleport_funding(new_funding_txo, responder_value_removal_sat, logger),
 				))
 			},
 			Some(pending_teleport) => {
@@ -14623,16 +14746,26 @@ where
 			)));
 		}
 
+		// Pull the agreed removal off `pending_teleport` (state at this point is
+		// `AwaitingRemoteCommitmentSigned`) BEFORE we sign — we'd otherwise re-enter
+		// `teleport_funding` looking it up from `pending_teleport` that was already
+		// `take()`d by an outer match somewhere, and end up signing at the wrong value.
+		let responder_value_removal_sat = self
+			.pending_teleport
+			.as_ref()
+			.map(|pt| pt.responder_value_removal_sat())
+			.unwrap_or(0);
 		let monitor_update = self.teleport_initial_commitment_signed(
 			msg,
 			new_funding_txo,
+			responder_value_removal_sat,
 			fee_estimator,
 			logger,
 		)?;
 		self.pending_teleport = Some(if is_initiator {
-			PendingTeleport::AwaitingLocalComplete { new_funding_txo }
+			PendingTeleport::AwaitingLocalComplete { new_funding_txo, responder_value_removal_sat }
 		} else {
-			PendingTeleport::AwaitingRemoteComplete { new_funding_txo }
+			PendingTeleport::AwaitingRemoteComplete { new_funding_txo, responder_value_removal_sat }
 		});
 		Ok(monitor_update)
 	}
@@ -16303,11 +16436,11 @@ where
 						.contributions.push(prior_contribution);
 					return Ok(Some(StfuResponse::SpliceInit(splice_init)));
 				},
-				Some(QuiescentAction::Teleport { new_funding_txo }) => {
+				Some(QuiescentAction::Teleport { new_funding_txo, responder_value_removal_sat }) => {
 					if self.pending_teleport.is_some() {
 						debug_assert!(false);
 						self.quiescent_action =
-							Some(QuiescentAction::Teleport { new_funding_txo });
+							Some(QuiescentAction::Teleport { new_funding_txo, responder_value_removal_sat });
 						return Err((
 							ChannelError::WarnAndDisconnect(
 								"Channel already has a teleport pending".to_owned(),
@@ -16317,7 +16450,10 @@ where
 					}
 
 					self.pending_teleport =
-						Some(PendingTeleport::AwaitingTeleportAck { new_funding_txo });
+						Some(PendingTeleport::AwaitingTeleportAck {
+							new_funding_txo,
+							responder_value_removal_sat,
+						});
 					// Generate our MuSig2 nonce for the new funding scope's first commitment
 					// so the counterparty can partial-sign our commitment in ack_teleport
 					// without a missing-nonce panic. The new scope here has signing_nonce
@@ -16326,8 +16462,10 @@ where
 					// `get_initial_counterparty_commitment_signatures` will use (the
 					// "current" commitment number — same as `holder_commitment_point.current_transaction_number()`
 					// since both sides are in sync at quiescence).
+					// Nonce-only construction (StfuResponse). Value-delta args are immaterial:
+					// `generate_local_nonce_pair` reads only the funding txid. Pass 0s.
 					let teleport_funding =
-						FundingScope::for_teleport(&self.funding, new_funding_txo, None);
+						FundingScope::for_teleport(&self.funding, new_funding_txo, 0, 0, None);
 					let next_commitment_number =
 						self.holder_commitment_point.current_transaction_number();
 					let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(
@@ -16339,6 +16477,7 @@ where
 						channel_id: self.context.channel_id,
 						new_funding_txo,
 						next_local_nonces: vec![(new_funding_txo.txid, next_local_nonce)],
+						responder_value_removal_sat,
 					})));
 				},
 				#[cfg(any(test, fuzzing, feature = "_test_utils"))]

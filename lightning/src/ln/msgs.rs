@@ -590,6 +590,19 @@ pub struct TeleportInit {
 	/// ECDSA signing); required for proto-taproot / Ark channels whose initial commitment
 	/// against the new funding scope cannot be signed without the counterparty's nonce.
 	pub next_local_nonces: Vec<(Txid, PublicNonce)>,
+	/// Satoshis the **responder** is removing from their channel balance as part of this
+	/// teleport. The new funding outpoint's value is `prev_channel_value - this`; the responder
+	/// reclaims the difference out-of-band (Ark fork: forfeit-TX claim of the old leaf vTXO).
+	///
+	/// Comes off the responder's `value_to_self_msat` only — the initiator's `value_to_self_msat`
+	/// is invariant across the teleport. See `FundingScope::for_teleport`.
+	///
+	/// `0` is the default and means "no value change" (existing teleport semantics).
+	///
+	/// This field is **declarative** from the initiator's perspective: the actual amount is
+	/// committed-to by the responder at leaf-cosign time (out of band). The responder
+	/// validates incoming `TeleportInit` against the value they signed; mismatch ⇒ abort.
+	pub responder_value_removal_sat: u64,
 }
 
 /// A `teleport_ack` message to be received by or sent to the teleport initiator.
@@ -3262,6 +3275,8 @@ impl_writeable_msg!(TeleportInit, {
 	new_funding_txo,
 }, {
 	(2, next_local_nonces, optional_vec),
+	// Default 0 preserves on-wire compat with peers that don't send this field.
+	(4, responder_value_removal_sat, (default_value, 0u64)),
 });
 
 impl_writeable_msg!(TeleportAck, {
