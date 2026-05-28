@@ -21,7 +21,7 @@ fn start_teleport<'a, 'b, 'c>(
 	let initiator_id = initiator.node.get_our_node_id();
 	let responder_id = responder.node.get_our_node_id();
 
-	initiator.node.teleport_channel(&channel_id, &responder_id, new_funding_txo).unwrap();
+	initiator.node.teleport_channel(&channel_id, &responder_id, new_funding_txo, 0).unwrap();
 
 	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);
 	responder.node.handle_stfu(initiator_id, &stfu);

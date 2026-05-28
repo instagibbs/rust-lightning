@@ -3285,6 +3285,10 @@ pub(crate) enum QuiescentAction {
 	},
 	Teleport {
 		new_funding_txo: OutPoint,
+		/// Sats the responder is removing from their side of the channel as part of this
+		/// teleport. `0` for value-preserving teleports (existing behavior). The bark refresh
+		/// coordinator sets this from the leaf-cosign result.
+		responder_value_removal_sat: u64,
 	},
 	#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 	DoNothing,
@@ -13806,7 +13810,7 @@ where
 	}
 
 	pub fn teleport_channel<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
 	) -> Result<Option<msgs::Stfu>, APIError> {
 		if self.pending_teleport.is_some() {
 			return Err(APIError::APIMisuseError {
@@ -13841,10 +13845,13 @@ where
 			});
 		}
 
-		self.propose_quiescence(logger, QuiescentAction::Teleport { new_funding_txo })
-			.map_err(|_| APIError::APIMisuseError {
-				err: format!("Channel {} cannot begin teleport", self.context.channel_id()),
-			})
+		self.propose_quiescence(
+			logger,
+			QuiescentAction::Teleport { new_funding_txo, responder_value_removal_sat },
+		)
+		.map_err(|_| APIError::APIMisuseError {
+			err: format!("Channel {} cannot begin teleport", self.context.channel_id()),
+		})
 	}
 
 	pub fn funding_contributed<F: FeeEstimator, L: Logger>(
@@ -14166,6 +14173,50 @@ where
 			return Err(ChannelError::WarnAndDisconnect(
 				"Teleport requested on a channel that is not live".to_owned(),
 			));
+		}
+
+		// Validate any responder-side value removal proposed by the initiator. The removal
+		// is "responder takes X sats off their own to_self"; the receiver of TeleportInit
+		// is by definition the responder, so the checks below are against THIS side's
+		// FundingScope values.
+		let removal_sat = msg.responder_value_removal_sat;
+		if removal_sat > 0 {
+			let removal_msat = removal_sat.checked_mul(1000).ok_or_else(|| {
+				ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} overflows when converted to msat",
+				))
+			})?;
+			if removal_msat > self.funding.value_to_self_msat {
+				return Err(ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} exceeds our value_to_self ({} msat)",
+					self.funding.value_to_self_msat,
+				)));
+			}
+			// Reserve check: post-removal value_to_self must remain at or above the reserve
+			// the counterparty selected for us (`counterparty_selected_channel_reserve_satoshis`).
+			if let Some(reserve_sat) = self.funding.counterparty_selected_channel_reserve_satoshis {
+				let reserve_msat = reserve_sat.saturating_mul(1000);
+				let new_value_to_self_msat = self.funding.value_to_self_msat - removal_msat;
+				if new_value_to_self_msat < reserve_msat {
+					return Err(ChannelError::close(format!(
+						"Teleport responder_value_removal_sat {removal_sat} would drop our value_to_self ({} msat) below the counterparty-selected reserve ({} msat)",
+						new_value_to_self_msat, reserve_msat,
+					)));
+				}
+			}
+			// Dust-floor check on the new channel value: must still hold both anchors + a
+			// non-zero balance per side. We accept this is a coarse lower bound; tighter
+			// HTLC-coverage checks are deferred (quiescence drains in-flight updates, so the
+			// only HTLCs present are already-committed, and BOLT3 already enforces dust
+			// on individual outputs).
+			let new_channel_value =
+				self.funding.get_value_satoshis().saturating_sub(removal_sat);
+			let min_viable_sat = 2 * ANCHOR_OUTPUT_VALUE_SATOSHI + MIN_CHAN_DUST_LIMIT_SATOSHIS;
+			if new_channel_value < min_viable_sat {
+				return Err(ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} would shrink channel_value to {new_channel_value} sat, below dust+anchors floor ({min_viable_sat} sat)",
+				)));
+			}
 		}
 
 		// MuSig2 channels: stash the initiator's nonce for the new funding scope so the
@@ -15876,11 +15927,11 @@ where
 						.contributions.push(prior_contribution);
 					return Ok(Some(StfuResponse::SpliceInit(splice_init)));
 				},
-				Some(QuiescentAction::Teleport { new_funding_txo }) => {
+				Some(QuiescentAction::Teleport { new_funding_txo, responder_value_removal_sat }) => {
 					if self.pending_teleport.is_some() {
 						debug_assert!(false);
 						self.quiescent_action =
-							Some(QuiescentAction::Teleport { new_funding_txo });
+							Some(QuiescentAction::Teleport { new_funding_txo, responder_value_removal_sat });
 						return Err((
 							ChannelError::WarnAndDisconnect(
 								"Channel already has a teleport pending".to_owned(),
@@ -15892,11 +15943,7 @@ where
 					self.pending_teleport =
 						Some(PendingTeleport::AwaitingTeleportAck {
 							new_funding_txo,
-							// LDK-only quiescent-action path: no value change. Ark-side
-							// integration sets this through a different code path (the
-							// refresh coordinator's explicit `initiate_teleport_with_value`
-							// API, added when liquidity-removal lands end-to-end).
-							responder_value_removal_sat: 0,
+							responder_value_removal_sat,
 						});
 					// Generate our MuSig2 nonce for the new funding scope's first commitment
 					// so the counterparty can partial-sign our commitment in ack_teleport
@@ -15921,10 +15968,7 @@ where
 						channel_id: self.context.channel_id,
 						new_funding_txo,
 						next_local_nonces: vec![(new_funding_txo.txid, next_local_nonce)],
-						// Default: no value change. Out-of-band agreement (Ark leaf-cosign)
-						// will populate this when ASP-side liquidity removal applies; for
-						// the current LDK-only quiescent-action path, always 0.
-						responder_value_removal_sat: 0,
+						responder_value_removal_sat,
 					})));
 				},
 				#[cfg(any(test, fuzzing, feature = "_test_utils"))]

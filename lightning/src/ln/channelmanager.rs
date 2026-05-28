@@ -4875,8 +4875,13 @@ impl<
 	///
 	/// This enters quiescence first and, once both peers are quiescent, sends `teleport_init` to
 	/// the counterparty containing `new_funding_txo`.
+	///
+	/// `responder_value_removal_sat` carries any out-of-band-agreed value reduction the responder
+	/// is taking off their side of the channel as part of this teleport (Ark refresh: ASP-side
+	/// liquidity extraction). Pass `0` for value-preserving teleports (the typical case).
 	pub fn teleport_channel(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
 	) -> Result<(), APIError> {
 		let mut result = Ok(());
 		PersistenceNotifierGuard::optionally_notify(self, || {
@@ -4905,7 +4910,7 @@ impl<
 				hash_map::Entry::Occupied(mut chan_entry) => {
 					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
 						let logger = WithChannelContext::from(&self.logger, &chan.context, None);
-						match chan.teleport_channel(new_funding_txo, &&logger) {
+						match chan.teleport_channel(new_funding_txo, responder_value_removal_sat, &&logger) {
 							Ok(stfu_opt) => {
 								if let Some(msg) = stfu_opt {
 									peer_state.pending_msg_events.push(
