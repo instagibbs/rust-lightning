@@ -2895,18 +2895,35 @@ impl FundingScope {
 	}
 
 	/// Constructs a `FundingScope` for teleporting a channel to a new funding outpoint.
+	///
+	/// `channel_value_delta_sat` and `local_value_to_self_delta_msat` are signed deltas applied
+	/// on top of `prev_funding`'s values. For value-preserving teleports both are 0 (existing
+	/// behavior). For responder-side liquidity removal of X sats during a refresh:
+	/// - both sides pass `channel_value_delta_sat = -X`
+	/// - the responder passes `local_value_to_self_delta_msat = -X*1000`
+	/// - the initiator passes `local_value_to_self_delta_msat = 0`
+	///
+	/// See `teleport_funding` on the channel for the side-aware wiring.
 	fn for_teleport(
 		prev_funding: &Self,
 		new_funding_txo: OutPoint,
+		channel_value_delta_sat: i64,
+		local_value_to_self_delta_msat: i64,
 		signing_nonce: Option<musig_secp::musig::PublicNonce>,
 	) -> Self {
 		let mut channel_transaction_parameters =
 			prev_funding.channel_transaction_parameters.clone();
 		channel_transaction_parameters.funding_outpoint = Some(new_funding_txo);
 		channel_transaction_parameters.splice_parent_funding_txid = None;
+		channel_transaction_parameters.channel_value_satoshis = (channel_transaction_parameters
+			.channel_value_satoshis as i64
+			+ channel_value_delta_sat) as u64;
+
+		let new_value_to_self_msat =
+			(prev_funding.value_to_self_msat as i64 + local_value_to_self_delta_msat) as u64;
 
 		Self {
-			value_to_self_msat: prev_funding.value_to_self_msat,
+			value_to_self_msat: new_value_to_self_msat,
 			counterparty_selected_channel_reserve_satoshis:
 				prev_funding.counterparty_selected_channel_reserve_satoshis,
 			holder_selected_channel_reserve_satoshis:
@@ -7487,9 +7504,30 @@ where
 	}
 
 	fn teleport_funding(&self, new_funding_txo: OutPoint) -> FundingScope {
+		// Apply any in-flight responder value removal carried on `pending_teleport`.
+		// `0` for value-preserving teleports (existing behavior).
+		//
+		// The teleport-initiator (refresh-initiator) is assumed to be the same side as
+		// the channel-open initiator in our refresh flow (client refreshes its own
+		// channel). If that ever changes, this needs revisiting.
+		let responder_value_removal_sat = self
+			.pending_teleport
+			.as_ref()
+			.map(|pt| pt.responder_value_removal_sat())
+			.unwrap_or(0);
+		let channel_value_delta_sat = -(responder_value_removal_sat as i64);
+		let local_value_to_self_delta_msat = if self.funding.is_outbound() {
+			// We are the channel-open + teleport initiator: our value_to_self is invariant.
+			0
+		} else {
+			// We are the responder: our value_to_self decreases by the removal.
+			-((responder_value_removal_sat as i64) * 1000)
+		};
 		FundingScope::for_teleport(
 			&self.funding,
 			new_funding_txo,
+			channel_value_delta_sat,
+			local_value_to_self_delta_msat,
 			self.pending_teleport_counterparty_nonce,
 		)
 	}
@@ -14012,9 +14050,14 @@ where
 				// Generate our MuSig2 nonce for the new funding scope's first commitment so
 				// the initiator can partial-sign their commitment after handling our ack.
 				// See the equivalent comment in the TeleportInit construction path.
+				// Nonce-only — channel-value-delta args are immaterial here because
+				// `generate_local_nonce_pair` derives only from `funding_outpoint.txid` +
+				// `splice_parent_funding_txid`. Pass 0s.
 				let teleport_funding_params_only = FundingScope::for_teleport(
 					&self.funding,
 					new_funding_txo,
+					0,
+					0,
 					None,
 				);
 				let next_commitment_number =
@@ -15863,8 +15906,10 @@ where
 					// `get_initial_counterparty_commitment_signatures` will use (the
 					// "current" commitment number — same as `holder_commitment_point.current_transaction_number()`
 					// since both sides are in sync at quiescence).
+					// Nonce-only construction (StfuResponse). Value-delta args are immaterial:
+					// `generate_local_nonce_pair` reads only the funding txid. Pass 0s.
 					let teleport_funding =
-						FundingScope::for_teleport(&self.funding, new_funding_txo, None);
+						FundingScope::for_teleport(&self.funding, new_funding_txo, 0, 0, None);
 					let next_commitment_number =
 						self.holder_commitment_point.current_transaction_number();
 					let next_local_nonce = self.context.holder_signer.generate_local_nonce_pair(
