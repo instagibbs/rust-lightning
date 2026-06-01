@@ -7507,18 +7507,12 @@ where
 		}
 	}
 
-	fn teleport_funding(&self, new_funding_txo: OutPoint) -> FundingScope {
-		// Apply any in-flight responder value removal carried on `pending_teleport`.
-		// `0` for value-preserving teleports (existing behavior).
-		//
+	fn teleport_funding(
+		&self, new_funding_txo: OutPoint, responder_value_removal_sat: u64,
+	) -> FundingScope {
 		// The teleport-initiator (refresh-initiator) is assumed to be the same side as
 		// the channel-open initiator in our refresh flow (client refreshes its own
 		// channel). If that ever changes, this needs revisiting.
-		let responder_value_removal_sat = self
-			.pending_teleport
-			.as_ref()
-			.map(|pt| pt.responder_value_removal_sat())
-			.unwrap_or(0);
 		let channel_value_delta_sat = -(responder_value_removal_sat as i64);
 		let local_value_to_self_delta_msat = if self.funding.is_outbound() {
 			// We are the channel-open + teleport initiator: our value_to_self is invariant.
@@ -7551,17 +7545,18 @@ where
 	}
 
 	fn get_initial_teleport_commitment_signed<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
 	) -> Option<msgs::CommitmentSigned> {
-		let funding = self.teleport_funding(new_funding_txo);
+		let funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
 		self.context.get_initial_commitment_signed_v2(&funding, logger)
 	}
 
 	fn teleport_initial_commitment_signed<F: FeeEstimator, L: Logger>(
 		&mut self, msg: &msgs::CommitmentSigned, new_funding_txo: OutPoint,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+		responder_value_removal_sat: u64, fee_estimator: &LowerBoundedFeeEstimator<F>,
+		logger: &L,
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
-		let teleport_funding = self.teleport_funding(new_funding_txo);
+		let teleport_funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
 
 		let transaction_number = self.holder_commitment_point.current_transaction_number();
 		let commitment_point = self.holder_commitment_point.current_point().ok_or_else(|| {
@@ -7620,7 +7615,7 @@ where
 	}
 
 	fn promote_teleport_funding<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
 	) -> Option<ChannelMonitorUpdate> {
 		log_info!(
 			logger,
@@ -7631,7 +7626,7 @@ where
 		if let Some(scid) = self.funding.short_channel_id {
 			self.context.historical_scids.push(scid);
 		}
-		self.funding = self.teleport_funding(new_funding_txo);
+		self.funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
 		self.context.announcement_sigs = None;
 		self.context.announcement_sigs_state = AnnouncementSigsState::NotSent;
 
@@ -14075,7 +14070,7 @@ where
 					&self.context.secp_ctx,
 				);
 				let commitment_signed =
-					self.get_initial_teleport_commitment_signed(new_funding_txo, logger);
+					self.get_initial_teleport_commitment_signed(new_funding_txo, responder_value_removal_sat, logger);
 				Ok((
 					msgs::TeleportAck {
 						channel_id: self.context.channel_id(),
@@ -14250,7 +14245,7 @@ where
 					.find(|(txid, _)| *txid == new_funding_txo.txid)
 					.map(|(_, nonce)| *nonce);
 				let commitment_signed =
-					self.get_initial_teleport_commitment_signed(new_funding_txo, logger);
+					self.get_initial_teleport_commitment_signed(new_funding_txo, responder_value_removal_sat, logger);
 				self.pending_teleport =
 					Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
 						new_funding_txo,
@@ -14323,7 +14318,7 @@ where
 				debug_assert!(self.pending_teleport_previous_funding.is_none());
 				self.pending_teleport_previous_funding =
 					Some(self.funding.channel_transaction_parameters.clone());
-				Ok(self.promote_teleport_funding(new_funding_txo, logger))
+				Ok(self.promote_teleport_funding(new_funding_txo, responder_value_removal_sat, logger))
 			},
 			Some(pending_teleport) => {
 				self.pending_teleport = Some(pending_teleport);
@@ -14379,13 +14374,13 @@ where
 		&mut self, _msg: &msgs::TeleportCompleteAck, logger: &L,
 	) -> Result<(bool, Option<ChannelMonitorUpdate>), ChannelError> {
 		match self.pending_teleport.take() {
-			Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, responder_value_removal_sat: _ }) => {
+			Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, responder_value_removal_sat }) => {
 				self.mark_response_received();
 				let exited_quiescence = self.context.channel_state.is_quiescent();
 				self.context.channel_state.clear_quiescent();
 				Ok((
 					exited_quiescence,
-					self.promote_teleport_funding(new_funding_txo, logger),
+					self.promote_teleport_funding(new_funding_txo, responder_value_removal_sat, logger),
 				))
 			},
 			Some(pending_teleport) => {
@@ -14414,17 +14409,22 @@ where
 			)));
 		}
 
-		let monitor_update = self.teleport_initial_commitment_signed(
-			msg,
-			new_funding_txo,
-			fee_estimator,
-			logger,
-		)?;
+		// Pull the agreed removal off `pending_teleport` (state at this point is
+		// `AwaitingRemoteCommitmentSigned`) BEFORE we sign — we'd otherwise re-enter
+		// `teleport_funding` looking it up from `pending_teleport` that was already
+		// `take()`d by an outer match somewhere, and end up signing at the wrong value.
 		let responder_value_removal_sat = self
 			.pending_teleport
 			.as_ref()
 			.map(|pt| pt.responder_value_removal_sat())
 			.unwrap_or(0);
+		let monitor_update = self.teleport_initial_commitment_signed(
+			msg,
+			new_funding_txo,
+			responder_value_removal_sat,
+			fee_estimator,
+			logger,
+		)?;
 		self.pending_teleport = Some(if is_initiator {
 			PendingTeleport::AwaitingLocalComplete { new_funding_txo, responder_value_removal_sat }
 		} else {
