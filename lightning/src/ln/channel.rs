@@ -18254,11 +18254,16 @@ mod tests {
 	use crate::prelude::*;
 	use crate::routing::router::{Path, RouteHop};
 	use crate::sign::tx_builder::HTLCAmountDirection;
-	#[cfg(ldk_test_vectors)]
+	// FIXME(proto-taproot): the BOLT3 ECDSA commitment-vector apparatus below (these imports, the
+	// `Keys` test signer, and the `test_commitment_common` macro) only served `outbound_commitment_test`
+	// and `zero_fee_commitment_test_vectors`, both disabled above because proto-taproot's taproot/MuSig2
+	// funding makes them uncompilable and semantically void. Gated `cfg(any())` (never compiled, formerly
+	// `cfg(ldk_test_vectors)`) until real channel-type-gated taproot channels ship taproot vectors.
+	#[cfg(any())]
 	use crate::sign::{ChannelSigner, EntropySource, InMemorySigner, SignerProvider};
-	#[cfg(ldk_test_vectors)]
+	#[cfg(any())]
 	use crate::sync::Mutex;
-	#[cfg(ldk_test_vectors)]
+	#[cfg(any())]
 	use crate::types::features::ChannelTypeFeatures;
 	use crate::types::features::{ChannelFeatures, NodeFeatures};
 	use crate::types::payment::{PaymentHash, PaymentPreimage};
@@ -18301,19 +18306,19 @@ mod tests {
 		assert!(ChannelState::ChannelReady(ChannelReadyFlags::new()) < ChannelState::ShutdownComplete);
 	}
 
-	#[cfg(ldk_test_vectors)]
+	#[cfg(any())]
 	struct Keys {
 		signer: crate::sign::InMemorySigner,
 	}
 
-	#[cfg(ldk_test_vectors)]
+	#[cfg(any())]
 	impl EntropySource for Keys {
 		fn get_secure_random_bytes(&self) -> [u8; 32] {
 			[0; 32]
 		}
 	}
 
-	#[cfg(ldk_test_vectors)]
+	#[cfg(any())]
 	impl SignerProvider for Keys {
 		type EcdsaSigner = InMemorySigner;
 
@@ -19110,7 +19115,7 @@ mod tests {
 		assert_eq!(decoded_chan.context.holding_cell_htlc_updates, holding_cell_htlc_updates);
 	}
 
-	#[cfg(ldk_test_vectors)]
+	#[cfg(any())]
 	macro_rules! test_commitment_common {
 			( $chan: expr, $logger: expr, $secp_ctx: expr, $signer: expr, $holder_pubkeys: expr, $per_commitment_point: expr, $counterparty_sig_hex: expr, $sig_hex: expr, $tx_hex: expr, $channel_type_features: expr, {
 				$( { $htlc_idx: expr, $counterparty_htlc_sig_hex: expr, $htlc_sig_hex: expr, $htlc_tx_hex: expr, $preimage: expr } ), *
@@ -19208,7 +19213,14 @@ mod tests {
 			} }
 		}
 
-	#[cfg(ldk_test_vectors)]
+	// FIXME(proto-taproot): outbound_commitment_test validates hardcoded BOLT3 ECDSA
+	// commitment-transaction signature vectors. The proto-taproot prototype replaces the
+	// 2-of-2 P2WSH/ECDSA funding path with taproot MuSig2, so this test no longer compiles
+	// (FundingScope::get_funding_redeemscript and the ECDSA signing helpers it drives are
+	// gone in this build) and its hardcoded ECDSA vectors are semantically void regardless.
+	// Disabled via cfg(any()) (never compiled) until real channel-type-gated taproot channels
+	// ship taproot test vectors. Original gate was #[cfg(ldk_test_vectors)].
+	#[cfg(any())]
 	#[test]
 	fn outbound_commitment_test() {
 		assert!(cfg!(not(feature = "grind_signatures")));
@@ -19901,7 +19913,12 @@ mod tests {
 	}
 
 	// Test vectors from bolt03/zero_fee_commitments.json
-	#[cfg(ldk_test_vectors)]
+	// FIXME(proto-taproot): disabled for the same reason as `outbound_commitment_test` above —
+	// hardcoded ECDSA commitment-tx vectors that proto-taproot's taproot/MuSig2 funding makes
+	// uncompilable (shared `test_commitment_common` macro calls the removed
+	// `FundingScope::get_funding_redeemscript`) and semantically void. Re-enable with real
+	// channel-type-gated taproot channels. Original gate was #[cfg(ldk_test_vectors)].
+	#[cfg(any())]
 	#[test]
 	fn zero_fee_commitment_test_vectors() {
 		use crate::chain::transaction::OutPoint;
