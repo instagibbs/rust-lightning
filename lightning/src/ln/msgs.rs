@@ -628,6 +628,15 @@ pub struct TeleportAbort {
 pub struct TeleportComplete {
 	/// The channel ID where teleport is intended.
 	pub channel_id: ChannelId,
+	/// Per-funding-scope nonces the sender will use for MuSig2 partial signing of the
+	/// counterparty's *first regular* commitment transaction against the promoted teleport
+	/// funding scope (the commitment after the teleport-initial/anchoring commitment).
+	///
+	/// The `next_local_nonces` carried by [`TeleportInit`]/[`TeleportAck`] only cover the
+	/// anchoring commitment; without a fresh nonce here the first `commitment_signed` after
+	/// promotion would be signed against a stale nonce and rejected. Keyed by the txid of the
+	/// new funding output. Empty on channel types that don't use MuSig2 partial sigs.
+	pub next_local_nonces: Vec<(Txid, PublicNonce)>,
 }
 
 /// A `teleport_complete_ack` message to be sent in response to `teleport_complete`.
@@ -635,6 +644,10 @@ pub struct TeleportComplete {
 pub struct TeleportCompleteAck {
 	/// The channel ID where teleport is intended.
 	pub channel_id: ChannelId,
+	/// Per-funding-scope nonces the sender will use for MuSig2 partial signing of the
+	/// counterparty's first regular commitment transaction against the promoted teleport
+	/// funding scope. See [`TeleportComplete::next_local_nonces`] for the full rationale.
+	pub next_local_nonces: Vec<(Txid, PublicNonce)>,
 }
 
 /// A [`tx_add_input`] message for adding an input during interactive transaction construction
@@ -3291,11 +3304,15 @@ impl_writeable_msg!(TeleportAbort, {
 
 impl_writeable_msg!(TeleportComplete, {
 	channel_id,
-}, {});
+}, {
+	(2, next_local_nonces, optional_vec),
+});
 
 impl_writeable_msg!(TeleportCompleteAck, {
 	channel_id,
-}, {});
+}, {
+	(2, next_local_nonces, optional_vec),
+});
 
 impl Writeable for TxAddInput {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {

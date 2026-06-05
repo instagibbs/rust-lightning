@@ -7316,12 +7316,12 @@ pub(super) struct FundedChannel<SP: SignerProvider> {
 	/// funding outpoint — the initiator hasn't promoted yet and its `next_local_nonces`
 	/// keying expects the OLD txid. Cleared once we observe peer activity past the
 	/// `TeleportCompleteAck` boundary
-	/// (see [`note_counterparty_post_teleport_complete_ack_activity`]).
+	/// (see `note_counterparty_post_teleport_complete_ack_activity`).
 	///
 	/// We store just the `ChannelTransactionParameters` rather than the full `FundingScope`
 	/// because `FundingScope` holds `Mutex` fields and isn't `Clone`. Nonce generation
 	/// only needs the channel-transaction-parameters anyway
-	/// (see [`crate::sign::ChannelSigner::generate_local_nonce_pair`]).
+	/// (see `generate_local_nonce_pair`).
 	pending_teleport_previous_funding: Option<ChannelTransactionParameters>,
 
 	/// Once we become quiescent, if we're the initiator, there's some action we'll want to take.
@@ -7643,17 +7643,64 @@ where
 		)
 	}
 
+	/// MuSig2 nonce for the new funding scope's first *regular* commitment after teleport
+	/// promotion. The teleport-initial (anchoring) commitment is signed with the nonce carried
+	/// by `TeleportInit`/`TeleportAck`; this covers the very next commitment so the first
+	/// `commitment_signed` after promotion has a fresh counterparty nonce to verify against.
+	/// Empty for channel types that don't use MuSig2 partial sigs.
+	fn teleport_completion_nonces(
+		&self, new_funding_txo: OutPoint,
+	) -> Vec<(Txid, PublicNonce)> {
+		let params = if self.funding.channel_transaction_parameters.funding_outpoint
+			== Some(new_funding_txo)
+		{
+			// Promoted side: the new scope is already `self.funding`.
+			self.funding.channel_transaction_parameters.clone()
+		} else {
+			// Not yet promoted: reconstruct the new scope's params. The nonce derives only
+			// from the funding txid, so the value-delta args are immaterial; pass 0s.
+			FundingScope::for_teleport(&self.funding, new_funding_txo, 0, 0, None)
+				.channel_transaction_parameters
+		};
+		let next_commitment_number = self.holder_commitment_point.next_transaction_number();
+		let nonce = self.context.holder_signer.generate_local_nonce_pair(
+			&params,
+			next_commitment_number,
+			&self.context.secp_ctx,
+		);
+		vec![(new_funding_txo.txid, nonce)]
+	}
+
+	/// Adopts the counterparty's post-teleport commitment nonce (from `TeleportComplete` /
+	/// `TeleportCompleteAck`) as the promoted scope's `signing_nonce`, replacing the stale
+	/// anchoring-commitment nonce so the first `commitment_signed` after promotion signs
+	/// against the right nonce. No-op for channel types that don't carry MuSig2 nonces.
+	fn adopt_teleport_completion_nonce(
+		&mut self, new_funding_txo: OutPoint, next_local_nonces: &[(Txid, PublicNonce)],
+	) {
+		if let Some(nonce) = next_local_nonces
+			.iter()
+			.find(|(txid, _)| *txid == new_funding_txo.txid)
+			.map(|(_, nonce)| *nonce)
+		{
+			self.funding.signing_nonce = Some(nonce);
+		}
+	}
+
 	fn get_pending_teleport_complete_ack(&self) -> Option<msgs::TeleportCompleteAck> {
 		self.pending_teleport.as_ref().and_then(|pending_teleport| {
-			if matches!(
-				pending_teleport,
-				PendingTeleport::AwaitingTeleportCompleteAckSend { .. }
-					| PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. }
-			) {
-				Some(msgs::TeleportCompleteAck { channel_id: self.context.channel_id() })
-			} else {
-				None
-			}
+			let new_funding_txo = match pending_teleport {
+				PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo, .. }
+				| PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+					new_funding_txo,
+					..
+				} => *new_funding_txo,
+				_ => return None,
+			};
+			Some(msgs::TeleportCompleteAck {
+				channel_id: self.context.channel_id(),
+				next_local_nonces: self.teleport_completion_nonces(new_funding_txo),
+			})
 		})
 	}
 
@@ -14464,9 +14511,13 @@ where
 		}
 		match self.pending_teleport.take() {
 			Some(PendingTeleport::AwaitingLocalComplete { new_funding_txo, responder_value_removal_sat }) => {
+				let next_local_nonces = self.teleport_completion_nonces(new_funding_txo);
 				self.pending_teleport =
 					Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, responder_value_removal_sat });
-				Ok(msgs::TeleportComplete { channel_id: self.context.channel_id() })
+				Ok(msgs::TeleportComplete {
+					channel_id: self.context.channel_id(),
+					next_local_nonces,
+				})
 			},
 			Some(pending_teleport) => {
 				self.pending_teleport = Some(pending_teleport);
@@ -14639,7 +14690,7 @@ where
 	}
 
 	pub(crate) fn teleport_complete<L: Logger>(
-		&mut self, _msg: &msgs::TeleportComplete, logger: &L,
+		&mut self, msg: &msgs::TeleportComplete, logger: &L,
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
 		match self.pending_teleport.take() {
 			Some(PendingTeleport::AwaitingRemoteComplete { new_funding_txo, responder_value_removal_sat }) => {
@@ -14655,7 +14706,12 @@ where
 				debug_assert!(self.pending_teleport_previous_funding.is_none());
 				self.pending_teleport_previous_funding =
 					Some(self.funding.channel_transaction_parameters.clone());
-				Ok(self.promote_teleport_funding(new_funding_txo, responder_value_removal_sat, logger))
+				let monitor_update =
+					self.promote_teleport_funding(new_funding_txo, responder_value_removal_sat, logger);
+				// Adopt the initiator's nonce for the new scope's first regular commitment,
+				// replacing the anchoring-commitment nonce promotion just installed.
+				self.adopt_teleport_completion_nonce(new_funding_txo, &msg.next_local_nonces);
+				Ok(monitor_update)
 			},
 			Some(pending_teleport) => {
 				self.pending_teleport = Some(pending_teleport);
@@ -14708,17 +14764,19 @@ where
 	}
 
 	pub(crate) fn teleport_complete_ack<L: Logger>(
-		&mut self, _msg: &msgs::TeleportCompleteAck, logger: &L,
+		&mut self, msg: &msgs::TeleportCompleteAck, logger: &L,
 	) -> Result<(bool, Option<ChannelMonitorUpdate>), ChannelError> {
 		match self.pending_teleport.take() {
 			Some(PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, responder_value_removal_sat }) => {
 				self.mark_response_received();
 				let exited_quiescence = self.context.channel_state.is_quiescent();
 				self.context.channel_state.clear_quiescent();
-				Ok((
-					exited_quiescence,
-					self.promote_teleport_funding(new_funding_txo, responder_value_removal_sat, logger),
-				))
+				let monitor_update =
+					self.promote_teleport_funding(new_funding_txo, responder_value_removal_sat, logger);
+				// Adopt the responder's nonce for the new scope's first regular commitment,
+				// replacing the anchoring-commitment nonce promotion just installed.
+				self.adopt_teleport_completion_nonce(new_funding_txo, &msg.next_local_nonces);
+				Ok((exited_quiescence, monitor_update))
 			},
 			Some(pending_teleport) => {
 				self.pending_teleport = Some(pending_teleport);
