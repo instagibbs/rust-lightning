@@ -96,6 +96,41 @@ fn test_option_zero_fee_commitments_from_zero_htlc_anchors_initial() {
 	)
 }
 
+#[test]
+fn test_option_ark_channel_initial() {
+	// When both sides advertise the Ark channel type and the local node opts into it,
+	// get_initial_channel_type should return the Ark channel type (not anchors / static-remote-key).
+	let expected_type = ChannelTypeFeatures::ark_channel();
+
+	do_test_get_initial_channel_type(
+		UserConfig::default(),
+		InitFeatures::empty(),
+		ChannelTypeFeatures::only_static_remote_key(),
+		|cfg: &mut UserConfig| {
+			cfg.channel_handshake_config.negotiate_ark_channel = true;
+		},
+		|their_features: &mut InitFeatures| {
+			their_features.set_ark_channel_optional();
+		},
+		expected_type,
+	)
+}
+
+#[test]
+fn test_supports_ark_channel() {
+	// Tests that if both sides support and negotiate `ark_channel`, it is the resulting
+	// `channel_type`, and that it uses zero-fee commitment shape (feerate == 0).
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_ark_channel = true;
+
+	let expected_channel_type = ChannelTypeFeatures::ark_channel();
+	assert!(expected_channel_type.requires_ark_channel());
+	assert!(expected_channel_type.requires_static_remote_key());
+	assert!(expected_channel_type.requires_anchor_zero_fee_commitments());
+
+	do_test_supports_channel_type(config, expected_channel_type)
+}
+
 fn do_test_get_initial_channel_type<F1, F2>(
 	start_cfg: UserConfig, start_features: InitFeatures, start_type: ChannelTypeFeatures,
 	mut local_cfg_mod: F1, mut remote_features_mod: F2, channel_type: ChannelTypeFeatures,

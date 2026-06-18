@@ -17236,6 +17236,13 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 		features.set_anchor_zero_fee_commitments_optional();
 	}
 
+	if config.channel_handshake_config.negotiate_ark_channel {
+		features.set_ark_channel_optional();
+		// ArkChannel implies anchor_zero_fee_commitments and static_remote_key; advertise them
+		// so the peer can recognise the dependency bundle in InitFeatures.
+		features.set_anchor_zero_fee_commitments_optional();
+	}
+
 	if config.enable_htlc_hold {
 		features.set_htlc_hold_optional();
 	}

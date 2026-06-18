@@ -14216,6 +14216,15 @@ pub(super) fn get_initial_channel_type(
 		ret.set_scid_privacy_required();
 	}
 
+	// If both sides advertise the Ark channel type, prefer it over everything else — Ark has its
+	// own funding (P2WSH 2-of-2), commitment shape (zero_fee_commitments), and is not compatible
+	// with plain anchors or zero-fee-commitments alone.
+	if config.channel_handshake_config.negotiate_ark_channel
+		&& their_features.supports_ark_channel()
+	{
+		return ChannelTypeFeatures::ark_channel();
+	}
+
 	// Optionally, if the user would like to negotiate `option_zero_fee_commitments` we set it now.
 	// If they don't understand it (or we don't want it), we check the same conditions for
 	// `option_anchors_zero_fee_htlc_tx`. The counterparty can still refuse the channel and we'll

@@ -238,6 +238,13 @@ pub struct ChannelHandshakeConfig {
 	///
 	/// [`max_htlcs`]: crate::ln::chan_utils::max_htlcs
 	pub our_max_accepted_htlcs: u16,
+
+	/// Ark-on-Lightning: if `true`, advertise and prefer the `ArkChannel` channel type when both
+	/// sides support it. The Ark channel type uses stock P2WSH 2-of-2 funding with the
+	/// `zero_fee_commitments` commit-TX shape (v3/TRUC + P2A anchor, 0-fee).
+	///
+	/// Default value: `false`.
+	pub negotiate_ark_channel: bool,
 }
 
 impl Default for ChannelHandshakeConfig {
@@ -254,6 +261,7 @@ impl Default for ChannelHandshakeConfig {
 			negotiate_anchors_zero_fee_htlc_tx: true,
 			negotiate_anchor_zero_fee_commitments: false,
 			our_max_accepted_htlcs: 50,
+			negotiate_ark_channel: false,
 		}
 	}
 }
@@ -276,6 +284,7 @@ impl Readable for ChannelHandshakeConfig {
 			negotiate_anchors_zero_fee_htlc_tx: Readable::read(reader)?,
 			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
+			negotiate_ark_channel: Readable::read(reader)?,
 		})
 	}
 }
