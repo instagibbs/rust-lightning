@@ -1587,6 +1587,31 @@ pub enum Event {
 		/// The features that this channel will operate with, if available.
 		channel_type: Option<ChannelTypeFeatures>,
 	},
+	/// Ark bridge: indicates the channel counterparty has requested a teleport of this channel to
+	/// a new funding outpoint (over quiescence). The user should validate the request out of band
+	/// and then call [`ChannelManager::ack_teleport`] to proceed or [`ChannelManager::cancel_teleport`]
+	/// to reject it.
+	///
+	/// # Failure Behavior and Persistence
+	/// This event will eventually be replayed after failures-to-handle (i.e., the event handler
+	/// returning `Err(ReplayEvent ())`), but won't be persisted across restarts.
+	///
+	/// [`ChannelManager::ack_teleport`]: crate::ln::channelmanager::ChannelManager::ack_teleport
+	/// [`ChannelManager::cancel_teleport`]: crate::ln::channelmanager::ChannelManager::cancel_teleport
+	ChannelTeleport {
+		/// The `channel_id` of the channel undergoing teleport.
+		channel_id: ChannelId,
+		/// The `user_channel_id` value passed in to [`ChannelManager::create_channel`] for outbound
+		/// channels, or to [`ChannelManager::accept_inbound_channel`] for inbound channels.
+		///
+		/// [`ChannelManager::create_channel`]: crate::ln::channelmanager::ChannelManager::create_channel
+		/// [`ChannelManager::accept_inbound_channel`]: crate::ln::channelmanager::ChannelManager::accept_inbound_channel
+		user_channel_id: u128,
+		/// The `node_id` of the channel counterparty.
+		counterparty_node_id: PublicKey,
+		/// The replacement funding outpoint provided by the initiator.
+		new_funding_txo: OutPoint,
+	},
 	/// Used to indicate to the user that they can abandon the funding transaction and recycle the
 	/// inputs for another purpose.
 	///
@@ -2389,6 +2414,11 @@ impl Writeable for Event {
 					(9, abandoned_funding_txo, option),
 				});
 			},
+			&Event::ChannelTeleport { .. } => {
+				53u8.write(writer)?;
+				// Never write ChannelTeleport events: teleport attempts before `teleport_ack` are
+				// abandoned on disconnect/restart.
+			},
 			// Note that, going forward, all new events must only write data inside of
 			// `write_tlv_fields`. Versions 0.0.101+ will ignore odd-numbered events that write
 			// data via `write_tlv_fields`.
@@ -3042,6 +3072,10 @@ impl MaybeReadable for Event {
 					}))
 				};
 				f()
+			},
+			53u8 => {
+				// Value 53 is used for `Event::ChannelTeleport`, which is never written with a body.
+				Ok(None)
 			},
 			// Versions prior to 0.0.100 did not ignore odd types, instead returning InvalidValue.
 			// Version 0.0.100 failed to properly ignore odd types, possibly resulting in corrupt

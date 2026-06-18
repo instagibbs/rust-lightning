@@ -6524,6 +6524,294 @@ impl<
 		result
 	}
 
+	/// Ark bridge: initiates a channel teleport after the replacement funding outpoint has been
+	/// negotiated out of band.
+	///
+	/// This enters quiescence first and, once both peers are quiescent, sends `teleport_init` to
+	/// the counterparty containing `new_funding_txo`.
+	///
+	/// `responder_value_removal_sat` carries any out-of-band-agreed value reduction the responder
+	/// is taking off their side of the channel as part of this teleport (Ark refresh: ASP-side
+	/// liquidity extraction). Pass `0` for value-preserving teleports (the typical case).
+	pub fn teleport_channel(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+	) -> Result<(), APIError> {
+		let mut result = Ok(());
+		PersistenceNotifierGuard::optionally_notify(self, || {
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex = match per_peer_state
+				.get(counterparty_node_id)
+				.ok_or_else(|| APIError::no_such_peer(counterparty_node_id))
+			{
+				Ok(peer_state_mutex) => peer_state_mutex,
+				Err(err) => {
+					result = Err(err);
+					return NotifyOption::SkipPersistNoEvents;
+				},
+			};
+
+			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &mut *peer_state_lock;
+			if !peer_state.latest_features.supports_quiescence() {
+				result = Err(APIError::ChannelUnavailable {
+					err: "Peer does not support quiescence, a teleport prerequisite".to_owned(),
+				});
+				return NotifyOption::SkipPersistNoEvents;
+			}
+
+			match peer_state.channel_by_id.entry(*channel_id) {
+				hash_map::Entry::Occupied(mut chan_entry) => {
+					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+						let logger = WithChannelContext::from(&self.logger, &chan.context, None);
+						match chan.teleport_channel(
+							new_funding_txo,
+							responder_value_removal_sat,
+							&&logger,
+						) {
+							Ok(stfu_opt) => {
+								if let Some(msg) = stfu_opt {
+									peer_state.pending_msg_events.push(MessageSendEvent::SendStfu {
+										node_id: *counterparty_node_id,
+										msg,
+									});
+								}
+								result = Ok(());
+								NotifyOption::DoPersist
+							},
+							Err(err) => {
+								result = Err(err);
+								NotifyOption::SkipPersistNoEvents
+							},
+						}
+					} else {
+						result = Err(APIError::ChannelUnavailable {
+							err: format!(
+								"Channel with id {} is not funded, cannot teleport it",
+								channel_id
+							),
+						});
+						NotifyOption::SkipPersistNoEvents
+					}
+				},
+				hash_map::Entry::Vacant(_) => {
+					result =
+						Err(APIError::no_such_channel_for_peer(channel_id, counterparty_node_id));
+					NotifyOption::SkipPersistNoEvents
+				},
+			}
+		});
+		result
+	}
+
+	/// Ark bridge: acknowledges a [`Event::ChannelTeleport`] and sends `teleport_ack` (plus the
+	/// new-scope `commitment_signed`) to the initiator.
+	///
+	/// [`Event::ChannelTeleport`]: crate::events::Event::ChannelTeleport
+	pub fn ack_teleport(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+	) -> Result<(), APIError> {
+		let mut result = Ok(());
+		PersistenceNotifierGuard::optionally_notify(self, || {
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex = match per_peer_state
+				.get(counterparty_node_id)
+				.ok_or_else(|| APIError::no_such_peer(counterparty_node_id))
+			{
+				Ok(peer_state_mutex) => peer_state_mutex,
+				Err(err) => {
+					result = Err(err);
+					return NotifyOption::SkipPersistNoEvents;
+				},
+			};
+
+			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &mut *peer_state_lock;
+			match peer_state.channel_by_id.entry(*channel_id) {
+				hash_map::Entry::Occupied(mut chan_entry) => {
+					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+						let logger = WithChannelContext::from(&self.logger, &chan.context, None);
+						match chan.ack_teleport(&&logger) {
+							Ok((msg, commitment_signed)) => {
+								peer_state.pending_msg_events.push(
+									MessageSendEvent::SendTeleportAck {
+										node_id: *counterparty_node_id,
+										msg,
+									},
+								);
+								if let Some(commitment_signed) = commitment_signed {
+									peer_state.pending_msg_events.push(
+										MessageSendEvent::UpdateHTLCs {
+											node_id: *counterparty_node_id,
+											channel_id: *channel_id,
+											updates: CommitmentUpdate {
+												commitment_signed: vec![commitment_signed],
+												update_add_htlcs: vec![],
+												update_fulfill_htlcs: vec![],
+												update_fail_htlcs: vec![],
+												update_fail_malformed_htlcs: vec![],
+												update_fee: None,
+											},
+										},
+									);
+								}
+								result = Ok(());
+								NotifyOption::DoPersist
+							},
+							Err(err) => {
+								result = Err(err);
+								NotifyOption::SkipPersistNoEvents
+							},
+						}
+					} else {
+						result = Err(APIError::ChannelUnavailable {
+							err: format!(
+								"Channel with id {} is not funded, cannot acknowledge teleport",
+								channel_id
+							),
+						});
+						NotifyOption::SkipPersistNoEvents
+					}
+				},
+				hash_map::Entry::Vacant(_) => {
+					result =
+						Err(APIError::no_such_channel_for_peer(channel_id, counterparty_node_id));
+					NotifyOption::SkipPersistNoEvents
+				},
+			}
+		});
+		result
+	}
+
+	/// Ark bridge: rejects a pending [`Event::ChannelTeleport`] and sends `teleport_abort` to the
+	/// initiator.
+	///
+	/// [`Event::ChannelTeleport`]: crate::events::Event::ChannelTeleport
+	pub fn cancel_teleport(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+	) -> Result<(), APIError> {
+		let mut result = Ok(());
+		let mut holding_cell_res = Vec::new();
+		let persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex = match per_peer_state
+				.get(counterparty_node_id)
+				.ok_or_else(|| APIError::no_such_peer(counterparty_node_id))
+			{
+				Ok(peer_state_mutex) => peer_state_mutex,
+				Err(err) => {
+					result = Err(err);
+					return NotifyOption::SkipPersistNoEvents;
+				},
+			};
+
+			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &mut *peer_state_lock;
+			match peer_state.channel_by_id.entry(*channel_id) {
+				hash_map::Entry::Occupied(mut chan_entry) => {
+					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+						match chan.cancel_teleport() {
+							Ok((msg, exited_quiescence)) => {
+								peer_state.pending_msg_events.push(
+									MessageSendEvent::SendTeleportAbort {
+										node_id: *counterparty_node_id,
+										msg,
+									},
+								);
+								if exited_quiescence {
+									holding_cell_res = self.check_free_peer_holding_cells(peer_state);
+								}
+								result = Ok(());
+								NotifyOption::DoPersist
+							},
+							Err(err) => {
+								result = Err(err);
+								NotifyOption::SkipPersistNoEvents
+							},
+						}
+					} else {
+						result = Err(APIError::ChannelUnavailable {
+							err: format!(
+								"Channel with id {} is not funded, cannot cancel teleport",
+								channel_id
+							),
+						});
+						NotifyOption::SkipPersistNoEvents
+					}
+				},
+				hash_map::Entry::Vacant(_) => {
+					result =
+						Err(APIError::no_such_channel_for_peer(channel_id, counterparty_node_id));
+					NotifyOption::SkipPersistNoEvents
+				},
+			}
+		});
+		drop(persistence_guard);
+		let _read_guard = self.total_consistency_lock.read().unwrap();
+		self.handle_holding_cell_free_result(holding_cell_res);
+		result
+	}
+
+	/// Ark bridge: completes a previously acknowledged teleport as the initiator, sending
+	/// `teleport_complete` to the counterparty.
+	pub fn complete_teleport(
+		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
+	) -> Result<(), APIError> {
+		let mut result = Ok(());
+		PersistenceNotifierGuard::optionally_notify(self, || {
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex = match per_peer_state
+				.get(counterparty_node_id)
+				.ok_or_else(|| APIError::no_such_peer(counterparty_node_id))
+			{
+				Ok(peer_state_mutex) => peer_state_mutex,
+				Err(err) => {
+					result = Err(err);
+					return NotifyOption::SkipPersistNoEvents;
+				},
+			};
+
+			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &mut *peer_state_lock;
+			match peer_state.channel_by_id.entry(*channel_id) {
+				hash_map::Entry::Occupied(mut chan_entry) => {
+					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+						match chan.complete_teleport() {
+							Ok(msg) => {
+								peer_state.pending_msg_events.push(
+									MessageSendEvent::SendTeleportComplete {
+										node_id: *counterparty_node_id,
+										msg,
+									},
+								);
+								result = Ok(());
+								NotifyOption::DoPersist
+							},
+							Err(err) => {
+								result = Err(err);
+								NotifyOption::SkipPersistNoEvents
+							},
+						}
+					} else {
+						result = Err(APIError::ChannelUnavailable {
+							err: format!(
+								"Channel with id {} is not funded, cannot complete teleport",
+								channel_id
+							),
+						});
+						NotifyOption::SkipPersistNoEvents
+					}
+				},
+				hash_map::Entry::Vacant(_) => {
+					result =
+						Err(APIError::no_such_channel_for_peer(channel_id, counterparty_node_id));
+					NotifyOption::SkipPersistNoEvents
+				},
+			}
+		});
+		result
+	}
+
 	/// Adds or removes funds from the given channel as specified by a [`FundingContribution`].
 	///
 	/// Used after [`ChannelManager::splice_channel`] by constructing a [`FundingContribution`]
@@ -10554,6 +10842,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				updates.announcement_sigs,
 				updates.tx_signatures,
 				None,
+				updates.teleport_complete_ack,
 				updates.channel_ready_order,
 			);
 			if let Some(upd) = channel_update {
@@ -10705,6 +10994,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		funding_broadcastable: Option<Transaction>,
 		channel_ready: Option<msgs::ChannelReady>, announcement_sigs: Option<msgs::AnnouncementSignatures>,
 		tx_signatures: Option<msgs::TxSignatures>, tx_abort: Option<msgs::TxAbort>,
+		teleport_complete_ack: Option<msgs::TeleportCompleteAck>,
 		channel_ready_order: ChannelReadyOrder,
 	) -> (Vec<PendingAddHTLCInfo>, Option<(u64, Vec<msgs::UpdateAddHTLC>)>) {
 		let logger = WithChannelContext::from(&self.logger, &channel.context, None);
@@ -10791,6 +11081,12 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			}
 			if let Some(msg) = tx_abort {
 				pending_msg_events.push(MessageSendEvent::SendTxAbort {
+					node_id: counterparty_node_id,
+					msg,
+				});
+			}
+			if let Some(msg) = teleport_complete_ack {
+				pending_msg_events.push(MessageSendEvent::SendTeleportCompleteAck {
 					node_id: counterparty_node_id,
 					msg,
 				});
@@ -12821,6 +13117,13 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							});
 							Ok(true)
 						},
+						Some(StfuResponse::TeleportInit(msg)) => {
+							peer_state.pending_msg_events.push(MessageSendEvent::SendTeleportInit {
+								node_id: *counterparty_node_id,
+								msg,
+							});
+							Ok(true)
+						},
 					}
 				} else {
 					let msg = "Peer sent `stfu` for an unfunded channel";
@@ -12980,7 +13283,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						let (htlc_forwards, decode_update_add_htlcs) = self.handle_channel_resumption(
 							&mut peer_state.pending_msg_events, chan, responses.raa, responses.commitment_update, responses.commitment_order,
 							Vec::new(), Vec::new(), None, responses.channel_ready, responses.announcement_sigs,
-							responses.tx_signatures, responses.tx_abort, responses.channel_ready_order,
+							responses.tx_signatures, responses.tx_abort, responses.teleport_complete_ack, responses.channel_ready_order,
 						);
 						debug_assert!(htlc_forwards.is_empty());
 						debug_assert!(decode_update_add_htlcs.is_none());
@@ -13041,6 +13344,291 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		}
 
 		Ok(())
+	}
+
+	fn internal_teleport_init(
+		&self, counterparty_node_id: &PublicKey, msg: &msgs::TeleportInit,
+	) -> Result<(), MsgHandleErrInternal> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id).ok_or_else(|| {
+			MsgHandleErrInternal::unreachable_no_such_peer(counterparty_node_id, msg.channel_id)
+		})?;
+		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+		let peer_state = &mut *peer_state_lock;
+
+		match peer_state.channel_by_id.entry(msg.channel_id) {
+			hash_map::Entry::Vacant(_) => Err(MsgHandleErrInternal::no_such_channel_for_peer(
+				counterparty_node_id,
+				msg.channel_id,
+			)),
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					let new_funding_txo =
+						try_channel_entry!(self, peer_state, chan.teleport_init(msg), chan_entry);
+					self.pending_events.lock().unwrap().push_back((
+						events::Event::ChannelTeleport {
+							channel_id: chan.context.channel_id(),
+							user_channel_id: chan.context.get_user_id(),
+							counterparty_node_id: *counterparty_node_id,
+							new_funding_txo: new_funding_txo.into_bitcoin_outpoint(),
+						},
+						None,
+					));
+					Ok(())
+				} else {
+					try_channel_entry!(
+						self,
+						peer_state,
+						Err(ChannelError::close("Channel is not funded, cannot teleport".into())),
+						chan_entry
+					)
+				}
+			},
+		}
+	}
+
+	fn internal_teleport_ack(
+		&self, counterparty_node_id: &PublicKey, msg: &msgs::TeleportAck,
+	) -> Result<(), MsgHandleErrInternal> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id).ok_or_else(|| {
+			MsgHandleErrInternal::unreachable_no_such_peer(counterparty_node_id, msg.channel_id)
+		})?;
+		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+		let peer_state = &mut *peer_state_lock;
+
+		match peer_state.channel_by_id.entry(msg.channel_id) {
+			hash_map::Entry::Vacant(_) => Err(MsgHandleErrInternal::no_such_channel_for_peer(
+				counterparty_node_id,
+				msg.channel_id,
+			)),
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					let logger = WithChannelContext::from(&self.logger, &chan.context, None);
+					let commitment_signed = try_channel_entry!(
+						self,
+						peer_state,
+						chan.teleport_ack(msg, &&logger),
+						chan_entry
+					);
+					if let Some(commitment_signed) = commitment_signed {
+						peer_state.pending_msg_events.push(MessageSendEvent::UpdateHTLCs {
+							node_id: *counterparty_node_id,
+							channel_id: msg.channel_id,
+							updates: CommitmentUpdate {
+								commitment_signed: vec![commitment_signed],
+								update_add_htlcs: vec![],
+								update_fulfill_htlcs: vec![],
+								update_fail_htlcs: vec![],
+								update_fail_malformed_htlcs: vec![],
+								update_fee: None,
+							},
+						});
+					}
+					Ok(())
+				} else {
+					try_channel_entry!(
+						self,
+						peer_state,
+						Err(ChannelError::close("Channel is not funded, cannot teleport".into())),
+						chan_entry
+					)
+				}
+			},
+		}
+	}
+
+	fn internal_teleport_abort(
+		&self, counterparty_node_id: &PublicKey, msg: &msgs::TeleportAbort,
+	) -> Result<(), MsgHandleErrInternal> {
+		let holding_cell_res = {
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex = per_peer_state.get(counterparty_node_id).ok_or_else(|| {
+				MsgHandleErrInternal::unreachable_no_such_peer(counterparty_node_id, msg.channel_id)
+			})?;
+			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &mut *peer_state_lock;
+
+			match peer_state.channel_by_id.entry(msg.channel_id) {
+				hash_map::Entry::Vacant(_) => {
+					return Err(MsgHandleErrInternal::no_such_channel_for_peer(
+						counterparty_node_id,
+						msg.channel_id,
+					))
+				},
+				hash_map::Entry::Occupied(mut chan_entry) => {
+					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+						let exited_quiescence = try_channel_entry!(
+							self,
+							peer_state,
+							chan.teleport_abort(msg),
+							chan_entry
+						);
+						if exited_quiescence {
+							self.check_free_peer_holding_cells(peer_state)
+						} else {
+							Vec::new()
+						}
+					} else {
+						return try_channel_entry!(
+							self,
+							peer_state,
+							Err(ChannelError::close(
+								"Channel is not funded, cannot teleport".into()
+							)),
+							chan_entry
+						);
+					}
+				},
+			}
+		};
+
+		self.handle_holding_cell_free_result(holding_cell_res);
+		Ok(())
+	}
+
+	fn internal_teleport_complete(
+		&self, counterparty_node_id: &PublicKey, msg: &msgs::TeleportComplete,
+	) -> Result<(), MsgHandleErrInternal> {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex = per_peer_state.get(counterparty_node_id).ok_or_else(|| {
+			MsgHandleErrInternal::unreachable_no_such_peer(counterparty_node_id, msg.channel_id)
+		})?;
+		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+		let peer_state = &mut *peer_state_lock;
+
+		match peer_state.channel_by_id.entry(msg.channel_id) {
+			hash_map::Entry::Vacant(_) => Err(MsgHandleErrInternal::no_such_channel_for_peer(
+				counterparty_node_id,
+				msg.channel_id,
+			)),
+			hash_map::Entry::Occupied(mut chan_entry) => {
+				if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+					let logger = WithChannelContext::from(&self.logger, &chan.context, None);
+					let monitor_update_opt = try_channel_entry!(
+						self,
+						peer_state,
+						chan.teleport_complete(msg, &&logger),
+						chan_entry
+					);
+					if let Some(monitor_update) = monitor_update_opt {
+						let funding_txo = chan
+							.funding
+							.get_funding_txo()
+							.expect("Funded channel should always have a funding outpoint");
+						if let Some(data) = self.handle_new_monitor_update(
+							&mut peer_state.in_flight_monitor_updates,
+							&mut peer_state.monitor_update_blocked_actions,
+							&mut peer_state.pending_msg_events,
+							peer_state.is_connected,
+							chan,
+							funding_txo,
+							monitor_update,
+						) {
+							mem::drop(peer_state_lock);
+							mem::drop(per_peer_state);
+							self.handle_post_monitor_update_chan_resume(data);
+						}
+					}
+					Ok(())
+				} else {
+					try_channel_entry!(
+						self,
+						peer_state,
+						Err(ChannelError::close("Channel is not funded, cannot teleport".into())),
+						chan_entry
+					)
+				}
+			},
+		}
+	}
+
+	fn internal_teleport_complete_ack(
+		&self, counterparty_node_id: &PublicKey, msg: &msgs::TeleportCompleteAck,
+	) -> Result<(), MsgHandleErrInternal> {
+		let mut post_update_data = None;
+		let holding_cell_res = {
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex = per_peer_state.get(counterparty_node_id).ok_or_else(|| {
+				MsgHandleErrInternal::unreachable_no_such_peer(counterparty_node_id, msg.channel_id)
+			})?;
+			let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &mut *peer_state_lock;
+
+			match peer_state.channel_by_id.entry(msg.channel_id) {
+				hash_map::Entry::Vacant(_) => {
+					return Err(MsgHandleErrInternal::no_such_channel_for_peer(
+						counterparty_node_id,
+						msg.channel_id,
+					))
+				},
+				hash_map::Entry::Occupied(mut chan_entry) => {
+					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+						let logger = WithChannelContext::from(&self.logger, &chan.context, None);
+						let (exited_quiescence, monitor_update_opt) = try_channel_entry!(
+							self,
+							peer_state,
+							chan.teleport_complete_ack(msg, &&logger),
+							chan_entry
+						);
+						if let Some(monitor_update) = monitor_update_opt {
+							let funding_txo = chan
+								.funding
+								.get_funding_txo()
+								.expect("Funded channel should always have a funding outpoint");
+							if let Some(data) = self.handle_new_monitor_update(
+								&mut peer_state.in_flight_monitor_updates,
+								&mut peer_state.monitor_update_blocked_actions,
+								&mut peer_state.pending_msg_events,
+								peer_state.is_connected,
+								chan,
+								funding_txo,
+								monitor_update,
+							) {
+								post_update_data = Some(data);
+							}
+						}
+						if exited_quiescence {
+							self.check_free_peer_holding_cells(peer_state)
+						} else {
+							Vec::new()
+						}
+					} else {
+						return try_channel_entry!(
+							self,
+							peer_state,
+							Err(ChannelError::close(
+								"Channel is not funded, cannot teleport".into()
+							)),
+							chan_entry
+						);
+					}
+				},
+			}
+		};
+
+		if let Some(data) = post_update_data {
+			self.handle_post_monitor_update_chan_resume(data);
+		}
+		self.handle_holding_cell_free_result(holding_cell_res);
+		Ok(())
+	}
+
+	/// Ark bridge: when the counterparty demonstrates post-promotion activity (any normal-operation
+	/// message after a teleport completed), clear the responder's lingering teleport state.
+	fn note_post_teleport_complete_ack_activity(
+		&self, counterparty_node_id: &PublicKey, channel_id: ChannelId,
+	) {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let Some(peer_state_mutex) = per_peer_state.get(counterparty_node_id) else {
+			return;
+		};
+		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+		if let Some(chan) =
+			peer_state_lock.channel_by_id.get_mut(&channel_id).and_then(Channel::as_funded_mut)
+		{
+			chan.note_counterparty_post_teleport_complete_ack_activity();
+		}
 	}
 
 	/// Handle incoming splice request, transition channel to splice-pending (unless some check fails).
@@ -15221,6 +15809,12 @@ impl<
 							&MessageSendEvent::SendSpliceInit { .. } => false,
 							&MessageSendEvent::SendSpliceAck { .. } => false,
 							&MessageSendEvent::SendSpliceLocked { .. } => false,
+							// Teleport
+							&MessageSendEvent::SendTeleportInit { .. } => false,
+							&MessageSendEvent::SendTeleportAck { .. } => false,
+							&MessageSendEvent::SendTeleportAbort { .. } => false,
+							&MessageSendEvent::SendTeleportComplete { .. } => false,
+							&MessageSendEvent::SendTeleportCompleteAck { .. } => false,
 							// Interactive Transaction Construction
 							&MessageSendEvent::SendTxAddInput { .. } => false,
 							&MessageSendEvent::SendTxAddOutput { .. } => false,
@@ -15465,16 +16059,69 @@ impl<
 
 			let mut is_any_peer_connected = false;
 			let mut pending_events = Vec::new();
+			let mut holding_cell_results = Vec::new();
 			let per_peer_state = self.per_peer_state.read().unwrap();
 			for (_cp_id, peer_state_mutex) in per_peer_state.iter() {
 				let mut peer_state_lock = peer_state_mutex.lock().unwrap();
 				let peer_state = &mut *peer_state_lock;
+
+				// Ark bridge: as our queued teleport (complete-)acks are about to leave the
+				// outbound queue, advance the teleport state machine off the *-Send states.
+				let teleport_ack_channels: Vec<_> = peer_state
+					.pending_msg_events
+					.iter()
+					.filter_map(|event| match event {
+						MessageSendEvent::SendTeleportAck { msg, .. } => Some(msg.channel_id),
+						_ => None,
+					})
+					.collect();
+				for channel_id in teleport_ack_channels {
+					if let Some(chan) = peer_state
+						.channel_by_id
+						.get_mut(&channel_id)
+						.and_then(Channel::as_funded_mut)
+					{
+						if chan.teleport_ack_sent().is_ok() {
+							result = NotifyOption::DoPersist;
+						}
+					}
+				}
+
+				let teleport_complete_ack_channels: Vec<_> = peer_state
+					.pending_msg_events
+					.iter()
+					.filter_map(|event| match event {
+						MessageSendEvent::SendTeleportCompleteAck { msg, .. } => Some(msg.channel_id),
+						_ => None,
+					})
+					.collect();
+				let mut exited_quiescence = false;
+				for channel_id in teleport_complete_ack_channels {
+					if let Some(chan) = peer_state
+						.channel_by_id
+						.get_mut(&channel_id)
+						.and_then(Channel::as_funded_mut)
+					{
+						if let Ok(exited) = chan.teleport_complete_ack_sent() {
+							exited_quiescence |= exited;
+							result = NotifyOption::DoPersist;
+						}
+					}
+				}
+				if exited_quiescence {
+					holding_cell_results.push(self.check_free_peer_holding_cells(peer_state));
+				}
+
 				if peer_state.pending_msg_events.len() > 0 {
 					pending_events.append(&mut peer_state.pending_msg_events);
 				}
 				if peer_state.is_connected {
 					is_any_peer_connected = true
 				}
+			}
+			drop(per_peer_state);
+			for holding_cell_res in holding_cell_results {
+				self.handle_holding_cell_free_result(holding_cell_res);
 			}
 
 			// Ensure that we are connected to some peers before getting broadcast messages.
@@ -16254,6 +16901,78 @@ impl<
 	fn handle_splice_locked(&self, counterparty_node_id: PublicKey, msg: &msgs::SpliceLocked) {
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let res = self.internal_splice_locked(&counterparty_node_id, msg);
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
+			let persist = match &res {
+				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
+				Err(_) => NotifyOption::SkipPersistHandleEvents,
+				Ok(()) => NotifyOption::DoPersist,
+			};
+			let _ = self.handle_error(res, counterparty_node_id);
+			persist
+		});
+	}
+
+	fn handle_teleport_init(&self, counterparty_node_id: PublicKey, msg: &msgs::TeleportInit) {
+		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
+			let res = self.internal_teleport_init(&counterparty_node_id, msg);
+			let persist = match &res {
+				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
+				Err(_) => NotifyOption::SkipPersistHandleEvents,
+				Ok(()) => NotifyOption::SkipPersistHandleEvents,
+			};
+			let _ = self.handle_error(res, counterparty_node_id);
+			persist
+		});
+	}
+
+	fn handle_teleport_ack(&self, counterparty_node_id: PublicKey, msg: &msgs::TeleportAck) {
+		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
+			let res = self.internal_teleport_ack(&counterparty_node_id, msg);
+			let persist = match &res {
+				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
+				Err(_) => NotifyOption::SkipPersistHandleEvents,
+				Ok(()) => NotifyOption::DoPersist,
+			};
+			let _ = self.handle_error(res, counterparty_node_id);
+			persist
+		});
+	}
+
+	fn handle_teleport_abort(&self, counterparty_node_id: PublicKey, msg: &msgs::TeleportAbort) {
+		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
+			let res = self.internal_teleport_abort(&counterparty_node_id, msg);
+			let persist = match &res {
+				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
+				Err(_) => NotifyOption::SkipPersistHandleEvents,
+				Ok(()) => NotifyOption::DoPersist,
+			};
+			let _ = self.handle_error(res, counterparty_node_id);
+			persist
+		});
+	}
+
+	fn handle_teleport_complete(
+		&self, counterparty_node_id: PublicKey, msg: &msgs::TeleportComplete,
+	) {
+		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
+			let res = self.internal_teleport_complete(&counterparty_node_id, msg);
+			let persist = match &res {
+				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
+				Err(_) => NotifyOption::SkipPersistHandleEvents,
+				Ok(()) => NotifyOption::DoPersist,
+			};
+			let _ = self.handle_error(res, counterparty_node_id);
+			persist
+		});
+	}
+
+	fn handle_teleport_complete_ack(
+		&self, counterparty_node_id: PublicKey, msg: &msgs::TeleportCompleteAck,
+	) {
+		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
+			let res = self.internal_teleport_complete_ack(&counterparty_node_id, msg);
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
 				Err(_) => NotifyOption::SkipPersistHandleEvents,
@@ -16267,12 +16986,18 @@ impl<
 	fn handle_shutdown(&self, counterparty_node_id: PublicKey, msg: &msgs::Shutdown) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_shutdown(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
 	fn handle_closing_signed(&self, counterparty_node_id: PublicKey, msg: &msgs::ClosingSigned) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_closing_signed(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
@@ -16296,6 +17021,11 @@ impl<
 		// `commitment_signed` message afterwards will.
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let res = self.internal_update_add_htlc(&counterparty_node_id, msg);
+			if res.is_ok() {
+				// Ark bridge: post-promotion traffic from the counterparty resolves a lingering
+				// teleport on our (responder) side before any subsequent commitment dance.
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
 				Err(_) => NotifyOption::SkipPersistHandleEvents,
@@ -16310,7 +17040,11 @@ impl<
 		&self, counterparty_node_id: PublicKey, msg: msgs::UpdateFulfillHTLC,
 	) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let channel_id = msg.channel_id;
 		let res = self.internal_update_fulfill_htlc(&counterparty_node_id, msg);
+		if res.is_ok() {
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
@@ -16320,6 +17054,9 @@ impl<
 		// `commitment_signed` message afterwards will.
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let res = self.internal_update_fail_htlc(&counterparty_node_id, msg);
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
 				Err(_) => NotifyOption::SkipPersistHandleEvents,
@@ -16338,6 +17075,9 @@ impl<
 		// only the `commitment_signed` message afterwards will.
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let res = self.internal_update_fail_malformed_htlc(&counterparty_node_id, msg);
+			if res.is_ok() {
+				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+			}
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
 				Err(_) => NotifyOption::SkipPersistHandleEvents,
@@ -16353,6 +17093,11 @@ impl<
 	) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_commitment_signed(&counterparty_node_id, msg);
+		if res.is_ok() {
+			// Ark bridge: post-promotion traffic from the counterparty resolves a lingering
+			// teleport on our (responder) side.
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
@@ -16368,6 +17113,11 @@ impl<
 	fn handle_revoke_and_ack(&self, counterparty_node_id: PublicKey, msg: &msgs::RevokeAndACK) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_revoke_and_ack(&counterparty_node_id, msg);
+		if res.is_ok() {
+			// Ark bridge: post-promotion traffic from the counterparty resolves a lingering
+			// teleport on our (responder) side.
+			self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+		}
 		let _ = self.handle_error(res, counterparty_node_id);
 	}
 
