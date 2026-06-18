@@ -83,6 +83,12 @@ pub(crate) const MIN_ACCEPTED_HTLC_SCRIPT_WEIGHT: usize = 136;
 /// This is the maximum post-anchor value.
 pub const MAX_ACCEPTED_HTLC_SCRIPT_WEIGHT: usize = 143;
 
+/// Upper bound on the extra bytes the Ark-on-Lightning success-path CSV suffix can add to an HTLC
+/// witness script. The suffix is `<delta> OP_CSV OP_DROP`; a 2-byte push (for deltas 128..=65535)
+/// plus 1-byte OP_CSV plus 1-byte OP_DROP gives 4 bytes, and for pathologically large pushes up
+/// to 5. We budget 5 so callers don't need to think about push encoding.
+pub(crate) const MAX_ARK_HTLC_SUCCESS_CSV_SUFFIX: usize = 5;
+
 /// The upper bound weight of an anchor input.
 #[cfg(feature = "grind_signatures")]
 pub const ANCHOR_INPUT_WITNESS_WEIGHT: u64 = 114;
@@ -149,13 +155,39 @@ pub(crate) const BASE_INPUT_WEIGHT: u64 = BASE_INPUT_SIZE * WITNESS_SCALE_FACTOR
 pub(crate) const P2WSH_TXOUT_WEIGHT: u64 =
 	(8 /* value */ + 1 /* var_int */ + 34/* p2wsh spk */) * WITNESS_SCALE_FACTOR as u64;
 
+/// Weight added to an HTLC witness script (and therefore to the HTLC-Success / HTLC-Timeout 2nd
+/// stage tx weights) by the Ark-on-Lightning success-path CSV suffix for a given delta. The
+/// suffix is `<delta> OP_CSV OP_DROP`; `OP_CSV` and `OP_DROP` are one byte each, while the push
+/// for `delta` is 1 byte for `1..=16` (OP_PUSHNUM_N), 2 bytes for `17..=127` (OP_PUSHBYTES_1 +
+/// byte), and 3 bytes for `128..=65535` (OP_PUSHBYTES_2 + 2 bytes). Returns 0 when no delta is
+/// set so non-Ark channels keep their baseline weight.
+#[inline]
+pub fn ark_htlc_success_csv_suffix_weight(success_csv_delta: Option<u16>) -> u64 {
+	match success_csv_delta {
+		None => 0,
+		Some(d) => {
+			let push_bytes: u64 = if d <= 16 { 1 } else if d <= 127 { 2 } else { 3 };
+			push_bytes + 2
+		},
+	}
+}
+
 /// Gets the weight for an HTLC-Success transaction.
 #[inline]
 #[rustfmt::skip]
 pub fn htlc_success_tx_weight(channel_type_features: &ChannelTypeFeatures) -> u64 {
+	htlc_success_tx_weight_with_ark(channel_type_features, None)
+}
+
+/// Gets the weight for an HTLC-Success transaction, accounting for the Ark success-path CSV
+/// suffix if `ark_htlc_success_csv_delta` is `Some`.
+#[inline]
+#[rustfmt::skip]
+pub fn htlc_success_tx_weight_with_ark(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	const HTLC_SUCCESS_TX_WEIGHT: u64 = 703;
 	const HTLC_SUCCESS_ANCHOR_TX_WEIGHT: u64 = 706;
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { HTLC_SUCCESS_ANCHOR_TX_WEIGHT } else { HTLC_SUCCESS_TX_WEIGHT }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { HTLC_SUCCESS_ANCHOR_TX_WEIGHT } else { HTLC_SUCCESS_TX_WEIGHT };
+	base + ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 /// Gets the weight of a single input-output pair in externally funded HTLC-success transactions
@@ -174,9 +206,20 @@ pub fn aggregated_htlc_success_input_output_pair_weight(
 #[inline]
 #[rustfmt::skip]
 pub fn htlc_timeout_tx_weight(channel_type_features: &ChannelTypeFeatures) -> u64 {
+	htlc_timeout_tx_weight_with_ark(channel_type_features, None)
+}
+
+/// Gets the weight for an HTLC-Timeout transaction, accounting for the Ark success-path CSV
+/// suffix if `ark_htlc_success_csv_delta` is `Some`. Even though the extra CSV lives in the
+/// success branch, it still inflates the witness script size, which is part of the witness used
+/// by the timeout spend path too.
+#[inline]
+#[rustfmt::skip]
+pub fn htlc_timeout_tx_weight_with_ark(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	const HTLC_TIMEOUT_TX_WEIGHT: u64 = 663;
 	const HTLC_TIMEOUT_ANCHOR_TX_WEIGHT: u64 = 666;
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { HTLC_TIMEOUT_ANCHOR_TX_WEIGHT } else { HTLC_TIMEOUT_TX_WEIGHT }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { HTLC_TIMEOUT_ANCHOR_TX_WEIGHT } else { HTLC_TIMEOUT_TX_WEIGHT };
+	base + ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 /// Gets the weight of a single input-output pair in externally funded HTLC-timeout transactions
@@ -718,6 +761,12 @@ pub struct HTLCOutputInCommitment {
 	/// below the dust limit (in which case no output appears in the commitment transaction and the
 	/// value is spent to additional transaction fees).
 	pub transaction_output_index: Option<u32>,
+	/// Ark-on-Lightning: when `Some`, the preimage-revealing (success) branch of the HTLC output
+	/// script is encumbered with an additional relative timelock of this many blocks. This lets
+	/// the broadcaster's timeout path win any race against the countersignatory's success path,
+	/// so the Ark server never has to unroll the tree to time an HTLC out. `None` preserves the
+	/// standard BOLT-3 script shape.
+	pub ark_htlc_success_csv_delta: Option<u16>,
 }
 
 impl HTLCOutputInCommitment {
@@ -735,6 +784,7 @@ impl HTLCOutputInCommitment {
 			&& self.amount_msat == other.amount_msat
 			&& self.cltv_expiry == other.cltv_expiry
 			&& self.payment_hash == other.payment_hash
+			&& self.ark_htlc_success_csv_delta == other.ark_htlc_success_csv_delta
 	}
 }
 
@@ -744,6 +794,7 @@ impl_writeable_tlv_based!(HTLCOutputInCommitment, {
 	(4, cltv_expiry, required),
 	(6, payment_hash, required),
 	(8, transaction_output_index, option),
+	(11, ark_htlc_success_csv_delta, option),
 });
 
 #[inline]
@@ -774,8 +825,14 @@ pub(crate) fn get_htlc_redeemscript_with_explicit_keys(htlc: &HTLCOutputInCommit
 		              .push_opcode(opcodes::all::OP_HASH160)
 		              .push_slice(&payment_hash160)
 		              .push_opcode(opcodes::all::OP_EQUALVERIFY)
-		              .push_opcode(opcodes::all::OP_CHECKSIG)
-		              .push_opcode(opcodes::all::OP_ENDIF);
+		              .push_opcode(opcodes::all::OP_CHECKSIG);
+		if let Some(delta) = htlc.ark_htlc_success_csv_delta {
+			debug_assert!(delta > 0, "ark success csv delta must be non-zero");
+			bldr = bldr.push_int(delta as i64)
+				.push_opcode(opcodes::all::OP_CSV)
+				.push_opcode(opcodes::all::OP_DROP);
+		}
+		bldr = bldr.push_opcode(opcodes::all::OP_ENDIF);
 		if channel_type_features.supports_anchors_zero_fee_htlc_tx() {
 			bldr = bldr.push_opcode(opcodes::all::OP_PUSHNUM_1)
 				.push_opcode(opcodes::all::OP_CSV)
@@ -804,8 +861,14 @@ pub(crate) fn get_htlc_redeemscript_with_explicit_keys(htlc: &HTLCOutputInCommit
 		              .push_opcode(opcodes::all::OP_SWAP)
 		              .push_slice(&broadcaster_htlc_key.to_public_key().serialize())
 		              .push_int(2)
-		              .push_opcode(opcodes::all::OP_CHECKMULTISIG)
-		              .push_opcode(opcodes::all::OP_ELSE)
+		              .push_opcode(opcodes::all::OP_CHECKMULTISIG);
+		if let Some(delta) = htlc.ark_htlc_success_csv_delta {
+			debug_assert!(delta > 0, "ark success csv delta must be non-zero");
+			bldr = bldr.push_int(delta as i64)
+				.push_opcode(opcodes::all::OP_CSV)
+				.push_opcode(opcodes::all::OP_DROP);
+		}
+		bldr = bldr.push_opcode(opcodes::all::OP_ELSE)
 		              .push_opcode(opcodes::all::OP_DROP)
 		              .push_int(htlc.cltv_expiry as i64)
 		              .push_opcode(opcodes::all::OP_CLTV)
@@ -892,13 +955,21 @@ pub fn build_htlc_transaction(
 
 #[rustfmt::skip]
 pub(crate) fn build_htlc_input(commitment_txid: &Txid, htlc: &HTLCOutputInCommitment, channel_type_features: &ChannelTypeFeatures) -> TxIn {
+	let baseline_csv = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { 1 } else { 0 };
+	// When the HTLC carries an Ark success-branch CSV delta, the HTLC-Success tx spending this
+	// input must satisfy that relative timelock too. The HTLC-Timeout tx spends through a
+	// different script branch that doesn't have the Ark CSV, but using the same nSequence for
+	// both 2nd-stage txs is still valid (it's >= the baseline anchor CSV) and keeps the pre-
+	// signed tx templates symmetric across both parties.
+	let ark_csv = htlc.ark_htlc_success_csv_delta.unwrap_or(0) as u32;
+	let sequence = core::cmp::max(baseline_csv, ark_csv);
 	TxIn {
 		previous_output: OutPoint {
 			txid: commitment_txid.clone(),
 			vout: htlc.transaction_output_index.expect("Can't build an HTLC transaction for a dust output"),
 		},
 		script_sig: ScriptBuf::new(),
-		sequence: Sequence(if channel_type_features.supports_anchors_zero_fee_htlc_tx() { 1 } else { 0 }),
+		sequence: Sequence(sequence),
 		witness: Witness::new(),
 	}
 }
@@ -1075,6 +1146,12 @@ pub struct ChannelTransactionParameters {
 	pub channel_type_features: ChannelTypeFeatures,
 	/// The value locked in the channel, denominated in satoshis.
 	pub channel_value_satoshis: u64,
+	/// Ark-on-Lightning: when `Some`, every HTLC output in this channel's commitment transactions
+	/// carries an extra relative timelock of this many blocks on the preimage-revealing (success)
+	/// branch. This is the self-enforcing race edge that lets the ASP's HTLC-Timeout path win
+	/// against the client's HTLC-Success path, so the Ark server never has to unroll the tree to
+	/// resolve an HTLC. `None` preserves the standard BOLT-3 channel semantics.
+	pub ark_htlc_success_csv_delta: Option<u16>,
 }
 
 /// Late-bound per-channel counterparty data used to build transactions.
@@ -1160,6 +1237,7 @@ impl ChannelTransactionParameters {
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::empty(),
 			channel_value_satoshis,
+			ark_htlc_success_csv_delta: None,
 		}
 	}
 }
@@ -1183,6 +1261,7 @@ impl Writeable for ChannelTransactionParameters {
 			(11, self.channel_type_features, required),
 			(12, self.splice_parent_funding_txid, option),
 			(13, self.channel_value_satoshis, required),
+			(15, self.ark_htlc_success_csv_delta, option),
 		});
 		Ok(())
 	}
@@ -1200,6 +1279,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 		let mut _legacy_deserialization_prevention_marker: Option<()> = None;
 		let mut channel_type_features = None;
 		let mut channel_value_satoshis = None;
+		let mut ark_htlc_success_csv_delta: Option<u16> = None;
 
 		read_tlv_fields!(reader, {
 			(0, holder_pubkeys, required),
@@ -1211,6 +1291,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			(11, channel_type_features, option),
 			(12, splice_parent_funding_txid, option),
 			(13, channel_value_satoshis, option),
+			(15, ark_htlc_success_csv_delta, option),
 		});
 
 		let channel_value_satoshis = match read_args {
@@ -1238,6 +1319,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			splice_parent_funding_txid,
 			channel_type_features: channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key()),
 			channel_value_satoshis,
+			ark_htlc_success_csv_delta,
 		})
 	}
 }
@@ -1367,6 +1449,7 @@ impl HolderCommitmentTransaction {
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 			channel_value_satoshis,
+			ark_htlc_success_csv_delta: None,
 		};
 		let mut counterparty_htlc_sigs = Vec::new();
 		for _ in 0..nondust_htlcs.len() {
@@ -2304,6 +2387,7 @@ mod tests {
 				splice_parent_funding_txid: None,
 				channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 				channel_value_satoshis: 4000,
+				ark_htlc_success_csv_delta: None,
 			};
 
 			Self {
@@ -2389,6 +2473,7 @@ mod tests {
 			cltv_expiry: 100,
 			payment_hash: PaymentHash([42; 32]),
 			transaction_output_index: None,
+			ark_htlc_success_csv_delta: None,
 		};
 
 		let offered_htlc = HTLCOutputInCommitment {
@@ -2397,6 +2482,7 @@ mod tests {
 			cltv_expiry: 100,
 			payment_hash: PaymentHash([43; 32]),
 			transaction_output_index: None,
+			ark_htlc_success_csv_delta: None,
 		};
 
 		// Generate broadcaster output and received and offered HTLC outputs, w/o anchors
@@ -2958,6 +3044,7 @@ mod tests {
 			cltv_expiry: 123,
 			payment_hash: PaymentHash([0xbb; 32]),
 			transaction_output_index: Some(0),
+			ark_htlc_success_csv_delta: None,
 		};
 
 		// Check amount sorting
@@ -2982,5 +3069,127 @@ mod tests {
 		big_htlc.transaction_output_index = Some(1);
 
 		swap_htlcs!(small_htlc, big_htlc);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn test_ark_htlc_redeemscript_adds_success_csv() {
+		// Verifies that setting `ark_htlc_success_csv_delta` on an HTLCOutputInCommitment causes
+		// `get_htlc_redeemscript` to emit a `<delta> OP_CSV OP_DROP` suffix inside the
+		// preimage-revealing (success) branch, while leaving the timeout branch alone. This is
+		// what lets the broadcaster's timeout path win the race against the countersignatory's
+		// success path, so the ASP never has to unroll the Ark tree to time an HTLC out.
+		//
+		// Also verifies that non-Ark HTLC scripts/weights are byte-for-byte unchanged.
+		use crate::util::ser::{Readable, Writeable};
+		use bitcoin::script::Instruction;
+
+		let mut builder = TestCommitmentTxBuilder::new();
+		// Use anchors_zero_htlc_fee_and_dependencies so the standard script already has a 1 OP_CSV
+		// for the outer anchor delay; the Ark variant should add a second one.
+		builder.channel_parameters.channel_type_features =
+			ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
+
+		let mk_htlc = |offered: bool, hash: [u8; 32], delta: Option<u16>| HTLCOutputInCommitment {
+			offered,
+			amount_msat: if offered { 600_000 } else { 400_000 },
+			cltv_expiry: 100,
+			payment_hash: PaymentHash(hash),
+			transaction_output_index: None,
+			ark_htlc_success_csv_delta: delta,
+		};
+
+		let success_csv_delta: u16 = 48;
+
+		// Build a commitment tx to get TxCreationKeys that match the parameters.
+		let std_received = mk_htlc(false, [42; 32], None);
+		let std_offered  = mk_htlc(true,  [43; 32], None);
+		let tx = builder.build(3000, 0, vec![std_received.clone(), std_offered.clone()]);
+		let keys = tx.trust().keys();
+		let features = ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
+
+		let ark_received = mk_htlc(false, [42; 32], Some(success_csv_delta));
+		let ark_offered  = mk_htlc(true,  [43; 32], Some(success_csv_delta));
+
+		let std_offered_script  = get_htlc_redeemscript(&std_offered,  &features, &keys);
+		let ark_offered_script  = get_htlc_redeemscript(&ark_offered,  &features, &keys);
+		let std_received_script = get_htlc_redeemscript(&std_received, &features, &keys);
+		let ark_received_script = get_htlc_redeemscript(&ark_received, &features, &keys);
+
+		// With a 48-block delta, push_int(48) encodes as OP_PUSHBYTES_1 0x30 (2 bytes); OP_CSV
+		// and OP_DROP each take one byte. Both offered and received Ark variants grow by exactly
+		// 4 bytes relative to the standard scripts.
+		assert_eq!(
+			ark_offered_script.len(), std_offered_script.len() + 4,
+			"ark offered script should grow by exactly the success-csv suffix size",
+		);
+		assert_eq!(
+			ark_received_script.len(), std_received_script.len() + 4,
+			"ark received script should grow by exactly the success-csv suffix size",
+		);
+
+		// The standard anchor scripts already contain a single OP_CSV for the outer 1-block
+		// anchor delay; the Ark variants should contain exactly two.
+		let count_csv = |script: &ScriptBuf| -> usize {
+			script.instructions().filter_map(Result::ok).filter(|ins| {
+				matches!(ins, Instruction::Op(op) if *op == bitcoin::opcodes::all::OP_CSV)
+			}).count()
+		};
+		assert_eq!(count_csv(&std_offered_script),  1, "standard offered should have 1 OP_CSV (anchor)");
+		assert_eq!(count_csv(&ark_offered_script),  2, "ark offered should have 2 OP_CSV (anchor + success)");
+		assert_eq!(count_csv(&std_received_script), 1, "standard received should have 1 OP_CSV (anchor)");
+		assert_eq!(count_csv(&ark_received_script), 2, "ark received should have 2 OP_CSV (anchor + success)");
+
+		// Spot-check: a delta that encodes as a single byte (OP_PUSHNUM_1..16) grows by only 3.
+		let ark_offered_small        = mk_htlc(true, [43; 32], Some(12));
+		let ark_offered_small_script = get_htlc_redeemscript(&ark_offered_small, &features, &keys);
+		assert_eq!(ark_offered_small_script.len(), std_offered_script.len() + 3);
+
+		// Round-trip the struct through TLV to verify the new field serializes cleanly.
+		let mut buf = Vec::new();
+		ark_offered.write(&mut buf).unwrap();
+		let decoded: HTLCOutputInCommitment = Readable::read(&mut &buf[..]).unwrap();
+		assert_eq!(decoded.ark_htlc_success_csv_delta, Some(success_csv_delta));
+
+		// Weight helpers must match actual script-size growth.
+		use crate::ln::chan_utils::{
+			ark_htlc_success_csv_suffix_weight, htlc_success_tx_weight,
+			htlc_success_tx_weight_with_ark, htlc_timeout_tx_weight,
+			htlc_timeout_tx_weight_with_ark,
+		};
+		assert_eq!(ark_htlc_success_csv_suffix_weight(None),        0, "no delta → no weight");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(12)),    3, "1-byte push + CSV + DROP");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(48)),    4, "2-byte push + CSV + DROP");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(2016)),  5, "3-byte push + CSV + DROP");
+
+		let non_anchor = ChannelTypeFeatures::only_static_remote_key();
+		let anchor     = ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
+		assert_eq!(
+			htlc_success_tx_weight_with_ark(&non_anchor, Some(48)) - htlc_success_tx_weight(&non_anchor),
+			4,
+		);
+		assert_eq!(
+			htlc_timeout_tx_weight_with_ark(&anchor, Some(48)) - htlc_timeout_tx_weight(&anchor),
+			4,
+		);
+
+		// Non-Ark channels: HTLC scripts MUST be byte-for-byte identical to baseline.
+		// (Exercises the non-Ark path unchanged invariant.)
+		let non_ark_features = ChannelTypeFeatures::only_static_remote_key();
+		let non_ark_received = mk_htlc(false, [42; 32], None);
+		let non_ark_offered  = mk_htlc(true,  [43; 32], None);
+		let non_ark_received_script = get_htlc_redeemscript(&non_ark_received, &non_ark_features, &keys);
+		let non_ark_offered_script  = get_htlc_redeemscript(&non_ark_offered,  &non_ark_features, &keys);
+		// These must match the known-good hex from test_anchors (non-anchor variant).
+		assert_eq!(
+			non_ark_offered_script.to_p2wsh().to_hex_string(),
+			"0020215d61bba56b19e9eadb6107f5a85d7f99c40f65992443f69229c290165bc00d",
+			"non-ark offered script must be unchanged",
+		);
+		assert_eq!(
+			non_ark_received_script.to_p2wsh().to_hex_string(),
+			"0020e43a7c068553003fe68fcae424fb7b28ec5ce48cd8b6744b3945631389bad2fb",
+			"non-ark received script must be unchanged",
+		);
 	}
 }
