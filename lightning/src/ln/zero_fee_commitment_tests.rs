@@ -5,11 +5,12 @@ use crate::ln::chan_utils::{
 	P2WSH_TXOUT_WEIGHT, SEGWIT_MARKER_FLAG_WEIGHT, TRUC_CHILD_MAX_WEIGHT,
 };
 use crate::ln::functional_test_utils::*;
-use crate::ln::msgs::BaseMessageHandler;
+use crate::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
 use crate::prelude::*;
 
 use bitcoin::constants::WITNESS_SCALE_FACTOR;
 use bitcoin::Amount;
+use lightning_types::features::ChannelTypeFeatures;
 
 #[test]
 fn test_p2a_anchor_values_under_trims_and_rounds() {
@@ -422,5 +423,114 @@ fn test_anchor_tx_too_big() {
 			txns[0].compute_txid()
 		),
 		1,
+	);
+}
+
+/// Assert that an `ArkChannel` reaches `ChannelReady` with a stock segwit-v0 P2WSH funding
+/// output — NOT a taproot (P2TR / witness-v1) output.
+///
+/// This is a non-vacuous structural guarantee: if the funding path were accidentally switched to
+/// `get_taproot_output` / MuSig2, this test would fail because the `output_script` emitted by
+/// `FundingGenerationReady` would be a 34-byte witness-v1 script (`OP_1 <32-byte-x-only-pubkey>`)
+/// rather than a 34-byte witness-v0 script (`OP_0 <32-byte-SHA256-hash>`).
+#[test]
+fn test_ark_channel_funding_output_is_p2wsh() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+
+	let mut user_cfg = test_default_channel_config();
+	// Enable ArkChannel negotiation on both sides.
+	user_cfg.channel_handshake_config.negotiate_ark_channel = true;
+
+	let configs = [Some(user_cfg.clone()), Some(user_cfg)];
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &configs);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	// ArkChannel implies zero_fee_commitments, which requires anchor reserves.
+	let _coinbase_tx = provide_anchor_reserves(&nodes);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// --- Open-channel / accept-channel handshake via functional-test helpers.
+	// After this, node 0 has a pending FundingGenerationReady event.
+	const CHAN_VALUE: u64 = 10_000_000;
+	let temporary_channel_id =
+		exchange_open_accept_chan(&nodes[0], &nodes[1], CHAN_VALUE, 0);
+
+	// `create_funding_transaction` consumes the FundingGenerationReady event and builds a
+	// transaction whose sole output uses exactly the `output_script` from that event.
+	let (chan_id, tx, _) = create_funding_transaction(&nodes[0], &node_b_id, CHAN_VALUE, 42);
+	assert_eq!(chan_id, temporary_channel_id);
+
+	// *** Core assertion: the funding output must be segwit-v0 P2WSH, not P2TR. ***
+	//
+	// P2WSH: OP_0 <32-byte-hash>   (0x0020...)  — witness version 0
+	// P2TR:  OP_1 <32-byte-x-only> (0x5120...)  — witness version 1
+	//
+	// `create_funding_transaction` sets tx.output[0].script_pubkey := output_script verbatim,
+	// so asserting on it is equivalent to asserting on the raw output_script.
+	//
+	// If `get_taproot_output` were ever accidentally wired up for ArkChannel, the script
+	// would be 34 bytes starting with 0x51 and is_p2wsh() would return false.
+	let funding_spk = &tx.output[0].script_pubkey;
+	assert!(
+		funding_spk.is_p2wsh(),
+		"ArkChannel funding output must be P2WSH (segwit-v0), got: {:?}",
+		funding_spk
+	);
+	assert!(
+		!funding_spk.is_p2tr(),
+		"ArkChannel funding output must NOT be P2TR (taproot / segwit-v1), got: {:?}",
+		funding_spk
+	);
+
+	// Verify the negotiated channel type is actually ArkChannel (not a fallback).
+	let chan_list = nodes[0].node.list_channels();
+	let chan = chan_list
+		.iter()
+		.find(|c| c.channel_id == temporary_channel_id)
+		.expect("channel should be in list");
+	assert_eq!(
+		chan.channel_type.as_ref().expect("channel_type should be set"),
+		&ChannelTypeFeatures::ark_channel(),
+		"negotiated channel_type should be ArkChannel"
+	);
+
+	// --- Complete the funding flow so the channel reaches ChannelReady.
+	//
+	// We have already consumed the FundingGenerationReady event via create_funding_transaction,
+	// so we drive the rest of the funding handshake manually.
+	nodes[0]
+		.node
+		.funding_transaction_generated(temporary_channel_id, node_b_id, tx.clone())
+		.unwrap();
+	check_added_monitors(&nodes[0], 0);
+
+	let funding_created_msg =
+		get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, node_b_id);
+	nodes[1].node.handle_funding_created(node_a_id, &funding_created_msg);
+	check_added_monitors(&nodes[1], 1);
+	expect_channel_pending_event(&nodes[1], &node_a_id);
+
+	let funding_signed_msg =
+		get_event_msg!(nodes[1], MessageSendEvent::SendFundingSigned, node_a_id);
+	nodes[0].node.handle_funding_signed(node_b_id, &funding_signed_msg);
+	check_added_monitors(&nodes[0], 1);
+	expect_channel_pending_event(&nodes[0], &node_b_id);
+
+	// Confirm the funding transaction on both sides so the channel reaches ChannelReady.
+	create_chan_between_nodes_with_value_confirm(&nodes[0], &nodes[1], &tx);
+
+	// Confirm the open channel carries the ArkChannel type and is ready.
+	let chan_list = nodes[0].node.list_channels();
+	let chan = chan_list
+		.iter()
+		.find(|c| c.channel_type.as_ref() == Some(&ChannelTypeFeatures::ark_channel()))
+		.expect("ArkChannel should be open and ready");
+	assert!(
+		chan.is_channel_ready,
+		"ArkChannel should have reached ChannelReady, channel_id={:?}",
+		chan.channel_id
 	);
 }
