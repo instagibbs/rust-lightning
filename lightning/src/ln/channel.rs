@@ -3755,7 +3755,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				splice_parent_funding_txid: None,
 				channel_type_features: channel_type.clone(),
 				channel_value_satoshis,
-				ark_htlc_success_csv_delta: None,
+				ark_htlc_success_csv_delta: ark_htlc_success_csv_delta_for_open(
+					&channel_type,
+					&config.channel_handshake_config,
+				),
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -4003,7 +4006,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				channel_type_features: channel_type.clone(),
 				// We'll add our counterparty's `funding_satoshis` when we receive `accept_channel2`.
 				channel_value_satoshis,
-				ark_htlc_success_csv_delta: None,
+				ark_htlc_success_csv_delta: ark_htlc_success_csv_delta_for_open(
+					&channel_type,
+					&config.channel_handshake_config,
+				),
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -14246,6 +14252,25 @@ pub(super) fn get_initial_channel_type(
 	}
 
 	ret
+}
+
+/// Resolves the per-channel Ark HTLC success-path CSV delta to store in the channel transaction
+/// parameters at open time.
+///
+/// The delta is only applied to `ArkChannel`s — non-Ark channels are left completely unchanged so
+/// they remain interoperable with stock LDK peers. A configured `Some(0)` is meaningless (it would
+/// produce a no-op `OP_0 OP_CSV` in the HTLC script) and is coerced to `None`, both in debug and
+/// release builds.
+fn ark_htlc_success_csv_delta_for_open(
+	channel_type: &ChannelTypeFeatures, config: &ChannelHandshakeConfig,
+) -> Option<u16> {
+	if !channel_type.requires_ark_channel() {
+		return None;
+	}
+	match config.ark_htlc_success_csv_delta {
+		Some(0) | None => None,
+		Some(delta) => Some(delta),
+	}
 }
 
 const SERIALIZATION_VERSION: u8 = 4;

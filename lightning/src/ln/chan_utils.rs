@@ -83,12 +83,6 @@ pub(crate) const MIN_ACCEPTED_HTLC_SCRIPT_WEIGHT: usize = 136;
 /// This is the maximum post-anchor value.
 pub const MAX_ACCEPTED_HTLC_SCRIPT_WEIGHT: usize = 143;
 
-/// Upper bound on the extra bytes the Ark-on-Lightning success-path CSV suffix can add to an HTLC
-/// witness script. The suffix is `<delta> OP_CSV OP_DROP`; a 2-byte push (for deltas 128..=65535)
-/// plus 1-byte OP_CSV plus 1-byte OP_DROP gives 4 bytes, and for pathologically large pushes up
-/// to 5. We budget 5 so callers don't need to think about push encoding.
-pub(crate) const MAX_ARK_HTLC_SUCCESS_CSV_SUFFIX: usize = 5;
-
 /// The upper bound weight of an anchor input.
 #[cfg(feature = "grind_signatures")]
 pub const ANCHOR_INPUT_WITNESS_WEIGHT: u64 = 114;
@@ -157,17 +151,39 @@ pub(crate) const P2WSH_TXOUT_WEIGHT: u64 =
 
 /// Weight added to an HTLC witness script (and therefore to the HTLC-Success / HTLC-Timeout 2nd
 /// stage tx weights) by the Ark-on-Lightning success-path CSV suffix for a given delta. The
-/// suffix is `<delta> OP_CSV OP_DROP`; `OP_CSV` and `OP_DROP` are one byte each, while the push
-/// for `delta` is 1 byte for `1..=16` (OP_PUSHNUM_N), 2 bytes for `17..=127` (OP_PUSHBYTES_1 +
-/// byte), and 3 bytes for `128..=65535` (OP_PUSHBYTES_2 + 2 bytes). Returns 0 when no delta is
-/// set so non-Ark channels keep their baseline weight.
+/// suffix is `<delta> OP_CSV OP_DROP`; `OP_CSV` and `OP_DROP` are one byte each. The push for
+/// `delta` matches exactly what [`bitcoin::script::Builder::push_int`] emits:
+///
+/// - `1..=16`: a single `OP_PUSHNUM_N` opcode (1 byte).
+/// - otherwise: a 1-byte `OP_PUSHBYTES_n` length prefix followed by the signed-magnitude
+///   (`write_scriptint`) encoding of `delta`. Because `delta` is always positive, that encoding
+///   is 1 byte for `17..=127`, 2 bytes for `128..=32767`, and — crucially — 3 bytes for
+///   `32768..=65535`, where the high magnitude byte has bit `0x80` set and an extra `0x00` sign
+///   byte is appended.
+///
+/// So the suffix is 3 bytes for `1..=16`, 4 bytes for `17..=127`, 5 bytes for `128..=32767`, and
+/// 6 bytes for `32768..=65535`. Returns 0 when no delta is set so non-Ark channels keep their
+/// baseline weight. Getting the `>= 32768` boundary right matters because under-counting would
+/// under-fund the consensus-timed HTLC-Success/Timeout 2nd-stage transactions.
 #[inline]
 pub fn ark_htlc_success_csv_suffix_weight(success_csv_delta: Option<u16>) -> u64 {
 	match success_csv_delta {
 		None => 0,
+		// `push_int` special-cases 1..=16 as a single OP_PUSHNUM_N opcode (no length prefix).
+		Some(d) if d <= 16 => 1 + 2,
 		Some(d) => {
-			let push_bytes: u64 = if d <= 16 { 1 } else if d <= 127 { 2 } else { 3 };
-			push_bytes + 2
+			// Replicate `write_scriptint`'s signed-magnitude length for a positive value: one
+			// byte per 8 bits of magnitude, plus one extra byte when the most-significant
+			// magnitude byte has bit 0x80 set (so the value isn't misread as negative).
+			let scriptint_len: u64 = if d <= 0x7f {
+				1
+			} else if d <= 0x7fff {
+				2
+			} else {
+				3
+			};
+			// 1-byte OP_PUSHBYTES_n length prefix + scriptint bytes + OP_CSV + OP_DROP.
+			1 + scriptint_len + 2
 		},
 	}
 }
@@ -3191,5 +3207,57 @@ mod tests {
 			"0020e43a7c068553003fe68fcae424fb7b28ec5ce48cd8b6744b3945631389bad2fb",
 			"non-ark received script must be unchanged",
 		);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn test_ark_htlc_success_csv_suffix_weight_matches_realized_bytes() {
+		// The weight predictor `ark_htlc_success_csv_suffix_weight` MUST equal the realized number
+		// of script bytes that `<delta> OP_CSV OP_DROP` adds, for EVERY u16 delta. `push_int` uses
+		// signed-magnitude (`write_scriptint`): when the top magnitude byte has bit 0x80 set
+		// (delta >= 0x8000 = 32768) an extra 0x00 sign byte is appended, so the push is 4 bytes
+		// (suffix = 6), not 3 (suffix = 5). A predictor that under-counts here would under-fund the
+		// HTLC-Success/Timeout 2nd-stage transactions on a channel that uses a large delta. This is
+		// safety-critical (fee estimation on a consensus-timed claim), so we check the realized
+		// bytes against the real `Builder::push_int` path rather than hand-computed magic numbers.
+		use crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight;
+		use bitcoin::opcodes::all::{OP_CSV, OP_DROP};
+		use bitcoin::script::Builder;
+
+		// Realize the exact bytes the production script builder appends for a given delta.
+		let realized_suffix_len = |delta: u16| -> u64 {
+			let empty = Builder::new().into_script();
+			let with_suffix = Builder::new()
+				.push_int(delta as i64)
+				.push_opcode(OP_CSV)
+				.push_opcode(OP_DROP)
+				.into_script();
+			(with_suffix.len() - empty.len()) as u64
+		};
+
+		// Exhaustively check the entire u16 domain: predictor == realized witness-script bytes.
+		// (delta 0 is rejected/coerced before reaching the script, so start at 1.)
+		for delta in 1u16..=u16::MAX {
+			assert_eq!(
+				ark_htlc_success_csv_suffix_weight(Some(delta)),
+				realized_suffix_len(delta),
+				"suffix-weight predictor disagrees with realized push for delta {}", delta,
+			);
+		}
+
+		// Explicit boundary assertions (documented expectations across each push-encoding band):
+		assert_eq!(ark_htlc_success_csv_suffix_weight(None),          0, "no delta -> no weight");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(1)),       3, "OP_PUSHNUM_1 + CSV + DROP");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(16)),      3, "OP_PUSHNUM_16 + CSV + DROP");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(17)),      4, "PUSHBYTES_1 0x11 + CSV + DROP");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(127)),     4, "PUSHBYTES_1 0x7f + CSV + DROP");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(128)),     5, "PUSHBYTES_2 0x80 0x00 + CSV + DROP (sign byte)");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(255)),     5, "PUSHBYTES_2 0xff 0x00 + CSV + DROP (sign byte)");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(256)),     5, "PUSHBYTES_2 0x00 0x01 + CSV + DROP");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(2016)),    5, "PUSHBYTES_2 + CSV + DROP");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(32767)),   5, "PUSHBYTES_2 0xff 0x7f + CSV + DROP (no sign byte)");
+		// The off-by-one boundary: 0x8000 forces the extra signed-magnitude sign byte.
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(32768)),   6, "PUSHBYTES_3 0x00 0x80 0x00 + CSV + DROP (sign byte)");
+		assert_eq!(ark_htlc_success_csv_suffix_weight(Some(65535)),   6, "PUSHBYTES_3 0xff 0xff 0x00 + CSV + DROP (sign byte)");
 	}
 }

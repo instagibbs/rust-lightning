@@ -245,6 +245,23 @@ pub struct ChannelHandshakeConfig {
 	///
 	/// Default value: `false`.
 	pub negotiate_ark_channel: bool,
+
+	/// Ark-on-Lightning: if `Some`, every HTLC output on this channel's commitment transactions
+	/// carries an additional relative timelock of this many blocks on the preimage-revealing
+	/// (success) branch. This is a consensus-enforced race edge that ensures the counterparty's
+	/// timeout claim path activates before the local success path, so the Ark server never has to
+	/// unroll the tree to resolve an HTLC.
+	///
+	/// Both sides of the channel must set this to the same value for the channel's commitment
+	/// signatures to validate. Intended for use only between Ark-aware peers; there is no
+	/// feature-bit negotiation yet, so setting this with a stock LDK counterparty will break the
+	/// channel.
+	///
+	/// A value of `Some(0)` is meaningless (it would emit a no-op `OP_0 OP_CSV`) and is treated as
+	/// `None` (no Ark CSV) when the channel is opened.
+	///
+	/// Default value: `None` (standard BOLT-3 HTLC script shape).
+	pub ark_htlc_success_csv_delta: Option<u16>,
 }
 
 impl Default for ChannelHandshakeConfig {
@@ -262,6 +279,7 @@ impl Default for ChannelHandshakeConfig {
 			negotiate_anchor_zero_fee_commitments: false,
 			our_max_accepted_htlcs: 50,
 			negotiate_ark_channel: false,
+			ark_htlc_success_csv_delta: None,
 		}
 	}
 }
@@ -285,6 +303,7 @@ impl Readable for ChannelHandshakeConfig {
 			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
 			negotiate_ark_channel: Readable::read(reader)?,
+			ark_htlc_success_csv_delta: Readable::read(reader)?,
 		})
 	}
 }
@@ -1202,6 +1221,11 @@ pub struct ChannelHandshakeConfigUpdate {
 	/// The Proportion of the channel value to configure as counterparty's channel reserve. See
 	/// [`ChannelHandshakeConfig::their_channel_reserve_proportional_millionths`].
 	pub channel_reserve_proportional_millionths: Option<u32>,
+
+	/// Override for the Ark-on-Lightning HTLC success-path CSV delta. See
+	/// [`ChannelHandshakeConfig::ark_htlc_success_csv_delta`]. `Some(Some(d))` sets the delta,
+	/// `Some(None)` disables Ark protection, `None` leaves the existing config value alone.
+	pub ark_htlc_success_csv_delta: Option<Option<u16>>,
 }
 
 impl ChannelHandshakeConfig {
@@ -1231,6 +1255,10 @@ impl ChannelHandshakeConfig {
 
 		if let Some(channel_reserve) = config.channel_reserve_proportional_millionths {
 			self.their_channel_reserve_proportional_millionths = channel_reserve;
+		}
+
+		if let Some(ark_delta) = config.ark_htlc_success_csv_delta {
+			self.ark_htlc_success_csv_delta = ark_delta;
 		}
 	}
 }

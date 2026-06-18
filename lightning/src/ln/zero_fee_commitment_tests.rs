@@ -1,3 +1,4 @@
+use crate::events::bump_transaction::BumpTransactionEvent;
 use crate::events::{ClosureReason, Event};
 use crate::ln::chan_utils;
 use crate::ln::chan_utils::{
@@ -9,6 +10,9 @@ use crate::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEven
 use crate::prelude::*;
 
 use bitcoin::constants::WITNESS_SCALE_FACTOR;
+use bitcoin::opcodes::all::OP_CSV;
+use bitcoin::script::Instruction;
+use bitcoin::secp256k1::Secp256k1;
 use bitcoin::Amount;
 use lightning_types::features::ChannelTypeFeatures;
 
@@ -532,5 +536,162 @@ fn test_ark_channel_funding_output_is_p2wsh() {
 		chan.is_channel_ready,
 		"ArkChannel should have reached ChannelReady, channel_id={:?}",
 		chan.channel_id
+	);
+}
+
+/// End-to-end proof that the Ark HTLC success-path CSV is ACTIVE once `ark_htlc_success_csv_delta`
+/// is configured at channel open.
+///
+/// This opens an `ArkChannel` with `ark_htlc_success_csv_delta = Some(D)` configured on BOTH nodes,
+/// routes a real HTLC across it, force-closes, and inspects the holder's on-chain HTLC claim:
+///   - the HTLC witness script (`HTLCDescriptor::witness_script`) carries TWO `OP_CSV`s — the
+///     1-block anchor delay AND the Ark success-branch `<D> OP_CSV OP_DROP` — and the Ark `OP_CSV`
+///     is immediately preceded by a `D` push; and
+///   - the HTLC-Success 2nd-stage tx input (`HTLCDescriptor::unsigned_tx_input`) sets
+///     `nSequence >= D`, so the consensus-enforced relative timelock is satisfiable.
+///
+/// This is NON-VACUOUS: before the delta is wired from config into the channel transaction
+/// parameters, `ark_htlc_success_csv_delta` is `None` on every commitment, the success branch has
+/// only the single anchor `OP_CSV`, and `nSequence` is just the 1-block anchor CSV — both
+/// assertions below would fail. The script and sequence are produced from the *real* commitment
+/// the channel built, not a hand-constructed `HTLCOutputInCommitment`.
+#[test]
+fn test_ark_channel_htlc_success_csv_active_end_to_end() {
+	const ARK_DELTA: u16 = 144;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+
+	let mut user_cfg = test_default_channel_config();
+	// Enable ArkChannel negotiation AND activate the success-path CSV delta on both sides.
+	user_cfg.channel_handshake_config.negotiate_ark_channel = true;
+	user_cfg.channel_handshake_config.ark_htlc_success_csv_delta = Some(ARK_DELTA);
+	user_cfg.channel_handshake_config.our_htlc_minimum_msat = 1;
+
+	let configs = [Some(user_cfg.clone()), Some(user_cfg)];
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &configs);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	// ArkChannel implies zero_fee_commitments, which needs anchor reserves for the bumped close.
+	let _coinbase_tx = provide_anchor_reserves(&nodes);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+
+	const CHAN_CAPACITY: u64 = 10_000_000;
+	let (_, _, chan_id, _funding_tx) = create_announced_chan_between_nodes_with_value(
+		&nodes,
+		0,
+		1,
+		CHAN_CAPACITY,
+		(CHAN_CAPACITY / 2) * 1000,
+	);
+
+	// Confirm the channel really negotiated the ArkChannel type (otherwise this test is vacuous).
+	let chan_list = nodes[0].node.list_channels();
+	let chan = chan_list.iter().find(|c| c.channel_id == chan_id).expect("channel in list");
+	assert_eq!(
+		chan.channel_type.as_ref().expect("channel_type set"),
+		&ChannelTypeFeatures::ark_channel(),
+		"test requires an ArkChannel to be negotiated",
+	);
+
+	// Route an HTLC from node 0 to node 1 and have node 1 claim it, so node 1 holds the preimage
+	// and will resolve the HTLC through the success path on-chain after a force close.
+	const HTLC_AMT_MSAT: u64 = 1_000_000;
+	let (preimage, payment_hash, ..) = route_payment(&nodes[0], &[&nodes[1]], HTLC_AMT_MSAT);
+	nodes[1].node.claim_funds(preimage);
+	check_added_monitors(&nodes[1], 1);
+	expect_payment_claimed!(nodes[1], payment_hash, HTLC_AMT_MSAT);
+	nodes[0].node.get_and_clear_pending_msg_events();
+	nodes[1].node.get_and_clear_pending_msg_events();
+
+	// Force close node 1 (the HTLC receiver / preimage holder) and confirm its commitment.
+	let node_1_commit_tx = get_local_commitment_txn!(nodes[1], chan_id).pop().unwrap();
+	let message = "force-close for ark csv test".to_owned();
+	nodes[1]
+		.node
+		.force_close_broadcasting_latest_txn(&chan_id, &node_a_id, message.clone())
+		.unwrap();
+	check_added_monitors(&nodes[1], 1);
+	check_closed_broadcast(&nodes[1], 1, true);
+	let reason =
+		ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	check_closed_event(&nodes[1], 1, reason, &[node_a_id], CHAN_CAPACITY);
+
+	mine_transaction(&nodes[1], &node_1_commit_tx);
+
+	// Drain the commitment-close bump event(s); we want the HTLCResolution event.
+	let secp = Secp256k1::new();
+	let events = nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	let mut checked_descriptors = 0usize;
+	for event in events {
+		if let Event::BumpTransaction(BumpTransactionEvent::HTLCResolution {
+			htlc_descriptors,
+			..
+		}) = event
+		{
+			for htlc_descriptor in &htlc_descriptors {
+				// This is the HTLC node 1 received and is now claiming with the preimage.
+				assert!(!htlc_descriptor.htlc.offered, "expected the received HTLC");
+				assert_eq!(
+					htlc_descriptor.htlc.ark_htlc_success_csv_delta,
+					Some(ARK_DELTA),
+					"the configured Ark delta must reach the on-chain HTLC output",
+				);
+
+				// (a) The real commitment's HTLC witness script must carry the Ark success-branch
+				// CSV: `<D> OP_CSV OP_DROP`. ArkChannel uses the `zero_fee_commitments` (P2A anchor)
+				// shape, whose HTLC outputs do NOT carry the legacy 1-block keyed-anchor CSV, so the
+				// ONLY OP_CSV in the script is the Ark one, and it must be immediately preceded by a
+				// push of the configured delta D (144 -> the 2-byte signed-magnitude push 0x90 0x00).
+				let witness_script = htlc_descriptor.witness_script(&secp);
+				let mut csv_count = 0usize;
+				let mut prev_push: Option<Vec<u8>> = None;
+				let mut saw_ark_csv_after_delta_push = false;
+				let expected_delta_push = ARK_DELTA.to_le_bytes().to_vec(); // 144 -> [0x90, 0x00]
+				for ins in witness_script.instructions() {
+					match ins.expect("valid script instruction") {
+						Instruction::Op(op) if op == OP_CSV => {
+							csv_count += 1;
+							if prev_push.as_deref() == Some(expected_delta_push.as_slice()) {
+								saw_ark_csv_after_delta_push = true;
+							}
+							prev_push = None;
+						},
+						Instruction::PushBytes(b) => {
+							prev_push = Some(b.as_bytes().to_vec());
+						},
+						Instruction::Op(_) => {
+							prev_push = None;
+						},
+					}
+				}
+				assert_eq!(
+					csv_count, 1,
+					"ArkChannel (P2A anchor) HTLC success script must have exactly 1 OP_CSV (the Ark success CSV), script={}",
+					witness_script,
+				);
+				assert!(
+					saw_ark_csv_after_delta_push,
+					"the OP_CSV must be guarded by a push of the configured delta {} (the Ark success CSV), script={}",
+					ARK_DELTA, witness_script,
+				);
+
+				// (b) The HTLC-Success 2nd-stage tx input must lock nSequence to at least the delta.
+				let txin = htlc_descriptor.unsigned_tx_input();
+				assert!(
+					txin.sequence.to_consensus_u32() >= ARK_DELTA as u32,
+					"HTLC-Success nSequence ({}) must be >= the Ark CSV delta ({})",
+					txin.sequence.to_consensus_u32(),
+					ARK_DELTA,
+				);
+
+				checked_descriptors += 1;
+			}
+		}
+	}
+	assert_eq!(
+		checked_descriptors, 1,
+		"expected exactly one HTLC-Success descriptor to inspect end-to-end",
 	);
 }
