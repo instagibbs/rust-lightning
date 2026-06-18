@@ -31,6 +31,7 @@ use crate::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEven
 use crate::ln::outbound_payment::RecipientOnionFields;
 use crate::ln::types::ChannelId;
 use crate::prelude::*;
+use crate::util::ser::Writeable;
 
 use bitcoin::hashes::Hash;
 use bitcoin::ScriptBuf;
@@ -713,4 +714,262 @@ fn test_teleport_responder_value_removal_rejected_when_below_reserve() {
 	// end-of-test "no excess events / monitors" assertions are satisfied.
 	let _ = responder.node.get_and_clear_pending_events();
 	check_added_monitors(responder, 1);
+}
+
+/// [C1] A channel **serialized while a persistent teleport is in flight** (the new-scope
+/// `commitment_signed` exchange has completed, so the channel is quiesced awaiting
+/// `complete_teleport`/`teleport_complete`) must come back from a restart **still quiescent**, with
+/// the `pending_teleport` intact, and resume the teleport to completion against the *continued*
+/// commitment number.
+///
+/// Without the teleport guard in `FundedChannel::write`, the reload silently drops quiescence while
+/// the persistent `pending_teleport` survives. Post-reconnect HTLC traffic could then advance the
+/// commitment number, and a late promotion would emit `RenegotiatedFundingLocked` against stale
+/// numbers — a cross-party commitment/monitor divergence on channel funds. This test pins all three
+/// properties the fix restores:
+/// - (a) the reloaded channel is **still quiescent** (a payment offered post-reconnect is held in
+///   the holding cell rather than immediately turned into an on-wire `update_add`);
+/// - (b) the `pending_teleport` **survives** (the teleport resumes and completes);
+/// - (c) promotion stays gated on quiescence — the channel promotes against the **same (continued)**
+///   commitment number, never an advanced one ([H1]).
+#[test]
+fn test_channel_teleport_persistent_state_survives_serialize_reload() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let (persister_0, persister_1);
+	let (chain_monitor_0, chain_monitor_1);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let (node_0_reload, node_1_reload);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let new_funding_txo = test_outpoint(11, 0);
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+	let original_funding_script = funding_watch_script(initiator, channel_id, original_funding_txo);
+
+	// [H1] Continuity baseline, captured before the teleport.
+	let initiator_commitment_number_before = holder_commitment_number(initiator, channel_id);
+	let responder_commitment_number_before = holder_commitment_number(responder, channel_id);
+
+	// Drive the teleport through the new-scope `commitment_signed` exchange. The initiator is now
+	// `AwaitingLocalComplete` and the responder `AwaitingRemoteComplete` — both PERSISTENT states,
+	// both still quiesced, neither promoted yet.
+	start_teleport(initiator, responder, channel_id, new_funding_txo);
+	let _ = get_event!(responder, Event::ChannelTeleport);
+	ack_teleport(initiator, responder, channel_id);
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
+
+	// Serialize BOTH nodes (channelmanager + monitor) and reload them — i.e. a restart mid-teleport.
+	let initiator_serialized = initiator.node.encode();
+	let responder_serialized = responder.node.encode();
+	let initiator_monitor = get_monitor!(initiator, channel_id).encode();
+	let responder_monitor = get_monitor!(responder, channel_id).encode();
+
+	reload_node!(
+		nodes[0],
+		&initiator_serialized,
+		&[&initiator_monitor],
+		persister_0,
+		chain_monitor_0,
+		node_0_reload
+	);
+	reload_node!(
+		nodes[1],
+		&responder_serialized,
+		&[&responder_monitor],
+		persister_1,
+		chain_monitor_1,
+		node_1_reload
+	);
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+
+	// The reloaded channels must still be on the OLD scope (no promotion happened across the
+	// restart) and the [H1] commitment number must be unchanged.
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
+	assert_eq!(
+		holder_commitment_number(initiator, channel_id),
+		initiator_commitment_number_before,
+		"[C1] the reloaded initiator's commitment number must not have advanced",
+	);
+	assert_eq!(
+		holder_commitment_number(responder, channel_id),
+		responder_commitment_number_before,
+		"[C1] the reloaded responder's commitment number must not have advanced",
+	);
+
+	let mut reconnect_args = ReconnectArgs::new(initiator, responder);
+	reconnect_args.send_channel_ready = (true, true);
+	reconnect_args.send_announcement_sigs = (true, true);
+	reconnect_nodes(reconnect_args);
+
+	// A persistent teleport waits on a local `complete_teleport`, so reconnect must NOT trip the
+	// awaiting-response disconnect timer.
+	for _ in 0..=DISCONNECT_PEER_AWAITING_RESPONSE_TICKS {
+		initiator.node.timer_tick_occurred();
+		responder.node.timer_tick_occurred();
+	}
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+	assert!(responder.node.get_and_clear_pending_msg_events().is_empty());
+
+	// (a) STILL QUIESCENT: a payment offered now must be parked in the holding cell — a quiescent
+	// channel does not emit a new `update_add`. Before the fix, the reload dropped quiescence and
+	// this payment would immediately produce an on-wire `update_add`.
+	let payment_amount = 1_000_000;
+	let (route, payment_hash, payment_preimage, payment_secret) =
+		get_route_and_payment_hash!(initiator, responder, payment_amount);
+	let onion = RecipientOnionFields::secret_only(payment_secret, payment_amount);
+	let payment_id = PaymentId(payment_hash.0);
+	initiator.node.send_payment_with_route(route, payment_hash, onion, payment_id).unwrap();
+	check_added_monitors(initiator, 0);
+	assert!(
+		initiator.node.get_and_clear_pending_msg_events().is_empty(),
+		"[C1] reloaded channel must still be quiescent: the payment must be held, not sent",
+	);
+
+	// (b)+(c) The persistent teleport survived and resumes to completion. Promotion lands on the new
+	// scope with the commitment number CONTINUED (never reset / advanced).
+	initiator.node.complete_teleport(&channel_id, &responder_id).unwrap();
+	let teleport_complete =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportComplete, responder_id);
+	responder.node.handle_teleport_complete(initiator_id, &teleport_complete);
+	check_added_monitors(responder, 1);
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), new_funding_txo);
+	assert_eq!(
+		holder_commitment_number(responder, channel_id),
+		responder_commitment_number_before,
+		"[C1]/[H1] responder must promote against the continued commitment number, not an advanced one",
+	);
+
+	let teleport_complete_ack =
+		get_event_msg!(responder, MessageSendEvent::SendTeleportCompleteAck, initiator_id);
+	initiator.node.handle_teleport_complete_ack(responder_id, &teleport_complete_ack);
+	check_added_monitors(initiator, 2);
+
+	assert_eq!(current_funding_txo(initiator, channel_id), new_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), new_funding_txo);
+	assert_eq!(
+		holder_commitment_number(initiator, channel_id),
+		initiator_commitment_number_before,
+		"[C1]/[H1] initiator must promote against the continued commitment number, not an advanced one",
+	);
+
+	// The held payment is released by promotion (quiescence ended) and delivers on the new scope.
+	let update_add = get_htlc_update_msgs(initiator, &responder_id);
+	responder.node.handle_update_add_htlc(initiator_id, &update_add.update_add_htlcs[0]);
+	do_commitment_signed_dance(responder, initiator, &update_add.commitment_signed, false, false);
+	expect_and_process_pending_htlcs(responder, false);
+	expect_payment_claimable!(responder, payment_hash, payment_secret, payment_amount);
+	claim_payment(initiator, &[responder], payment_preimage);
+
+	initiator
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script.clone());
+	responder
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script);
+}
+
+/// [I1] A disconnect in the **mid-CS-exchange window** — the responder has dequeued
+/// `teleport_ack`+its new-scope `commitment_signed` (so it is
+/// `AwaitingRemoteCommitmentSigned{is_initiator:false}`) and the initiator has sent its own
+/// `commitment_signed` (so it is `AwaitingRemoteCommitmentSigned{is_initiator:true}`), but *neither*
+/// has processed the other's `commitment_signed` and *neither* has promoted — must abort **cleanly
+/// and symmetrically**: BOTH parties drop back to the OLD funding scope and the channel stays
+/// usable (re-quiesce-able for a fresh teleport).
+///
+/// Before the fix, `AwaitingRemoteCommitmentSigned{is_initiator:true}` was persistent while
+/// `{is_initiator:false}` was not, so a disconnect here left the responder on the OLD scope but the
+/// initiator quiesced forever awaiting a `commitment_signed` that has no teleport resend path — the
+/// initiator was permanently bricked.
+#[test]
+fn test_channel_teleport_disconnect_mid_commitment_exchange_aborts_symmetrically() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+	let replacement_funding_txo = test_outpoint(13, 0);
+
+	start_teleport(initiator, responder, channel_id, test_outpoint(12, 0));
+	let _ = get_event!(responder, Event::ChannelTeleport);
+
+	// Drive to the mid-CS-exchange window WITHOUT either side processing the other's
+	// `commitment_signed`:
+	responder.node.ack_teleport(&channel_id, &initiator_id).unwrap();
+	// Draining the responder's events advances it off `AwaitingTeleportAckSend` to
+	// `AwaitingRemoteCommitmentSigned{is_initiator:false}` (non-persistent).
+	let mut responder_events = responder.node.get_and_clear_pending_msg_events();
+	assert_eq!(responder_events.len(), 2, "{responder_events:?}");
+	let teleport_ack = match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::SendTeleportAck { msg, .. } => msg,
+		event => panic!("Unexpected event {event:?}"),
+	};
+	// Hold (do NOT deliver) the responder's new-scope `commitment_signed`.
+	match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::UpdateHTLCs { .. } => {},
+		event => panic!("Unexpected event {event:?}"),
+	};
+	assert!(responder_events.is_empty());
+
+	// The initiator processes `teleport_ack` and emits its own `commitment_signed`, landing in
+	// `AwaitingRemoteCommitmentSigned{is_initiator:true}`.
+	initiator.node.handle_teleport_ack(responder_id, &teleport_ack);
+	// Drain (and hold) the initiator's `commitment_signed`. Neither CS has been delivered.
+	let _initiator_commitment_signed =
+		get_htlc_update_msgs(initiator, &responder_id).commitment_signed[0].clone();
+
+	// Disconnect in this window.
+	initiator.node.peer_disconnected(responder_id);
+	responder.node.peer_disconnected(initiator_id);
+
+	// Reconnect. With the symmetric-abort fix, BOTH sides treated this window as non-persistent, so
+	// the teleport is abandoned and the channel is resolved back onto the OLD scope on reconnect.
+	// (Before the fix the initiator would be stuck quiesced and `reconnect_nodes` would observe a
+	// leftover quiescence/teleport state mismatch.)
+	let mut reconnect_args = ReconnectArgs::new(initiator, responder);
+	reconnect_args.send_channel_ready = (true, true);
+	reconnect_args.send_announcement_sigs = (true, true);
+	reconnect_nodes(reconnect_args);
+
+	// Neither side should hold a lingering awaiting-response/teleport state that trips the
+	// disconnect timer or emits stray messages.
+	for _ in 0..=DISCONNECT_PEER_AWAITING_RESPONSE_TICKS {
+		initiator.node.timer_tick_occurred();
+		responder.node.timer_tick_occurred();
+	}
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+	assert!(responder.node.get_and_clear_pending_msg_events().is_empty());
+
+	// BOTH parties are back on the OLD funding scope — neither bricked.
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
+
+	// The channel is fully usable: a normal payment flows...
+	send_payment(initiator, &[responder], 1_000_000);
+
+	// ...and it is re-quiesce-able — a fresh teleport can be started and acked end-to-end.
+	start_teleport(initiator, responder, channel_id, replacement_funding_txo);
+	match get_event!(responder, Event::ChannelTeleport) {
+		Event::ChannelTeleport { new_funding_txo: ev_outpoint, .. } => {
+			assert_eq!(ev_outpoint, replacement_funding_txo.into_bitcoin_outpoint());
+		},
+		_ => panic!(),
+	}
+	ack_teleport(initiator, responder, channel_id);
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
 }

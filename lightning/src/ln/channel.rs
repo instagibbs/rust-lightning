@@ -3233,15 +3233,26 @@ impl PendingTeleport {
 		}
 	}
 
-	/// Whether this state must survive a reconnect/restart. States before the new-scope
-	/// `commitment_signed` exchange are non-persistent: a disconnect simply abandons the attempt
-	/// (the channel stays on the old scope). Once commitments are exchanged the teleport must
-	/// resume from persisted state, so those states are persistent.
+	/// Whether this state must survive a reconnect/restart. States up to and including the
+	/// new-scope `commitment_signed` *exchange* are non-persistent: a disconnect simply abandons the
+	/// attempt and BOTH sides fall back to the old funding scope. Only once the exchange has fully
+	/// completed (both `commitment_signed` processed, neither having yet promoted — i.e. the
+	/// `AwaitingLocalComplete`/`AwaitingRemoteComplete` and later states) must the teleport resume
+	/// from persisted state, so those states are persistent.
+	///
+	/// Note `AwaitingRemoteCommitmentSigned` is non-persistent for BOTH `is_initiator` values. This
+	/// is deliberate and symmetric: in the mid-exchange window the responder (`{is_initiator:false}`)
+	/// has sent `teleport_ack`+its `commitment_signed` and the initiator (`{is_initiator:true}`) has
+	/// sent its own `commitment_signed`, but neither has processed the other's nor promoted. There is
+	/// no teleport `commitment_signed` resend path, so making `{is_initiator:true}` persistent would
+	/// strand the initiator quiesced forever after a disconnect (awaiting a `commitment_signed` that
+	/// never arrives) while the responder fell back to the old scope — a one-sided brick. Treating
+	/// both as non-persistent makes a disconnect in this window a clean symmetric abort to the old
+	/// scope.
 	fn is_persistent(&self) -> bool {
 		matches!(
 			self,
-			Self::AwaitingRemoteCommitmentSigned { is_initiator: true, .. }
-				| Self::AwaitingLocalComplete { .. }
+			Self::AwaitingLocalComplete { .. }
 				| Self::AwaitingRemoteComplete { .. }
 				| Self::AwaitingTeleportCompleteAck { .. }
 				| Self::AwaitingTeleportCompleteAckSend { .. }
@@ -12638,6 +12649,20 @@ where
 				new_funding_txo,
 				responder_value_removal_sat,
 			}) => {
+				// Defense-in-depth: a teleport only ever promotes from a quiescent channel. If
+				// quiescence was somehow lost (e.g. a serialization path that failed to preserve
+				// it), refuse to promote rather than emit `RenegotiatedFundingLocked` against a
+				// possibly-advanced commitment number — that would diverge our commitment/monitor
+				// from the counterparty's.
+				if !self.context.channel_state.is_quiescent() {
+					self.pending_teleport = Some(PendingTeleport::AwaitingRemoteComplete {
+						new_funding_txo,
+						responder_value_removal_sat,
+					});
+					return Err(ChannelError::close(
+						"Got teleport_complete while not quiescent".to_owned(),
+					));
+				}
 				self.pending_teleport = Some(PendingTeleport::AwaitingTeleportCompleteAckSend {
 					new_funding_txo,
 					responder_value_removal_sat,
@@ -12707,6 +12732,20 @@ where
 				new_funding_txo,
 				responder_value_removal_sat,
 			}) => {
+				// Defense-in-depth: a teleport only ever promotes from a quiescent channel. If
+				// quiescence was somehow lost (e.g. a serialization path that failed to preserve
+				// it), refuse to promote rather than emit `RenegotiatedFundingLocked` against a
+				// possibly-advanced commitment number — that would diverge our commitment/monitor
+				// from the counterparty's.
+				if !self.context.channel_state.is_quiescent() {
+					self.pending_teleport = Some(PendingTeleport::AwaitingTeleportCompleteAck {
+						new_funding_txo,
+						responder_value_removal_sat,
+					});
+					return Err(ChannelError::close(
+						"Got teleport_complete_ack while not quiescent".to_owned(),
+					));
+				}
 				self.mark_response_received();
 				let exited_quiescence = self.context.channel_state.is_quiescent();
 				self.context.channel_state.clear_quiescent();
@@ -15263,12 +15302,18 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 					channel_state.clear_local_stfu_sent();
 					channel_state.clear_remote_stfu_sent();
 					if self.should_reset_pending_splice_state(false)
-						|| !self.has_pending_splice_awaiting_signatures()
+						|| (!self.has_pending_splice_awaiting_signatures()
+							&& !self.has_persistent_teleport())
 					{
 						// We shouldn't be quiescent anymore upon reconnecting if:
 						// - We were in quiescence but a splice/RBF was never negotiated or
 						// - We were in quiescence but the splice negotiation failed due to
 						// disconnecting
+						// Ark bridge: but we MUST stay quiescent across the restart if a
+						// persistent teleport is in flight (the new-scope commitments have been
+						// exchanged and we're awaiting `complete`/`complete_ack`); otherwise the
+						// reloaded channel would process HTLC traffic and a late promotion would
+						// emit `RenegotiatedFundingLocked` against an advanced commitment number.
 						channel_state.clear_quiescent();
 					}
 				},
