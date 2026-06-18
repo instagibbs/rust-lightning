@@ -16,6 +16,7 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::Amount;
 use lightning_types::features::ChannelTypeFeatures;
 
+
 #[test]
 fn test_p2a_anchor_values_under_trims_and_rounds() {
 	let chanmon_cfgs = create_chanmon_cfgs(2);
@@ -693,5 +694,263 @@ fn test_ark_channel_htlc_success_csv_active_end_to_end() {
 	assert_eq!(
 		checked_descriptors, 1,
 		"expected exactly one HTLC-Success descriptor to inspect end-to-end",
+	);
+}
+
+/// Integration capstone (M5): an `ArkChannel` opened via
+/// `unsafe_manual_funding_transaction_generated` — the virtual/manual-funding entry bark uses —
+/// runs the full lifecycle on the LDK side:
+///
+///   open → `ChannelReady` → HTLC route + settle → force-close → claim
+///
+/// Unique value over M1/M2/M4: this is the first test that exercises the
+/// **manual-funding path** (`FundingType::Unchecked`) for an `ArkChannel`.  We assert:
+///
+///   1. `FundingTxBroadcastSafe` is emitted (not `FundingTxBroadcasted`) — proving the
+///      manual path was taken.
+///   2. The channel reaches `ChannelReady` and negotiates the `ArkChannel` type.
+///   3. An HTLC can be routed and settled over it.
+///   4. After a force-close the broadcast commitment is **stock** (P2WSH input, no
+///      OP_RETURN output, commitment input `nSequence` has the locktime-disable bit set —
+///      confirming there is no extra commitment-input CSV).
+///   5. An HTLC output on the commitment carries the success-path CSV (`ark_htlc_success_csv_delta`),
+///      verifying that the manual-funding path does not break the ARK feature composition.
+#[test]
+fn test_ark_channel_manual_funding_lifecycle() {
+	const ARK_DELTA: u16 = 144;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+
+	let mut user_cfg = test_default_channel_config();
+	user_cfg.channel_handshake_config.negotiate_ark_channel = true;
+	user_cfg.channel_handshake_config.ark_htlc_success_csv_delta = Some(ARK_DELTA);
+	user_cfg.channel_handshake_config.our_htlc_minimum_msat = 1;
+
+	let configs = [Some(user_cfg.clone()), Some(user_cfg)];
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &configs);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	// ArkChannel → zero_fee_commitments → anchor reserves needed for the bumped close.
+	let _coinbase_tx = provide_anchor_reserves(&nodes);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// -----------------------------------------------------------------------
+	// Phase 1: Open the channel via unsafe_manual_funding_transaction_generated.
+	//
+	// This is the funding entry that bark uses: the caller supplies just an
+	// outpoint (no full transaction); LDK skips the validation/broadcast step
+	// and emits FundingTxBroadcastSafe instead of broadcasting automatically.
+	// -----------------------------------------------------------------------
+	const CHAN_VALUE: u64 = 10_000_000;
+	let temp_chan_id = exchange_open_accept_chan(&nodes[0], &nodes[1], CHAN_VALUE, 0);
+
+	// Consume the FundingGenerationReady event and build the funding tx (but do NOT
+	// hand it to funding_transaction_generated — we use the "unsafe" outpoint-only API).
+	let (funding_temp_id, funding_tx, funding_outpoint) =
+		create_funding_transaction(&nodes[0], &node_b_id, CHAN_VALUE, 42);
+	assert_eq!(funding_temp_id, temp_chan_id);
+
+	// *** THE MANUAL-FUNDING ENTRY UNDER TEST ***
+	nodes[0]
+		.node
+		.unsafe_manual_funding_transaction_generated(temp_chan_id, node_b_id, funding_outpoint)
+		.unwrap();
+	check_added_monitors(&nodes[0], 0);
+
+	// FundingCreated  ──→  node_b
+	let funding_created_msg =
+		get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, node_b_id);
+	nodes[1].node.handle_funding_created(node_a_id, &funding_created_msg);
+	check_added_monitors(&nodes[1], 1);
+	expect_channel_pending_event(&nodes[1], &node_a_id);
+
+	// FundingSigned  ──→  node_a
+	let funding_signed_msg =
+		get_event_msg!(nodes[1], MessageSendEvent::SendFundingSigned, node_a_id);
+	nodes[0].node.handle_funding_signed(node_b_id, &funding_signed_msg);
+	check_added_monitors(&nodes[0], 1);
+
+	// Assert that FundingTxBroadcastSafe was emitted (not an automatic broadcast).
+	// This is the proof that the manual-funding entry was exercised.
+	let pending_events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(
+		pending_events.len(),
+		2,
+		"expected FundingTxBroadcastSafe + ChannelPending, got {pending_events:?}",
+	);
+	let mut saw_broadcast_safe = false;
+	for ev in &pending_events {
+		match ev {
+			Event::FundingTxBroadcastSafe { funding_txo, .. } => {
+				assert_eq!(funding_txo.txid, funding_outpoint.txid);
+				assert_eq!(funding_txo.vout, u32::from(funding_outpoint.index));
+				saw_broadcast_safe = true;
+			},
+			Event::ChannelPending { counterparty_node_id, .. } => {
+				assert_eq!(*counterparty_node_id, node_b_id);
+			},
+			other => panic!("unexpected pending event: {other:?}"),
+		}
+	}
+	assert!(saw_broadcast_safe, "FundingTxBroadcastSafe must be emitted on the manual-funding path");
+
+	// -----------------------------------------------------------------------
+	// Phase 2: Mine the funding tx → ChannelReady, exchange announcement sigs.
+	// -----------------------------------------------------------------------
+	// confirm_first: mine on node_b (sends channel_ready to node_a)
+	let conf_height =
+		core::cmp::max(nodes[0].best_block_info().1 + 1, nodes[1].best_block_info().1 + 1);
+	create_chan_between_nodes_with_value_confirm_first(&nodes[0], &nodes[1], &funding_tx, conf_height);
+
+	// mine on node_a, which fires ChannelReady + AnnouncementSigs + ChannelUpdate
+	confirm_transaction_at(&nodes[0], &funding_tx, conf_height);
+	connect_blocks(&nodes[0], CHAN_CONFIRM_DEPTH - 1);
+	expect_channel_ready_event(&nodes[0], &node_b_id);
+
+	let (as_funding_msgs, chan_id) =
+		create_chan_between_nodes_with_value_confirm_second(&nodes[1], &nodes[0]);
+
+	let (announcement, as_update, bs_update) =
+		create_chan_between_nodes_with_value_b(&nodes[0], &nodes[1], &as_funding_msgs);
+	update_nodes_with_chan_announce(&nodes, 0, 1, &announcement, &as_update, &bs_update);
+
+	// Assert we really opened an ArkChannel (not a fallback).
+	let chan_list = nodes[0].node.list_channels();
+	let chan = chan_list.iter().find(|c| c.channel_id == chan_id).expect("channel in list");
+	assert!(chan.is_channel_ready, "channel must be ChannelReady");
+	assert_eq!(
+		chan.channel_type.as_ref().expect("channel_type set"),
+		&ChannelTypeFeatures::ark_channel(),
+		"manual-funding must negotiate an ArkChannel",
+	);
+
+	// -----------------------------------------------------------------------
+	// Phase 3: Route an HTLC and have node 1 claim it with the preimage.
+	//
+	// We route node_0 → node_1 so that node_1 is the receiver/preimage-holder
+	// and will use the HTLC success path on-chain after the force-close.
+	// -----------------------------------------------------------------------
+	const HTLC_AMT_MSAT: u64 = 1_000_000;
+	let (preimage, payment_hash, ..) = route_payment(&nodes[0], &[&nodes[1]], HTLC_AMT_MSAT);
+	nodes[1].node.claim_funds(preimage);
+	check_added_monitors(&nodes[1], 1);
+	expect_payment_claimed!(nodes[1], payment_hash, HTLC_AMT_MSAT);
+	// Drain pending messages so the subsequent force-close starts from a clean state.
+	nodes[0].node.get_and_clear_pending_msg_events();
+	nodes[1].node.get_and_clear_pending_msg_events();
+
+	// -----------------------------------------------------------------------
+	// Phase 4: Force-close (node 1) and assert the on-chain outputs.
+	// -----------------------------------------------------------------------
+	let node_1_commit_tx = get_local_commitment_txn!(nodes[1], chan_id).pop().unwrap();
+
+	// Assert (4a): no OP_RETURN output in the commitment tx (stock commitment).
+	for (idx, out) in node_1_commit_tx.output.iter().enumerate() {
+		assert!(
+			!out.script_pubkey.is_op_return(),
+			"commitment tx must not have an OP_RETURN output (output #{idx})",
+		);
+	}
+
+	// Assert (4b): the commitment's single input uses a sequence with the
+	// locktime-disable bit set — i.e. it does NOT carry a commitment-input CSV.
+	// BOLT-3 §commitment_tx sets nSequence = 0x80000000 (relative-locktime disabled).
+	const LOCKTIME_DISABLE_FLAG: u32 = 0x8000_0000;
+	for (idx, inp) in node_1_commit_tx.input.iter().enumerate() {
+		assert!(
+			inp.sequence.to_consensus_u32() & LOCKTIME_DISABLE_FLAG != 0,
+			"commitment tx input #{idx} must have the locktime-disable bit set (nSequence=0x{:08x})",
+			inp.sequence.to_consensus_u32(),
+		);
+	}
+
+	// Perform the force-close.
+	let message = "force-close for M5 manual-funding lifecycle test".to_owned();
+	nodes[1]
+		.node
+		.force_close_broadcasting_latest_txn(&chan_id, &node_a_id, message.clone())
+		.unwrap();
+	check_added_monitors(&nodes[1], 1);
+	check_closed_broadcast(&nodes[1], 1, true);
+	let reason =
+		ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	check_closed_event(&nodes[1], 1, reason, &[node_a_id], CHAN_VALUE);
+
+	mine_transaction(&nodes[1], &node_1_commit_tx);
+
+	// -----------------------------------------------------------------------
+	// Phase 5: Inspect the HTLCResolution event — assert the Ark success CSV
+	// is present in the witness script and nSequence satisfies it.
+	// -----------------------------------------------------------------------
+	let secp = Secp256k1::new();
+	let chain_events = nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	let mut checked_descriptors = 0usize;
+	for event in chain_events {
+		if let Event::BumpTransaction(BumpTransactionEvent::HTLCResolution {
+			htlc_descriptors,
+			..
+		}) = event
+		{
+			for htlc_descriptor in &htlc_descriptors {
+				// node_1 received this HTLC (holds the preimage).
+				assert!(!htlc_descriptor.htlc.offered, "expected the received HTLC");
+				assert_eq!(
+					htlc_descriptor.htlc.ark_htlc_success_csv_delta,
+					Some(ARK_DELTA),
+					"the configured Ark delta must reach the on-chain HTLC output",
+				);
+
+				// Assert (5a): the witness script has exactly one OP_CSV (the Ark CSV)
+				// immediately preceded by a push of ARK_DELTA.
+				let witness_script = htlc_descriptor.witness_script(&secp);
+				let mut csv_count = 0usize;
+				let mut prev_push: Option<Vec<u8>> = None;
+				let mut saw_ark_csv_after_delta_push = false;
+				let expected_delta_push = ARK_DELTA.to_le_bytes().to_vec();
+				for ins in witness_script.instructions() {
+					match ins.expect("valid script instruction") {
+						Instruction::Op(op) if op == OP_CSV => {
+							csv_count += 1;
+							if prev_push.as_deref() == Some(expected_delta_push.as_slice()) {
+								saw_ark_csv_after_delta_push = true;
+							}
+							prev_push = None;
+						},
+						Instruction::PushBytes(b) => {
+							prev_push = Some(b.as_bytes().to_vec());
+						},
+						Instruction::Op(_) => {
+							prev_push = None;
+						},
+					}
+				}
+				assert_eq!(
+					csv_count, 1,
+					"ArkChannel (P2A) HTLC success script must have exactly 1 OP_CSV, script={witness_script}",
+				);
+				assert!(
+					saw_ark_csv_after_delta_push,
+					"the OP_CSV must be preceded by the configured delta {ARK_DELTA}, script={witness_script}",
+				);
+
+				// Assert (5b): the 2nd-stage tx input nSequence satisfies the CSV.
+				let txin = htlc_descriptor.unsigned_tx_input();
+				assert!(
+					txin.sequence.to_consensus_u32() >= ARK_DELTA as u32,
+					"HTLC-Success nSequence ({}) must be >= Ark CSV delta ({})",
+					txin.sequence.to_consensus_u32(),
+					ARK_DELTA,
+				);
+
+				checked_descriptors += 1;
+			}
+		}
+	}
+	assert_eq!(
+		checked_descriptors, 1,
+		"expected exactly one HTLC-Success descriptor from the manual-funding ArkChannel lifecycle",
 	);
 }
