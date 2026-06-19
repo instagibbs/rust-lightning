@@ -13624,6 +13624,22 @@ where
 				"Quiescence needed to teleport".to_owned(),
 			));
 		}
+		// A prior teleport that fully completed on both sides leaves the responder in the terminal
+		// `AwaitingRemoteActivityAfterTeleportCompleteAckSend` state — it has promoted its scope and
+		// sent `teleport_complete_ack`, and only lingers to observe the initiator demonstrate it
+		// processed that ack (see `note_counterparty_post_teleport_complete_ack_activity`). A fresh
+		// `teleport_init` from that same initiator IS such a demonstration: the initiator promotes on
+		// `teleport_complete_ack`, so it could only be starting a new teleport from the promoted
+		// scope. Treat the new `teleport_init` as resolving the lingering state and proceed, rather
+		// than rejecting back-to-back refreshes (a second refresh with no intervening channel traffic
+		// would otherwise be stuck forever — observed as "already has a teleport pending"). Any other
+		// pending-teleport state is a genuinely in-flight teleport and must still be refused.
+		if matches!(
+			self.pending_teleport,
+			Some(PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. })
+		) {
+			self.pending_teleport = None;
+		}
 		if self.pending_teleport.is_some() {
 			return Err(ChannelError::WarnAndDisconnect(format!(
 				"Channel {} already has a teleport pending",
