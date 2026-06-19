@@ -1011,6 +1011,14 @@ pub struct ChannelReestablish {
 	///
 	/// Also contains a bitfield indicating which messages should be retransmitted.
 	pub my_current_funding_locked: Option<FundingLocked>,
+	/// Ark bridge: the new funding txid of an in-flight teleport whose new-scope commitments are
+	/// not yet promoted, if any. It lets the counterparty distinguish, on reconnect, a teleport the
+	/// sender is still pursuing (so the sender's mid-exchange initiator state can keep waiting for
+	/// the redelivered new-scope `commitment_signed`) from one the sender has abandoned (so the
+	/// counterparty falls back to the old funding scope). `None` for non-teleport reconnects and for
+	/// teleports the sender is no longer pursuing. A peer that does not implement teleports ignores
+	/// it.
+	pub teleport_funding_txid: Option<Txid>,
 }
 
 /// Information exchanged during channel reestablishment about the next funding from interactive
@@ -3304,6 +3312,7 @@ impl_writeable_msg!(ChannelReestablish, {
 }, {
 	(1, next_funding, option),
 	(5, my_current_funding_locked, option),
+	(7, teleport_funding_txid, option),
 });
 
 impl_writeable!(NextFunding, {
@@ -4771,6 +4780,7 @@ mod tests {
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
 			my_current_funding_locked: None,
+			teleport_funding_txid: None,
 		};
 
 		let encoded_value = cr.encode();
@@ -4826,6 +4836,7 @@ mod tests {
 				retransmit_flags: 1,
 			}),
 			my_current_funding_locked: None,
+			teleport_funding_txid: None,
 		};
 
 		let encoded_value = cr.encode();
@@ -4885,6 +4896,7 @@ mod tests {
 				),
 				retransmit_flags: 1,
 			}),
+			teleport_funding_txid: None,
 		};
 
 		let encoded_value = cr.encode();

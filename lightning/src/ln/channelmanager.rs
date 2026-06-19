@@ -13748,6 +13748,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							my_current_per_commitment_point: PublicKey::from_slice(&[2u8; 33]).unwrap(),
 							next_funding: None,
 							my_current_funding_locked: None,
+							teleport_funding_txid: None,
 						},
 					});
 					return Err(MsgHandleErrInternal::no_such_channel_for_peer(counterparty_node_id, msg.channel_id)

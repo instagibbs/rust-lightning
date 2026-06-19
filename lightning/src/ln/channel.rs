@@ -3497,26 +3497,55 @@ impl PendingTeleport {
 		}
 	}
 
-	/// Whether this state must survive a reconnect/restart. States up to and including the
-	/// new-scope `commitment_signed` *exchange* are non-persistent: a disconnect simply abandons the
-	/// attempt and BOTH sides fall back to the old funding scope. Only once the exchange has fully
-	/// completed (both `commitment_signed` processed, neither having yet promoted — i.e. the
-	/// `AwaitingLocalComplete`/`AwaitingRemoteComplete` and later states) must the teleport resume
-	/// from persisted state, so those states are persistent.
+	/// The new funding outpoint this teleport is re-pointing the channel at.
+	pub(crate) fn new_funding_txo(&self) -> OutPoint {
+		match self {
+			Self::AwaitingTeleportAck { new_funding_txo, .. }
+			| Self::AwaitingUserDecision { new_funding_txo, .. }
+			| Self::AwaitingTeleportAckSend { new_funding_txo, .. }
+			| Self::AwaitingRemoteCommitmentSigned { new_funding_txo, .. }
+			| Self::AwaitingLocalComplete { new_funding_txo, .. }
+			| Self::AwaitingRemoteComplete { new_funding_txo, .. }
+			| Self::AwaitingTeleportCompleteAck { new_funding_txo, .. }
+			| Self::AwaitingTeleportCompleteAckSend { new_funding_txo, .. }
+			| Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend { new_funding_txo, .. } => {
+				*new_funding_txo
+			},
+		}
+	}
+
+	/// Whether this state must survive a reconnect/restart. States *before* the side has both sent
+	/// its own new-scope `commitment_signed` AND committed to the exchange are non-persistent: a
+	/// disconnect abandons the attempt and that side falls back to the old funding scope.
 	///
-	/// Note `AwaitingRemoteCommitmentSigned` is non-persistent for BOTH `is_initiator` values. This
-	/// is deliberate and symmetric: in the mid-exchange window the responder (`{is_initiator:false}`)
-	/// has sent `teleport_ack`+its `commitment_signed` and the initiator (`{is_initiator:true}`) has
-	/// sent its own `commitment_signed`, but neither has processed the other's nor promoted. There is
-	/// no teleport `commitment_signed` resend path, so making `{is_initiator:true}` persistent would
-	/// strand the initiator quiesced forever after a disconnect (awaiting a `commitment_signed` that
-	/// never arrives) while the responder fell back to the old scope — a one-sided brick. Treating
-	/// both as non-persistent makes a disconnect in this window a clean symmetric abort to the old
-	/// scope.
+	/// The two `AwaitingRemoteCommitmentSigned` variants are treated **asymmetrically**, mirroring the
+	/// real asymmetry of the exchange:
+	///
+	/// * `{is_initiator:false}` (responder) is **non-persistent**. In this state the responder has
+	///   sent `teleport_ack`+its `commitment_signed` but has NOT yet processed the initiator's
+	///   `commitment_signed`. A disconnect here means the exchange never got off the ground on the
+	///   responder side, so it cleanly falls back to the old scope. (Symmetric-abort window: if the
+	///   initiator is likewise still `AwaitingRemoteCommitmentSigned`, BOTH abort — see the
+	///   reconnect gate in `handle_channel_reestablish`, which aborts the initiator when the peer's
+	///   reestablish no longer advertises the teleport scope.)
+	///
+	/// * `{is_initiator:true}` (initiator) is **persistent**. Here the initiator has sent its
+	///   `commitment_signed` and is awaiting the responder's. The responder may already have
+	///   PROCESSED the initiator's `commitment_signed` and advanced to the persistent
+	///   `AwaitingRemoteComplete` (it does so the moment it receives that message). If the
+	///   responder's own `commitment_signed` was in flight at the disconnect, dropping the
+	///   initiator's state would desync the two sides — the responder on the new scope, the
+	///   initiator reverted to the old — and the responder's redelivered `commitment_signed` would
+	///   then be mis-validated against the old scope and force-close the channel. Persisting the
+	///   initiator's state keeps it quiesced and routable so that redelivered `commitment_signed`
+	///   advances it to `AwaitingLocalComplete`. The reconnect gate still aborts it cleanly if the
+	///   responder did NOT advance (its reestablish then carries no teleport scope), preserving the
+	///   symmetric-abort behavior.
 	fn is_persistent(&self) -> bool {
 		matches!(
 			self,
-			Self::AwaitingLocalComplete { .. }
+			Self::AwaitingRemoteCommitmentSigned { is_initiator: true, .. }
+				| Self::AwaitingLocalComplete { .. }
 				| Self::AwaitingRemoteComplete { .. }
 				| Self::AwaitingTeleportCompleteAck { .. }
 				| Self::AwaitingTeleportCompleteAckSend { .. }
@@ -9052,6 +9081,28 @@ where
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
 		self.commitment_signed_check_state()?;
 
+		// Ark bridge defense-in-depth: a `commitment_signed` naming a `funding_txid` that is neither
+		// our current funding nor any pending (splice/teleport) scope is a stale new-scope teleport
+		// message — e.g. a counterparty that aborted the teleport after its new-scope
+		// `commitment_signed` was already in flight to us, which then arrives once we have reverted
+		// to the old scope. Validating it against the old scope would fail the signature check and
+		// force-close the channel. Drop it benignly instead. (On the happy path the teleport CS is
+		// routed to `teleport_commitment_signed` before reaching here, so this only fires on a stale
+		// message.) A normal old-scope CS carries our current funding txid and is unaffected.
+		if let Some(funding_txid) = msg.funding_txid {
+			let matches_known_scope = self.funding.get_funding_txid() == Some(funding_txid)
+				|| self.pending_funding().iter().any(|f| f.get_funding_txid() == Some(funding_txid));
+			if !matches_known_scope {
+				log_info!(
+					logger,
+					"Ignoring commitment_signed for unknown/stale funding txid {} on channel {}",
+					funding_txid,
+					&self.context.channel_id(),
+				);
+				return Ok(None);
+			}
+		}
+
 		if !self.pending_funding().is_empty() {
 			return Err(ChannelError::close(
 				"Got a single commitment_signed message when expecting a batch".to_owned(),
@@ -11072,6 +11123,40 @@ where
 			self.get_announcement_sigs(node_signer, chain_hash, user_config, best_block.height, logger)
 		};
 
+		// Ark bridge: reconcile the initiator's mid-CS-exchange teleport state on reconnect.
+		// In `AwaitingRemoteCommitmentSigned{is_initiator:true}` we have sent our new-scope
+		// `commitment_signed` and are awaiting the responder's. This state is persistent (it can
+		// survive a disconnect/restart) BUT it is only resumable if the responder is still pursuing
+		// the same teleport — which it signals by re-advertising the new funding txid in its
+		// reestablish. If the responder's reestablish does NOT carry our teleport scope, the
+		// responder abandoned the teleport (e.g. it never processed our `commitment_signed`, the
+		// symmetric-abort window), so we abort locally too: drop the teleport and exit quiescence,
+		// falling back to the old funding scope. We have staged no monitor update in this state, so
+		// there is nothing to revert. (If the responder IS still pursuing it, we keep waiting; its
+		// redelivered new-scope `commitment_signed` then routes through `teleport_commitment_signed`
+		// and advances us to `AwaitingLocalComplete`.)
+		if let Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
+			is_initiator: true, ..
+		}) = self.pending_teleport
+		{
+			let our_new_funding_txid =
+				self.pending_teleport.as_ref().map(|pt| pt.new_funding_txo().txid);
+			let responder_still_teleporting = msg.teleport_funding_txid.is_some()
+				&& msg.teleport_funding_txid == our_new_funding_txid;
+			if !responder_still_teleporting {
+				log_info!(
+					logger,
+					"Aborting mid-exchange teleport on reconnect (peer no longer advertises the \
+					 teleport scope); falling back to the old funding scope for channel {}",
+					&self.context.channel_id(),
+				);
+				self.pending_teleport = None;
+				if self.context.channel_state.is_quiescent() {
+					self.context.channel_state.clear_quiescent();
+				}
+			}
+		}
+
 		// Ark bridge: if we (the responder) promoted on `teleport_complete` but the initiator
 		// hasn't yet processed our `teleport_complete_ack`, resend it on reconnect.
 		let teleport_complete_ack = self.get_pending_teleport_complete_ack();
@@ -13009,6 +13094,30 @@ where
 		//     - MUST NOT include the `next_funding` TLV.
 	}
 
+	/// Ark bridge: the new funding txid to advertise on `channel_reestablish` for an in-flight,
+	/// unpromoted teleport. Returned for every teleport state from the new-scope `commitment_signed`
+	/// exchange onward (i.e. while a new scope exists that the counterparty must be told we are still
+	/// pursuing) and up until promotion. `None` for the pre-CS states (`AwaitingTeleportAck` /
+	/// `AwaitingUserDecision` / `AwaitingTeleportAckSend`) — there is no new-scope commitment to
+	/// reconcile yet — and when there is no teleport. The counterparty's mid-exchange initiator state
+	/// uses this to decide keep-vs-abort on reconnect (see `handle_channel_reestablish`).
+	fn maybe_get_teleport_funding_txid(&self) -> Option<Txid> {
+		self.pending_teleport.as_ref().and_then(|pending_teleport| match pending_teleport {
+			PendingTeleport::AwaitingRemoteCommitmentSigned { new_funding_txo, .. }
+			| PendingTeleport::AwaitingLocalComplete { new_funding_txo, .. }
+			| PendingTeleport::AwaitingRemoteComplete { new_funding_txo, .. }
+			| PendingTeleport::AwaitingTeleportCompleteAck { new_funding_txo, .. }
+			| PendingTeleport::AwaitingTeleportCompleteAckSend { new_funding_txo, .. }
+			| PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+				new_funding_txo,
+				..
+			} => Some(new_funding_txo.txid),
+			PendingTeleport::AwaitingTeleportAck { .. }
+			| PendingTeleport::AwaitingUserDecision { .. }
+			| PendingTeleport::AwaitingTeleportAckSend { .. } => None,
+		})
+	}
+
 	fn maybe_get_my_current_funding_locked(&self) -> Option<msgs::FundingLocked> {
 		self.pending_splice
 			.as_ref()
@@ -13092,6 +13201,7 @@ where
 			my_current_per_commitment_point: dummy_pubkey,
 			next_funding: self.maybe_get_next_funding(),
 			my_current_funding_locked,
+			teleport_funding_txid: self.maybe_get_teleport_funding_txid(),
 		}
 	}
 
