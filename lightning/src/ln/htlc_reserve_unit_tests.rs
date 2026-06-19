@@ -892,6 +892,7 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 		cltv_expiry: htlc_cltv,
 		payment_hash,
 		transaction_output_index: Some(1),
+		ark_htlc_success_csv_delta: None,
 	};
 
 	let local_chan_balance_msat = chan_amt_sat * 1000 - push_amt_msat;
@@ -2150,6 +2151,7 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 			cltv_expiry: 81,
 			payment_hash,
 			transaction_output_index: None,
+			ark_htlc_success_csv_delta: None,
 		};
 		htlcs.push(accepted_htlc);
 	}
@@ -2263,6 +2265,7 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 			cltv_expiry,
 			payment_hash: payment_hash_0_1,
 			transaction_output_index: None,
+			ark_htlc_success_csv_delta: None,
 		};
 		htlcs.push(accepted_htlc_info);
 
@@ -3487,6 +3490,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash: payment_hashes.iter().find(|hash| hash.0[0] == 0x75).unwrap().clone(),
 			amount_msat: 688_000,
 			transaction_output_index: Some(0),
+			ark_htlc_success_csv_delta: None,
 		},
 		HTLCOutputInCommitment {
 			offered: false,
@@ -3494,6 +3498,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash: payment_hashes.iter().find(|hash| hash.0[0] == 0x64).unwrap().clone(),
 			amount_msat: 688_000,
 			transaction_output_index: Some(1),
+			ark_htlc_success_csv_delta: None,
 		},
 		HTLCOutputInCommitment {
 			offered: false,
@@ -3501,6 +3506,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash,
 			amount_msat: 688_000,
 			transaction_output_index: Some(2),
+			ark_htlc_success_csv_delta: None,
 		},
 		HTLCOutputInCommitment {
 			offered: false,
@@ -3508,6 +3514,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash: payment_hashes.iter().find(|hash| hash.0[0] == 0x72).unwrap().clone(),
 			amount_msat: 688_000,
 			transaction_output_index: Some(3),
+			ark_htlc_success_csv_delta: None,
 		},
 		HTLCOutputInCommitment {
 			offered: false,
@@ -3515,6 +3522,7 @@ fn test_fail_cannot_afford_dust_htlcs_at_spike_multiple_if_nondust_at_base_feera
 			payment_hash: payment_hashes.iter().find(|hash| hash.0[0] == 0x66).unwrap().clone(),
 			amount_msat: 688_000,
 			transaction_output_index: Some(4),
+			ark_htlc_success_csv_delta: None,
 		},
 	];
 

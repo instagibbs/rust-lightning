@@ -55,35 +55,42 @@ use super::chaininterface::LowerBoundedFeeEstimator;
 const MAX_ALLOC_SIZE: usize = 64 * 1024;
 
 #[rustfmt::skip]
-pub(crate) fn weight_revoked_offered_htlc(channel_type_features: &ChannelTypeFeatures) -> u64 {
+pub(crate) fn weight_revoked_offered_htlc(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	// number_of_witness_elements + sig_length + revocation_sig + pubkey_length + revocationpubkey + witness_script_length + witness_script
 	const WEIGHT_REVOKED_OFFERED_HTLC: u64 = 1 + 1 + 73 + 1 + 33 + 1 + 133;
 	const WEIGHT_REVOKED_OFFERED_HTLC_ANCHORS: u64 = WEIGHT_REVOKED_OFFERED_HTLC + 3; // + OP_1 + OP_CSV + OP_DROP
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_REVOKED_OFFERED_HTLC_ANCHORS } else { WEIGHT_REVOKED_OFFERED_HTLC }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_REVOKED_OFFERED_HTLC_ANCHORS } else { WEIGHT_REVOKED_OFFERED_HTLC };
+	base + crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 #[rustfmt::skip]
-pub(crate) fn weight_revoked_received_htlc(channel_type_features: &ChannelTypeFeatures) -> u64 {
+pub(crate) fn weight_revoked_received_htlc(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	// number_of_witness_elements + sig_length + revocation_sig + pubkey_length + revocationpubkey + witness_script_length + witness_script
 	const WEIGHT_REVOKED_RECEIVED_HTLC: u64 = 1 + 1 + 73 + 1 + 33 + 1 +  139;
 	const WEIGHT_REVOKED_RECEIVED_HTLC_ANCHORS: u64 = WEIGHT_REVOKED_RECEIVED_HTLC + 3; // + OP_1 + OP_CSV + OP_DROP
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_REVOKED_RECEIVED_HTLC_ANCHORS } else { WEIGHT_REVOKED_RECEIVED_HTLC }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_REVOKED_RECEIVED_HTLC_ANCHORS } else { WEIGHT_REVOKED_RECEIVED_HTLC };
+	base + crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 #[rustfmt::skip]
-pub(crate) fn weight_offered_htlc(channel_type_features: &ChannelTypeFeatures) -> u64 {
+pub(crate) fn weight_offered_htlc(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	// number_of_witness_elements + sig_length + counterpartyhtlc_sig  + preimage_length + preimage + witness_script_length + witness_script
 	const WEIGHT_OFFERED_HTLC: u64 = 1 + 1 + 73 + 1 + 32 + 1 + 133;
 	const WEIGHT_OFFERED_HTLC_ANCHORS: u64 = WEIGHT_OFFERED_HTLC + 3; // + OP_1 + OP_CSV + OP_DROP
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_OFFERED_HTLC_ANCHORS } else { WEIGHT_OFFERED_HTLC }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_OFFERED_HTLC_ANCHORS } else { WEIGHT_OFFERED_HTLC };
+	// Ark HTLC scripts include an extra `<delta> OP_CSV OP_DROP` suffix on the success branch;
+	// the witness always carries the full witness script so the extra bytes apply to every spend
+	// path (success or timeout) that uses this script shape.
+	base + crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 #[rustfmt::skip]
-pub(crate) fn weight_received_htlc(channel_type_features: &ChannelTypeFeatures) -> u64 {
+pub(crate) fn weight_received_htlc(channel_type_features: &ChannelTypeFeatures, ark_htlc_success_csv_delta: Option<u16>) -> u64 {
 	// number_of_witness_elements + sig_length + counterpartyhtlc_sig + empty_vec_length + empty_vec + witness_script_length + witness_script
 	const WEIGHT_RECEIVED_HTLC: u64 = 1 + 1 + 73 + 1 + 1 + 1 + 139;
 	const WEIGHT_RECEIVED_HTLC_ANCHORS: u64 = WEIGHT_RECEIVED_HTLC + 3; // + OP_1 + OP_CSV + OP_DROP
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_RECEIVED_HTLC_ANCHORS } else { WEIGHT_RECEIVED_HTLC }
+	let base = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { WEIGHT_RECEIVED_HTLC_ANCHORS } else { WEIGHT_RECEIVED_HTLC };
+	base + crate::ln::chan_utils::ark_htlc_success_csv_suffix_weight(ark_htlc_success_csv_delta)
 }
 
 /// Verifies deserializable channel type features
@@ -98,6 +105,7 @@ pub(crate) fn verify_channel_type_features(channel_type_features: &Option<Channe
 		supported_feature_set.set_scid_privacy_required();
 		supported_feature_set.set_zero_conf_required();
 		supported_feature_set.set_anchor_zero_fee_commitments_required();
+		supported_feature_set.set_ark_channel_required();
 
 		// allow the passing of an additional necessary permitted flag
 		if let Some(additional_permitted_features) = additional_permitted_features {
@@ -216,9 +224,9 @@ impl RevokedHTLCOutput {
 		outpoint_confirmation_height: u32,
 	) -> Self {
 		let weight = if htlc.offered {
-			weight_revoked_offered_htlc(&channel_parameters.channel_type_features)
+			weight_revoked_offered_htlc(&channel_parameters.channel_type_features, htlc.ark_htlc_success_csv_delta)
 		} else {
-			weight_revoked_received_htlc(&channel_parameters.channel_type_features)
+			weight_revoked_received_htlc(&channel_parameters.channel_type_features, htlc.ark_htlc_success_csv_delta)
 		};
 		let directed_params = channel_parameters.as_counterparty_broadcastable();
 		let counterparty_keys = directed_params.broadcaster_pubkeys();
@@ -768,17 +776,19 @@ impl PackageSolvingData {
 		match self {
 			PackageSolvingData::RevokedOutput(ref outp) => outp.weight as usize,
 			PackageSolvingData::RevokedHTLCOutput(ref outp) => outp.weight as usize,
-			PackageSolvingData::CounterpartyOfferedHTLCOutput(ref outp) => weight_offered_htlc(&outp.channel_type_features) as usize,
-			PackageSolvingData::CounterpartyReceivedHTLCOutput(ref outp) => weight_received_htlc(&outp.channel_type_features) as usize,
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(ref outp) => weight_offered_htlc(&outp.channel_type_features, outp.htlc.ark_htlc_success_csv_delta) as usize,
+			PackageSolvingData::CounterpartyReceivedHTLCOutput(ref outp) => weight_received_htlc(&outp.channel_type_features, outp.htlc.ark_htlc_success_csv_delta) as usize,
 			PackageSolvingData::HolderHTLCOutput(ref outp) => {
 				let free_htlcs = outp.channel_type_features.supports_anchors_zero_fee_htlc_tx();
 				let free_commitments =
 					outp.channel_type_features.supports_anchor_zero_fee_commitments();
 				debug_assert!(free_htlcs || free_commitments);
+				let ark_delta = outp.htlc_descriptor.as_ref()
+					.and_then(|d| d.htlc.ark_htlc_success_csv_delta);
 				if outp.preimage.is_none() {
-					weight_offered_htlc(&outp.channel_type_features) as usize
+					weight_offered_htlc(&outp.channel_type_features, ark_delta) as usize
 				} else {
-					weight_received_htlc(&outp.channel_type_features) as usize
+					weight_received_htlc(&outp.channel_type_features, ark_delta) as usize
 				}
 			},
 			// Since HolderFundingOutput maps to an untractable package that is already signed, its
@@ -852,10 +862,15 @@ impl PackageSolvingData {
 		let sequence = match self {
 			PackageSolvingData::RevokedOutput(_) => Sequence::ENABLE_RBF_NO_LOCKTIME,
 			PackageSolvingData::RevokedHTLCOutput(_) => Sequence::ENABLE_RBF_NO_LOCKTIME,
-			PackageSolvingData::CounterpartyOfferedHTLCOutput(outp) => if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
-				Sequence::from_consensus(1)
-			} else {
-				Sequence::ENABLE_RBF_NO_LOCKTIME
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(outp) => {
+				// Ark-on-Lightning: when the counterparty-offered HTLC carries a success-branch
+				// CSV delta, the preimage spend this package constructs must satisfy that relative
+				// timelock or it is consensus-invalid and can never confirm. Use the max of the
+				// baseline anchor CSV (1 block if applicable) and the Ark delta.
+				let baseline: u32 = if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx() { 1 } else { 0 };
+				let ark_csv: u32 = outp.htlc.ark_htlc_success_csv_delta.unwrap_or(0) as u32;
+				let csv = core::cmp::max(baseline, ark_csv);
+				if csv == 0 { Sequence::ENABLE_RBF_NO_LOCKTIME } else { Sequence::from_consensus(csv) }
 			},
 			PackageSolvingData::CounterpartyReceivedHTLCOutput(outp) => if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
 				Sequence::from_consensus(1)
@@ -1830,7 +1845,7 @@ mod tests {
 				let dumb_scalar = SecretKey::from_slice(&<Vec<u8>>::from_hex("0101010101010101010101010101010101010101010101010101010101010101").unwrap()[..]).unwrap();
 				let dumb_point = PublicKey::from_secret_key(&secp_ctx, &dumb_scalar);
 				let hash = PaymentHash([1; 32]);
-				let htlc = HTLCOutputInCommitment { offered: false, amount_msat: 1_000_000, cltv_expiry: 0, payment_hash: hash, transaction_output_index: None };
+				let htlc = HTLCOutputInCommitment { offered: false, amount_msat: 1_000_000, cltv_expiry: 0, payment_hash: hash, transaction_output_index: None, ark_htlc_success_csv_delta: None };
 				let mut channel_parameters = ChannelTransactionParameters::test_dummy(0);
 				channel_parameters.channel_type_features =
 					ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
@@ -1849,7 +1864,7 @@ mod tests {
 				let dumb_scalar = SecretKey::from_slice(&<Vec<u8>>::from_hex("0101010101010101010101010101010101010101010101010101010101010101").unwrap()[..]).unwrap();
 				let dumb_point = PublicKey::from_secret_key(&secp_ctx, &dumb_scalar);
 				let hash = PaymentHash([1; 32]);
-				let htlc = HTLCOutputInCommitment { offered: true, amount_msat: $amt, cltv_expiry: $expiry, payment_hash: hash, transaction_output_index: None };
+				let htlc = HTLCOutputInCommitment { offered: true, amount_msat: $amt, cltv_expiry: $expiry, payment_hash: hash, transaction_output_index: None, ark_htlc_success_csv_delta: None };
 				let mut channel_parameters = ChannelTransactionParameters::test_dummy(0);
 				channel_parameters.channel_type_features = $features;
 				PackageSolvingData::CounterpartyReceivedHTLCOutput(
@@ -1862,13 +1877,16 @@ mod tests {
 	#[rustfmt::skip]
 	macro_rules! dumb_counterparty_offered_output {
 		($amt: expr, $features: expr) => {
+			dumb_counterparty_offered_output!($amt, $features, None)
+		};
+		($amt: expr, $features: expr, $ark_delta: expr) => {
 			{
 				let secp_ctx = Secp256k1::new();
 				let dumb_scalar = SecretKey::from_slice(&<Vec<u8>>::from_hex("0101010101010101010101010101010101010101010101010101010101010101").unwrap()[..]).unwrap();
 				let dumb_point = PublicKey::from_secret_key(&secp_ctx, &dumb_scalar);
 				let hash = PaymentHash([1; 32]);
 				let preimage = PaymentPreimage([2;32]);
-				let htlc = HTLCOutputInCommitment { offered: false, amount_msat: $amt, cltv_expiry: 0, payment_hash: hash, transaction_output_index: None };
+				let htlc = HTLCOutputInCommitment { offered: false, amount_msat: $amt, cltv_expiry: 0, payment_hash: hash, transaction_output_index: None, ark_htlc_success_csv_delta: $ark_delta };
 				let mut channel_parameters = ChannelTransactionParameters::test_dummy(0);
 				channel_parameters.channel_type_features = $features;
 				PackageSolvingData::CounterpartyOfferedHTLCOutput(
@@ -1891,6 +1909,7 @@ mod tests {
 					cltv_expiry: 420,
 					payment_hash: PaymentHash::from(preimage),
 					transaction_output_index: None,
+					ark_htlc_success_csv_delta: None,
 				};
 				let funding_outpoint = channel_parameters.funding_outpoint.unwrap();
 				let commitment_tx = HolderCommitmentTransaction::dummy(0, funding_outpoint, vec![htlc.clone()]);
@@ -1928,6 +1947,7 @@ mod tests {
 					cltv_expiry: $cltv_expiry,
 					payment_hash: PaymentHash::from(PaymentPreimage([2;32])),
 					transaction_output_index: None,
+					ark_htlc_success_csv_delta: None,
 				};
 				let funding_outpoint = channel_parameters.funding_outpoint.unwrap();
 				let commitment_tx = HolderCommitmentTransaction::dummy(0, funding_outpoint, vec![htlc.clone()]);
@@ -2186,7 +2206,7 @@ mod tests {
 			for channel_type_features in [ChannelTypeFeatures::only_static_remote_key(), ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies()].iter() {
 				let counterparty_outp = dumb_counterparty_received_output!(1_000_000, 1000, channel_type_features.clone());
 				let package = PackageTemplate::build_package(fake_txid(1), 0, counterparty_outp, 1000);
-				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_received_htlc(channel_type_features));
+				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_received_htlc(channel_type_features, None));
 			}
 		}
 
@@ -2194,8 +2214,51 @@ mod tests {
 			for channel_type_features in [ChannelTypeFeatures::only_static_remote_key(), ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies()].iter() {
 				let counterparty_outp = dumb_counterparty_offered_output!(1_000_000, channel_type_features.clone());
 				let package = PackageTemplate::build_package(fake_txid(1), 0, counterparty_outp, 1000);
-				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_offered_htlc(channel_type_features));
+				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_offered_htlc(channel_type_features, None));
 			}
+		}
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn test_ark_counterparty_offered_claim_sequence_and_weight() {
+		// SAFETY-CRITICAL: when an Ark counterparty-offered HTLC carries a success-branch CSV
+		// delta, the witness script (`get_htlc_redeemscript`) emits `<delta> OP_CSV OP_DROP`, so
+		// the single-stage preimage spend this package constructs MUST set nSequence >= delta or
+		// it is consensus-invalid (rejected by the relative-timelock check) and can never confirm.
+		// This asserts `as_tx_input` carries the delta into nSequence and that the package weight
+		// accounts for the extra suffix bytes.
+		use bitcoin::Sequence;
+
+		const ARK_DELTA: u16 = 1008;
+		// (nVersion (4) + nLocktime (4) + count_tx_in (1) + prevout (36) + sequence (4) + script_length (1) + count_tx_out (1) + value (8) + var_int (1)) * WITNESS_SCALE_FACTOR + witness marker (2)
+		let weight_sans_output = (4 + 4 + 1 + 36 + 4 + 1 + 1 + 8 + 1) * WITNESS_SCALE_FACTOR as u64 + 2;
+
+		for channel_type_features in [
+			ChannelTypeFeatures::only_static_remote_key(),
+			ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies(),
+		].iter() {
+			let ark_outp = dumb_counterparty_offered_output!(1_000_000, channel_type_features.clone(), Some(ARK_DELTA));
+
+			// nSequence on the claim input must satisfy the script's relative timelock.
+			let txin = ark_outp.as_tx_input(BitcoinOutPoint { txid: fake_txid(1), vout: 0 });
+			assert_eq!(
+				txin.sequence,
+				Sequence::from_consensus(ARK_DELTA as u32),
+				"counterparty-offered HTLC preimage claim must lock nSequence to the Ark CSV delta",
+			);
+			assert!(
+				txin.sequence.to_consensus_u32() >= ARK_DELTA as u32,
+				"claim nSequence must be >= the Ark CSV delta to be consensus-valid",
+			);
+
+			// Fee estimation must include the extra `<delta> OP_CSV OP_DROP` witness-script bytes.
+			let package = PackageTemplate::build_package(fake_txid(1), 0, ark_outp, 1000);
+			assert_eq!(
+				package.package_weight(&ScriptBuf::new()),
+				weight_sans_output + weight_offered_htlc(channel_type_features, Some(ARK_DELTA)),
+				"package weight must account for the Ark CSV suffix",
+			);
 		}
 	}
 

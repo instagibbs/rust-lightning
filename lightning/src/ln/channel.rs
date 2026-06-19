@@ -1239,6 +1239,9 @@ pub(super) struct MonitorRestoreUpdates {
 	/// Whether the restoration changed serialized channel state that needs ChannelManager
 	/// persistence.
 	pub requires_channel_manager_persistence: bool,
+	/// Ark bridge: a `teleport_complete_ack` to (re)send if we (the responder) promoted on a
+	/// `teleport_complete` but the initiator hasn't yet processed our ack.
+	pub teleport_complete_ack: Option<msgs::TeleportCompleteAck>,
 }
 
 /// The return value of `signer_maybe_unblocked`
@@ -1270,6 +1273,9 @@ pub(super) struct ReestablishResponses {
 	pub tx_abort: Option<msgs::TxAbort>,
 	pub splice_locked: Option<msgs::SpliceLocked>,
 	pub inferred_splice_locked: Option<msgs::SpliceLocked>,
+	/// Ark bridge: a `teleport_complete_ack` to (re)send on reconnect if we (the responder)
+	/// promoted on a `teleport_complete` but the initiator hasn't yet processed our ack.
+	pub teleport_complete_ack: Option<msgs::TeleportCompleteAck>,
 }
 
 /// The first message we send to our peer after connection
@@ -1751,19 +1757,29 @@ where
 			if matches!(chan.context.channel_state, ChannelState::ChannelReady(_)) {
 				chan.context.channel_state.clear_local_stfu_sent();
 				chan.context.channel_state.clear_remote_stfu_sent();
+				// Ark bridge: a teleport that hasn't yet exchanged the new-scope commitments is
+				// abandoned on disconnect (we fall back to the old scope); a persistent teleport
+				// must keep the channel quiesced so it can resume after reconnect.
+				chan.clear_nonpersistent_teleport();
 				if chan.should_reset_pending_splice_state(true) {
 					// If there was a pending splice negotiation that failed due to disconnecting, we
 					// also take the opportunity to clean up our state.
 					let splice_funding_failed = chan.reset_pending_splice_state();
 					debug_assert!(!chan.context.channel_state.is_quiescent());
 					splice_funding_failed
-				} else if !chan.has_pending_splice_awaiting_signatures() {
+				} else if !chan.has_pending_splice_awaiting_signatures()
+					&& !chan.has_persistent_teleport()
+				{
 					// We shouldn't be quiescent anymore upon reconnecting if:
 					// - We were in quiescence but a splice/RBF was never negotiated or
 					// - We were in quiescence but the splice negotiation failed due to disconnecting
+					// - We were in quiescence for a teleport that never exchanged commitments
 					//
 					// NOTE: While `exit_quiescence` clears the disconnect timer, it should already
 					// have been cleared by `remove_uncommitted_htlcs_and_mark_paused`.
+					if matches!(chan.quiescent_action, Some(QuiescentAction::Teleport { .. })) {
+						chan.quiescent_action = None;
+					}
 					chan.exit_quiescence();
 					None
 				} else {
@@ -2385,6 +2401,7 @@ where
 					holder_commitment_point,
 					pending_splice: None,
 					quiescent_action: None,
+					pending_teleport: None,
 				};
 				let res = funded_channel.initial_commitment_signed_v2(msg, best_block, signer_provider, logger)
 					.map(|monitor| (Some(monitor), None))
@@ -2413,7 +2430,34 @@ where
 					// Not having a signing session implies they've already sent `splice_locked`,
 					// which must always come after the initial commitment signed is sent.
 					.unwrap_or(true);
-				let res = if has_negotiated_pending_splice && !session_received_commitment_signed {
+				// Ark bridge: a `commitment_signed` received while we're awaiting the counterparty's
+				// new-scope commitment during a teleport is routed to the teleport state machine
+				// rather than the normal commitment path.
+				let res = if let Some((new_funding_txo, is_initiator)) = funded_channel
+					.pending_teleport
+					.as_ref()
+					.and_then(|pending_teleport| {
+						if let PendingTeleport::AwaitingRemoteCommitmentSigned {
+							new_funding_txo,
+							is_initiator,
+							responder_value_removal_sat: _,
+						} = pending_teleport
+						{
+							Some((*new_funding_txo, *is_initiator))
+						} else {
+							None
+						}
+					}) {
+					funded_channel
+						.teleport_commitment_signed(
+							msg,
+							new_funding_txo,
+							is_initiator,
+							fee_estimator,
+							logger,
+						)
+						.map(|monitor_update_opt| (None, monitor_update_opt))
+				} else if has_negotiated_pending_splice && !session_received_commitment_signed {
 					let has_holder_witnesses = funded_channel
 						.context
 						.interactive_tx_signing_session
@@ -2854,6 +2898,7 @@ impl FundingScope {
 			splice_parent_funding_txid: prev_funding.get_funding_txid(),
 			channel_type_features: channel_parameters.channel_type_features.clone(),
 			channel_value_satoshis: post_channel_value_sat,
+			ark_htlc_success_csv_delta: channel_parameters.ark_htlc_success_csv_delta,
 		};
 		post_channel_transaction_parameters
 			.counterparty_parameters
@@ -2926,6 +2971,68 @@ impl FundingScope {
 			minimum_depth_override: None,
 			short_channel_id: None,
 		})
+	}
+
+	/// Constructs a `FundingScope` for teleporting a channel to a new funding outpoint.
+	///
+	/// `channel_value_delta_sat` and `local_value_to_self_delta_msat` are signed deltas applied
+	/// on top of `prev_funding`'s values. For value-preserving teleports both are 0 (the typical
+	/// case). For responder-side liquidity removal of X sats during a refresh:
+	/// - both sides pass `channel_value_delta_sat = -X`
+	/// - the responder passes `local_value_to_self_delta_msat = -X*1000`
+	/// - the initiator passes `local_value_to_self_delta_msat = 0`
+	///
+	/// See `teleport_funding` on the channel for the side-aware wiring.
+	///
+	/// Note that this does NOT touch any commitment-number / per-commitment-point state: those
+	/// live on the channel (in `ChannelContext`/`holder_commitment_point`), not in the
+	/// `FundingScope`. Because the funding keys and basepoints are reused across scopes (the
+	/// cloned `channel_transaction_parameters`), the new scope MUST continue the existing
+	/// commitment sequence — see [H1]. Resetting the numbering would re-reveal already-revealed
+	/// per-commitment secrets and pre-revoke the new scope. Continuity is preserved structurally:
+	/// promotion only swaps `self.funding`, leaving the counters untouched.
+	fn for_teleport(
+		prev_funding: &Self, new_funding_txo: OutPoint, channel_value_delta_sat: i64,
+		local_value_to_self_delta_msat: i64,
+	) -> Self {
+		let mut channel_transaction_parameters =
+			prev_funding.channel_transaction_parameters.clone();
+		channel_transaction_parameters.funding_outpoint = Some(new_funding_txo);
+		channel_transaction_parameters.splice_parent_funding_txid = None;
+		channel_transaction_parameters.channel_value_satoshis = (channel_transaction_parameters
+			.channel_value_satoshis as i64
+			+ channel_value_delta_sat) as u64;
+
+		let new_value_to_self_msat =
+			(prev_funding.value_to_self_msat as i64 + local_value_to_self_delta_msat) as u64;
+
+		Self {
+			value_to_self_msat: new_value_to_self_msat,
+			counterparty_selected_channel_reserve_satoshis: prev_funding
+				.counterparty_selected_channel_reserve_satoshis,
+			holder_selected_channel_reserve_satoshis: prev_funding
+				.holder_selected_channel_reserve_satoshis,
+			#[cfg(debug_assertions)]
+			holder_prev_commitment_tx_balance: {
+				let prev = *prev_funding.holder_prev_commitment_tx_balance.lock().unwrap();
+				Mutex::new(prev)
+			},
+			#[cfg(debug_assertions)]
+			counterparty_prev_commitment_tx_balance: {
+				let prev = *prev_funding.counterparty_prev_commitment_tx_balance.lock().unwrap();
+				Mutex::new(prev)
+			},
+			#[cfg(any(test, fuzzing))]
+			next_local_fee: Mutex::new(*prev_funding.next_local_fee.lock().unwrap()),
+			#[cfg(any(test, fuzzing))]
+			next_remote_fee: Mutex::new(*prev_funding.next_remote_fee.lock().unwrap()),
+			channel_transaction_parameters,
+			funding_transaction: None,
+			funding_tx_confirmed_in: None,
+			funding_tx_confirmation_height: 0,
+			short_channel_id: None,
+			minimum_depth_override: None,
+		}
 	}
 
 	/// Returns a `SharedOwnedInput` for using this `FundingScope` as the input to a new splice.
@@ -3284,6 +3391,14 @@ pub(crate) enum QuiescentAction {
 		contribution: FundingContribution,
 		locktime: LockTime,
 	},
+	/// Ark bridge: re-point the channel to a new funding outpoint once both sides are quiescent.
+	Teleport {
+		new_funding_txo: OutPoint,
+		/// Sats the responder is removing from their side of the channel as part of this
+		/// teleport. `0` for value-preserving teleports (existing behavior). The bark refresh
+		/// coordinator sets this from the leaf-cosign result.
+		responder_value_removal_sat: u64,
+	},
 	#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 	DoNothing,
 }
@@ -3298,7 +3413,157 @@ pub(crate) enum StfuResponse {
 	Stfu(msgs::Stfu),
 	SpliceInit(msgs::SpliceInit),
 	TxInitRbf(msgs::TxInitRbf),
+	TeleportInit(msgs::TeleportInit),
 }
+
+/// Tracks the progress of an in-flight (Ark bridge-model) channel teleport — re-pointing an open
+/// channel to a new funding outpoint over quiescence.
+///
+/// The new-funding spend is stock ECDSA 2-of-2, so — unlike the donor's MuSig2 design — none of
+/// these states carry any nonce. The state machine is symmetric except at promotion: the
+/// responder promotes its `FundingScope` on receiving `teleport_complete`, while the initiator
+/// promotes only on receiving `teleport_complete_ack`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PendingTeleport {
+	/// Initiator: sent `teleport_init`, awaiting the responder's `teleport_ack`.
+	AwaitingTeleportAck { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	/// Responder: received `teleport_init`, surfaced a [`Event::ChannelTeleport`], awaiting the
+	/// user's `ack_teleport`/`cancel_teleport` decision.
+	///
+	/// [`Event::ChannelTeleport`]: crate::events::Event::ChannelTeleport
+	AwaitingUserDecision { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	/// Responder: queued `teleport_ack` (+ new-scope `commitment_signed`), awaiting it to actually
+	/// leave the outbound queue (`teleport_ack_sent`).
+	AwaitingTeleportAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	/// Awaiting the counterparty's new-scope `commitment_signed`. `is_initiator` records which
+	/// side we are so we know which completion state to advance to.
+	AwaitingRemoteCommitmentSigned {
+		new_funding_txo: OutPoint,
+		is_initiator: bool,
+		responder_value_removal_sat: u64,
+	},
+	/// Initiator: new-scope commitments exchanged, awaiting the user's `complete_teleport`.
+	AwaitingLocalComplete { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	/// Responder: new-scope commitments exchanged, awaiting the initiator's `teleport_complete`.
+	AwaitingRemoteComplete { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	/// Initiator: sent `teleport_complete`, awaiting the responder's `teleport_complete_ack`
+	/// (after which the initiator promotes).
+	AwaitingTeleportCompleteAck { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	/// Responder: promoted on `teleport_complete` receipt and queued `teleport_complete_ack`,
+	/// awaiting it to leave the outbound queue (`teleport_complete_ack_sent`).
+	AwaitingTeleportCompleteAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	/// Responder: `teleport_complete_ack` sent; awaiting any post-promotion activity from the
+	/// initiator that demonstrates it processed the ack (and thus promoted too), at which point
+	/// the teleport is fully resolved.
+	AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+		new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+	},
+}
+
+impl PendingTeleport {
+	/// Satoshis the responder is removing from the channel as part of this teleport.
+	/// `0` for value-preserving teleports (existing semantics).
+	pub(crate) fn responder_value_removal_sat(&self) -> u64 {
+		match self {
+			Self::AwaitingTeleportAck { responder_value_removal_sat, .. } => {
+				*responder_value_removal_sat
+			},
+			Self::AwaitingUserDecision { responder_value_removal_sat, .. } => {
+				*responder_value_removal_sat
+			},
+			Self::AwaitingTeleportAckSend { responder_value_removal_sat, .. } => {
+				*responder_value_removal_sat
+			},
+			Self::AwaitingRemoteCommitmentSigned { responder_value_removal_sat, .. } => {
+				*responder_value_removal_sat
+			},
+			Self::AwaitingLocalComplete { responder_value_removal_sat, .. } => {
+				*responder_value_removal_sat
+			},
+			Self::AwaitingRemoteComplete { responder_value_removal_sat, .. } => {
+				*responder_value_removal_sat
+			},
+			Self::AwaitingTeleportCompleteAck { responder_value_removal_sat, .. } => {
+				*responder_value_removal_sat
+			},
+			Self::AwaitingTeleportCompleteAckSend { responder_value_removal_sat, .. } => {
+				*responder_value_removal_sat
+			},
+			Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+				responder_value_removal_sat,
+				..
+			} => *responder_value_removal_sat,
+		}
+	}
+
+	/// Whether this state must survive a reconnect/restart. States up to and including the
+	/// new-scope `commitment_signed` *exchange* are non-persistent: a disconnect simply abandons the
+	/// attempt and BOTH sides fall back to the old funding scope. Only once the exchange has fully
+	/// completed (both `commitment_signed` processed, neither having yet promoted — i.e. the
+	/// `AwaitingLocalComplete`/`AwaitingRemoteComplete` and later states) must the teleport resume
+	/// from persisted state, so those states are persistent.
+	///
+	/// Note `AwaitingRemoteCommitmentSigned` is non-persistent for BOTH `is_initiator` values. This
+	/// is deliberate and symmetric: in the mid-exchange window the responder (`{is_initiator:false}`)
+	/// has sent `teleport_ack`+its `commitment_signed` and the initiator (`{is_initiator:true}`) has
+	/// sent its own `commitment_signed`, but neither has processed the other's nor promoted. There is
+	/// no teleport `commitment_signed` resend path, so making `{is_initiator:true}` persistent would
+	/// strand the initiator quiesced forever after a disconnect (awaiting a `commitment_signed` that
+	/// never arrives) while the responder fell back to the old scope — a one-sided brick. Treating
+	/// both as non-persistent makes a disconnect in this window a clean symmetric abort to the old
+	/// scope.
+	fn is_persistent(&self) -> bool {
+		matches!(
+			self,
+			Self::AwaitingLocalComplete { .. }
+				| Self::AwaitingRemoteComplete { .. }
+				| Self::AwaitingTeleportCompleteAck { .. }
+				| Self::AwaitingTeleportCompleteAckSend { .. }
+				| Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. }
+		)
+	}
+}
+
+impl_writeable_tlv_based_enum_upgradable!(PendingTeleport,
+	(0, AwaitingTeleportAck) => {
+		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
+	},
+	(2, AwaitingUserDecision) => {
+		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
+	},
+	(4, AwaitingTeleportAckSend) => {
+		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
+	},
+	(6, AwaitingRemoteCommitmentSigned) => {
+		(0, new_funding_txo, required),
+		(2, is_initiator, required),
+		(4, responder_value_removal_sat, (default_value, 0u64)),
+	},
+	(8, AwaitingLocalComplete) => {
+		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
+	},
+	(10, AwaitingRemoteComplete) => {
+		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
+	},
+	(12, AwaitingTeleportCompleteAck) => {
+		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
+	},
+	(14, AwaitingTeleportCompleteAckSend) => {
+		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
+	},
+	(16, AwaitingRemoteActivityAfterTeleportCompleteAckSend) => {
+		(0, new_funding_txo, required),
+		(2, responder_value_removal_sat, (default_value, 0u64)),
+	},
+);
 
 /// Wrapper around a [`Transaction`] useful for caching the result of [`Transaction::compute_txid`].
 struct ConfirmedTransaction<'a> {
@@ -4158,6 +4423,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				splice_parent_funding_txid: None,
 				channel_type_features: channel_type.clone(),
 				channel_value_satoshis,
+				ark_htlc_success_csv_delta: ark_htlc_success_csv_delta_for_open(
+					&channel_type,
+					&config.channel_handshake_config,
+				),
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -4475,6 +4744,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				channel_type_features: channel_type.clone(),
 				// We'll add our counterparty's `funding_satoshis` when we receive `accept_channel2`.
 				channel_value_satoshis,
+				ark_htlc_success_csv_delta: ark_htlc_success_csv_delta_for_open(
+					&channel_type,
+					&config.channel_handshake_config,
+				),
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -6100,6 +6373,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 					cltv_expiry: $htlc.cltv_expiry,
 					payment_hash: $htlc.payment_hash,
 					transaction_output_index: None,
+					ark_htlc_success_csv_delta: funding.channel_transaction_parameters.ark_htlc_success_csv_delta,
 				}
 			}
 		}
@@ -7062,6 +7336,10 @@ pub(super) struct FundedChannel<SP: SignerProvider> {
 	/// initiator we may be able to merge this action into what the counterparty wanted to do (e.g.
 	/// in the case of splicing).
 	quiescent_action: Option<QuiescentAction>,
+
+	/// Ark bridge: state of an in-flight channel teleport handshake, if any. Persisted only once
+	/// the new-scope commitments have been exchanged (see [`PendingTeleport::is_persistent`]).
+	pending_teleport: Option<PendingTeleport>,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -7292,6 +7570,8 @@ where
 			QuiescentAction::Splice { contribution, .. } => {
 				Some(self.splice_funding_failed_for(contribution))
 			},
+			// A teleport has no in-flight funding contribution to fail.
+			QuiescentAction::Teleport { .. } => None,
 			#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 			QuiescentAction::DoNothing => None,
 		}
@@ -7342,6 +7622,169 @@ where
 				.unwrap_or(&mut [])
 				.iter_mut(),
 		)
+	}
+
+	/// Ark bridge: whether there is an in-flight teleport whose state must survive a reconnect.
+	fn has_persistent_teleport(&self) -> bool {
+		self.pending_teleport
+			.as_ref()
+			.map(|pending_teleport| pending_teleport.is_persistent())
+			.unwrap_or(false)
+	}
+
+	/// Ark bridge: drop any in-flight teleport whose state does NOT need to survive a reconnect
+	/// (i.e. one that hasn't yet exchanged the new-scope commitments). Called on disconnect.
+	fn clear_nonpersistent_teleport(&mut self) {
+		if self
+			.pending_teleport
+			.as_ref()
+			.map(|pending_teleport| !pending_teleport.is_persistent())
+			.unwrap_or(false)
+		{
+			self.pending_teleport.take();
+		}
+	}
+
+	/// Ark bridge: builds the new `FundingScope` for the teleport to `new_funding_txo`, applying
+	/// any responder-side value removal in a side-aware fashion.
+	///
+	/// The teleport-initiator (refresh-initiator) is assumed to be the same side as the
+	/// channel-open initiator in our refresh flow (the client refreshes its own channel). If that
+	/// ever changes, this needs revisiting.
+	fn teleport_funding(
+		&self, new_funding_txo: OutPoint, responder_value_removal_sat: u64,
+	) -> FundingScope {
+		let channel_value_delta_sat = -(responder_value_removal_sat as i64);
+		let local_value_to_self_delta_msat = if self.funding.is_outbound() {
+			// We are the channel-open + teleport initiator: our value_to_self is invariant.
+			0
+		} else {
+			// We are the responder: our value_to_self decreases by the removal.
+			-((responder_value_removal_sat as i64) * 1000)
+		};
+		FundingScope::for_teleport(
+			&self.funding,
+			new_funding_txo,
+			channel_value_delta_sat,
+			local_value_to_self_delta_msat,
+		)
+	}
+
+	/// Ark bridge: if we (the responder) have promoted to the new scope and owe the initiator a
+	/// `teleport_complete_ack`, returns it. Used both on the happy path and to resend it across a
+	/// reconnect. The new-funding spend is stock ECDSA, so this message carries no nonce.
+	fn get_pending_teleport_complete_ack(&self) -> Option<msgs::TeleportCompleteAck> {
+		self.pending_teleport.as_ref().and_then(|pending_teleport| {
+			match pending_teleport {
+				PendingTeleport::AwaitingTeleportCompleteAckSend { .. }
+				| PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. } => {
+					Some(msgs::TeleportCompleteAck { channel_id: self.context.channel_id() })
+				},
+				_ => None,
+			}
+		})
+	}
+
+	/// Ark bridge: produces the `commitment_signed` for the counterparty's first commitment on the
+	/// new (teleport) funding scope. Stock ECDSA via `get_initial_commitment_signed_v2`.
+	fn get_initial_teleport_commitment_signed<L: Logger>(
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
+	) -> Option<msgs::CommitmentSigned> {
+		let funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
+		self.context.get_initial_commitment_signed_v2(&funding, logger)
+	}
+
+	/// Ark bridge: validates the counterparty's new-scope `commitment_signed` and stages a
+	/// `RenegotiatedFunding` monitor update against the new funding scope.
+	///
+	/// [H1]: this reads the holder commitment-transaction-number and counterparty commitment
+	/// number straight off the channel (NOT reset by the teleport) and signs the new scope's
+	/// commitment at those same numbers, continuing the existing sequence.
+	fn teleport_initial_commitment_signed<F: FeeEstimator, L: Logger>(
+		&mut self, msg: &msgs::CommitmentSigned, new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
+		let teleport_funding =
+			self.teleport_funding(new_funding_txo, responder_value_removal_sat);
+
+		let transaction_number = self.holder_commitment_point.current_transaction_number();
+		let commitment_point = self.holder_commitment_point.current_point().ok_or_else(|| {
+			debug_assert!(false);
+			ChannelError::close(
+				"current_point should be set while teleporting a channel".to_owned(),
+			)
+		})?;
+		let (holder_commitment_tx, _) = self.context.validate_commitment_signed(
+			&teleport_funding,
+			transaction_number,
+			commitment_point,
+			msg,
+			fee_estimator,
+			logger,
+		)?;
+		let counterparty_commitment_tx = self
+			.context
+			.build_commitment_transaction(
+				&teleport_funding,
+				self.context.counterparty_next_commitment_transaction_number + 1,
+				&self.context.counterparty_current_commitment_point.unwrap(),
+				false,
+				false,
+				logger,
+			)
+			.tx;
+
+		log_info!(
+			logger,
+			"Received teleport commitment_signed from peer with funding txid {}",
+			new_funding_txo.txid
+		);
+
+		self.context.latest_monitor_update_id += 1;
+		let monitor_update = ChannelMonitorUpdate {
+			update_id: self.context.latest_monitor_update_id,
+			updates: vec![ChannelMonitorUpdateStep::RenegotiatedFunding {
+				channel_parameters: teleport_funding.channel_transaction_parameters.clone(),
+				holder_commitment_tx,
+				counterparty_commitment_tx,
+				// Ark bridge: a teleport re-points funding without an interactive-tx splice
+				// contribution, so there is nothing to record here.
+				funding_contribution: None,
+			}],
+			channel_id: Some(self.context.channel_id()),
+		};
+
+		self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new(), logger);
+		Ok(self.push_ret_blockable_mon_update(monitor_update))
+	}
+
+	/// Ark bridge: promotes the channel's live `FundingScope` to the teleport's new scope.
+	///
+	/// [H1]: this swaps `self.funding` only; the commitment-number counters and
+	/// per-commitment-point/secret derivation live on the channel/context and are deliberately
+	/// left untouched, so the new scope continues the existing commitment sequence.
+	fn promote_teleport_funding<L: Logger>(
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
+	) -> Option<ChannelMonitorUpdate> {
+		log_info!(logger, "Promoting teleport funding txid {}", new_funding_txo.txid);
+
+		if let Some(scid) = self.funding.short_channel_id {
+			self.context.historical_scids.push(scid);
+		}
+		self.funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
+		self.context.announcement_sigs = None;
+		self.context.announcement_sigs_state = AnnouncementSigsState::NotSent;
+
+		self.context.latest_monitor_update_id += 1;
+		let monitor_update = ChannelMonitorUpdate {
+			update_id: self.context.latest_monitor_update_id,
+			updates: vec![ChannelMonitorUpdateStep::RenegotiatedFundingLocked {
+				funding_txid: new_funding_txo.txid,
+			}],
+			channel_id: Some(self.context.channel_id()),
+		};
+		self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new(), logger);
+		self.push_ret_blockable_mon_update(monitor_update)
 	}
 
 	fn has_pending_splice_awaiting_signatures(&self) -> bool {
@@ -9996,6 +10439,9 @@ where
 		let announcement_sigs = self.get_announcement_sigs(node_signer, chain_hash, user_config, best_block_height, logger);
 		requires_channel_manager_persistence |= announcement_sigs.is_some();
 
+		// Ark bridge: resend `teleport_complete_ack` if a teleport completion is still pending.
+		let teleport_complete_ack = self.get_pending_teleport_complete_ack();
+
 		let mut accepted_htlcs = Vec::new();
 		mem::swap(&mut accepted_htlcs, &mut self.context.monitor_pending_forwards);
 		requires_channel_manager_persistence |= !accepted_htlcs.is_empty();
@@ -10026,7 +10472,7 @@ where
 				accepted_htlcs, failed_htlcs, finalized_claimed_htlcs, pending_update_adds,
 				funding_broadcastable, channel_ready, channel_ready_order, announcement_sigs,
 				funding_tx_signed, committed_outbound_htlc_sources,
-				requires_channel_manager_persistence,
+				requires_channel_manager_persistence, teleport_complete_ack: None,
 			};
 		}
 
@@ -10058,7 +10504,7 @@ where
 			raa, commitment_update, commitment_order, accepted_htlcs, failed_htlcs, finalized_claimed_htlcs,
 			pending_update_adds, funding_broadcastable, channel_ready, channel_ready_order,
 			announcement_sigs, funding_tx_signed, committed_outbound_htlc_sources,
-			requires_channel_manager_persistence,
+			requires_channel_manager_persistence, teleport_complete_ack,
 		}
 	}
 
@@ -10626,6 +11072,10 @@ where
 			self.get_announcement_sigs(node_signer, chain_hash, user_config, best_block.height, logger)
 		};
 
+		// Ark bridge: if we (the responder) promoted on `teleport_complete` but the initiator
+		// hasn't yet processed our `teleport_complete_ack`, resend it on reconnect.
+		let teleport_complete_ack = self.get_pending_teleport_complete_ack();
+
 		let mut commitment_update = None;
 		let mut tx_signatures = None;
 		let mut tx_abort = None;
@@ -10746,6 +11196,7 @@ where
 					tx_abort: None,
 					splice_locked: None,
 					inferred_splice_locked: None,
+					teleport_complete_ack,
 				});
 			}
 
@@ -10760,6 +11211,7 @@ where
 				tx_abort,
 				splice_locked: None,
 				inferred_splice_locked: None,
+				teleport_complete_ack,
 			});
 		}
 
@@ -10876,6 +11328,7 @@ where
 				tx_abort,
 				splice_locked,
 				inferred_splice_locked,
+				teleport_complete_ack,
 			})
 		} else if msg.next_local_commitment_number == next_counterparty_commitment_number - 1 {
 			debug_assert!(commitment_update.is_none());
@@ -10902,6 +11355,7 @@ where
 					tx_abort,
 					splice_locked,
 					inferred_splice_locked,
+					teleport_complete_ack,
 				})
 			} else {
 				let commitment_update = if self.context.resend_order == RAACommitmentOrder::RevokeAndACKFirst
@@ -10930,6 +11384,7 @@ where
 					tx_abort,
 					splice_locked,
 					inferred_splice_locked,
+					teleport_complete_ack,
 				})
 			}
 		} else if msg.next_local_commitment_number < next_counterparty_commitment_number {
@@ -11095,7 +11550,11 @@ where
 	#[allow(clippy::assertions_on_constants)]
 	#[rustfmt::skip]
 	pub fn should_disconnect_peer_awaiting_response(&mut self) -> bool {
-		if let Some(ticks_elapsed) = self.context.sent_message_awaiting_response.as_mut() {
+		if self.has_persistent_teleport() {
+			// Ark bridge: a persistent teleport is waiting on a local `complete_teleport` decision
+			// that may take arbitrarily long; don't disconnect the peer for it.
+			false
+		} else if let Some(ticks_elapsed) = self.context.sent_message_awaiting_response.as_mut() {
 			*ticks_elapsed += 1;
 			*ticks_elapsed >= DISCONNECT_PEER_AWAITING_RESPONSE_TICKS
 		} else if
@@ -12853,6 +13312,56 @@ where
 			.expect("feerate compatibility already checked")
 	}
 
+	/// Ark bridge: initiates a channel teleport to `new_funding_txo` once both peers are quiescent.
+	///
+	/// `responder_value_removal_sat` carries any out-of-band-agreed value reduction the responder
+	/// is taking off their side of the channel as part of this teleport. Pass `0` for a
+	/// value-preserving teleport (the typical case).
+	pub fn teleport_channel<L: Logger>(
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
+	) -> Result<Option<msgs::Stfu>, APIError> {
+		if self.pending_teleport.is_some() {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} cannot teleport as one is currently in progress",
+					self.context.channel_id(),
+				),
+			});
+		}
+		if self.pending_splice.is_some() {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} cannot teleport while a splice is pending",
+					self.context.channel_id(),
+				),
+			});
+		}
+		if self.quiescent_action.is_some() {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} cannot teleport as a quiescent action is already pending",
+					self.context.channel_id(),
+				),
+			});
+		}
+		if !self.context.is_usable() {
+			return Err(APIError::APIMisuseError {
+				err: format!(
+					"Channel {} cannot teleport as it is either pending open/close",
+					self.context.channel_id()
+				),
+			});
+		}
+
+		self.propose_quiescence(
+			logger,
+			QuiescentAction::Teleport { new_funding_txo, responder_value_removal_sat },
+		)
+		.map_err(|_| APIError::APIMisuseError {
+			err: format!("Channel {} cannot begin teleport", self.context.channel_id()),
+		})
+	}
+
 	pub fn funding_contributed<F: FeeEstimator, L: Logger>(
 		&mut self, contribution: FundingContribution, locktime: LockTime,
 		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
@@ -12878,6 +13387,10 @@ where
 					},
 				};
 			},
+			// Ark bridge: a teleport is a separate quiescent action that never goes through the
+			// splice funding-contribution flow; treat a contribution arriving while one is pending
+			// as a no-op rather than corrupting the teleport.
+			Some(QuiescentAction::Teleport { .. }) => return Err(QuiescentError::DoNothing),
 			#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 			Some(QuiescentAction::DoNothing) => unreachable!(),
 			None => {},
@@ -12989,6 +13502,431 @@ where
 			},
 			_ => None,
 		}
+	}
+
+	/// Ark bridge: responder side. Acknowledges a [`Event::ChannelTeleport`], returning the
+	/// `teleport_ack` and the new-scope `commitment_signed` (stock ECDSA) to send to the initiator.
+	///
+	/// [`Event::ChannelTeleport`]: crate::events::Event::ChannelTeleport
+	pub fn ack_teleport<L: Logger>(
+		&mut self, logger: &L,
+	) -> Result<(msgs::TeleportAck, Option<msgs::CommitmentSigned>), APIError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingUserDecision {
+				new_funding_txo,
+				responder_value_removal_sat,
+			}) => {
+				self.pending_teleport = Some(PendingTeleport::AwaitingTeleportAckSend {
+					new_funding_txo,
+					responder_value_removal_sat,
+				});
+				let commitment_signed = self.get_initial_teleport_commitment_signed(
+					new_funding_txo,
+					responder_value_removal_sat,
+					logger,
+				);
+				Ok((
+					msgs::TeleportAck { channel_id: self.context.channel_id() },
+					commitment_signed,
+				))
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(APIError::APIMisuseError {
+					err: format!(
+						"Channel {} is not awaiting teleport acknowledgement",
+						self.context.channel_id(),
+					),
+				})
+			},
+			None => Err(APIError::APIMisuseError {
+				err: format!("Channel {} has no pending teleport", self.context.channel_id()),
+			}),
+		}
+	}
+
+	/// Ark bridge: responder side. Rejects a pending [`Event::ChannelTeleport`], returning the
+	/// `teleport_abort` to send and whether this exited quiescence.
+	///
+	/// [`Event::ChannelTeleport`]: crate::events::Event::ChannelTeleport
+	pub fn cancel_teleport(&mut self) -> Result<(msgs::TeleportAbort, bool), APIError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingUserDecision { .. }) => {
+				let exited_quiescence = self.context.channel_state.is_quiescent();
+				self.context.channel_state.clear_quiescent();
+				Ok((
+					msgs::TeleportAbort { channel_id: self.context.channel_id() },
+					exited_quiescence,
+				))
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(APIError::APIMisuseError {
+					err: format!(
+						"Channel {} cannot cancel teleport after acknowledgement",
+						self.context.channel_id(),
+					),
+				})
+			},
+			None => Err(APIError::APIMisuseError {
+				err: format!("Channel {} has no pending teleport", self.context.channel_id()),
+			}),
+		}
+	}
+
+	/// Ark bridge: initiator side. Completes a previously acknowledged teleport, returning the
+	/// `teleport_complete` to send.
+	pub fn complete_teleport(&mut self) -> Result<msgs::TeleportComplete, APIError> {
+		if !self.context.is_live() {
+			return Err(APIError::ChannelUnavailable {
+				err: format!(
+					"Channel {} cannot complete teleport while disconnected",
+					self.context.channel_id(),
+				),
+			});
+		}
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingLocalComplete {
+				new_funding_txo,
+				responder_value_removal_sat,
+			}) => {
+				self.pending_teleport = Some(PendingTeleport::AwaitingTeleportCompleteAck {
+					new_funding_txo,
+					responder_value_removal_sat,
+				});
+				Ok(msgs::TeleportComplete { channel_id: self.context.channel_id() })
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(APIError::APIMisuseError {
+					err: format!(
+						"Channel {} is not ready to complete teleport",
+						self.context.channel_id(),
+					),
+				})
+			},
+			None => Err(APIError::APIMisuseError {
+				err: format!("Channel {} has no pending teleport", self.context.channel_id()),
+			}),
+		}
+	}
+
+	/// Ark bridge: responder side. Handles an incoming `teleport_init`, validating any
+	/// responder-side value removal and surfacing a [`Event::ChannelTeleport`] (via the returned
+	/// outpoint) for the user to decide on.
+	///
+	/// [`Event::ChannelTeleport`]: crate::events::Event::ChannelTeleport
+	pub(crate) fn teleport_init(
+		&mut self, msg: &msgs::TeleportInit,
+	) -> Result<OutPoint, ChannelError> {
+		if !self.context.channel_state.is_quiescent() {
+			return Err(ChannelError::WarnAndDisconnect(
+				"Quiescence needed to teleport".to_owned(),
+			));
+		}
+		if self.pending_teleport.is_some() {
+			return Err(ChannelError::WarnAndDisconnect(format!(
+				"Channel {} already has a teleport pending",
+				self.context.channel_id(),
+			)));
+		}
+		if self.pending_splice.is_some() {
+			return Err(ChannelError::WarnAndDisconnect(format!(
+				"Channel {} cannot teleport while a splice is pending",
+				self.context.channel_id(),
+			)));
+		}
+		if !self.context.is_live() {
+			return Err(ChannelError::WarnAndDisconnect(
+				"Teleport requested on a channel that is not live".to_owned(),
+			));
+		}
+
+		// Validate any responder-side value removal proposed by the initiator. The removal is
+		// "responder takes X sats off their own to_self"; the receiver of TeleportInit is by
+		// definition the responder, so the checks below are against THIS side's FundingScope.
+		let removal_sat = msg.responder_value_removal_sat;
+		if removal_sat > 0 {
+			let removal_msat = removal_sat.checked_mul(1000).ok_or_else(|| {
+				ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} overflows when converted to msat",
+				))
+			})?;
+			if removal_msat > self.funding.value_to_self_msat {
+				return Err(ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} exceeds our value_to_self ({} msat)",
+					self.funding.value_to_self_msat,
+				)));
+			}
+			// Reserve check: post-removal value_to_self must remain at or above the reserve the
+			// counterparty selected for us.
+			if let Some(reserve_sat) = self.funding.counterparty_selected_channel_reserve_satoshis {
+				let reserve_msat = reserve_sat.saturating_mul(1000);
+				let new_value_to_self_msat = self.funding.value_to_self_msat - removal_msat;
+				if new_value_to_self_msat < reserve_msat {
+					return Err(ChannelError::close(format!(
+						"Teleport responder_value_removal_sat {removal_sat} would drop our value_to_self ({} msat) below the counterparty-selected reserve ({} msat)",
+						new_value_to_self_msat, reserve_msat,
+					)));
+				}
+			}
+			// Coarse dust-floor check on the new channel value: must still hold both anchors + a
+			// non-zero balance per side. Tighter HTLC-coverage checks are deferred (quiescence
+			// drains in-flight updates, and BOLT3 already enforces dust on individual outputs).
+			let new_channel_value = self.funding.get_value_satoshis().saturating_sub(removal_sat);
+			let min_viable_sat = 2 * ANCHOR_OUTPUT_VALUE_SATOSHI + MIN_CHAN_DUST_LIMIT_SATOSHIS;
+			if new_channel_value < min_viable_sat {
+				return Err(ChannelError::close(format!(
+					"Teleport responder_value_removal_sat {removal_sat} would shrink channel_value to {new_channel_value} sat, below dust+anchors floor ({min_viable_sat} sat)",
+				)));
+			}
+		}
+
+		self.pending_teleport = Some(PendingTeleport::AwaitingUserDecision {
+			new_funding_txo: msg.new_funding_txo,
+			responder_value_removal_sat: msg.responder_value_removal_sat,
+		});
+		Ok(msg.new_funding_txo)
+	}
+
+	/// Ark bridge: initiator side. Handles an incoming `teleport_ack` and returns our new-scope
+	/// `commitment_signed` (stock ECDSA) to send back.
+	pub(crate) fn teleport_ack<L: Logger>(
+		&mut self, _msg: &msgs::TeleportAck, logger: &L,
+	) -> Result<Option<msgs::CommitmentSigned>, ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportAck {
+				new_funding_txo,
+				responder_value_removal_sat,
+			}) => {
+				self.mark_response_received();
+				let commitment_signed = self.get_initial_teleport_commitment_signed(
+					new_funding_txo,
+					responder_value_removal_sat,
+					logger,
+				);
+				self.pending_teleport = Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
+					new_funding_txo,
+					is_initiator: true,
+					responder_value_removal_sat,
+				});
+				Ok(commitment_signed)
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::WarnAndDisconnect("Got unexpected teleport_ack".to_owned()))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_ack".to_owned())),
+		}
+	}
+
+	/// Ark bridge: responder side. Marks that our queued `teleport_ack` has left the outbound
+	/// queue, advancing to await the initiator's new-scope `commitment_signed`.
+	pub(crate) fn teleport_ack_sent(&mut self) -> Result<(), ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportAckSend {
+				new_funding_txo,
+				responder_value_removal_sat,
+			}) => {
+				self.pending_teleport = Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
+					new_funding_txo,
+					is_initiator: false,
+					responder_value_removal_sat,
+				});
+				Ok(())
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::Ignore("Got unexpected teleport_ack send".to_owned()))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_ack send".to_owned())),
+		}
+	}
+
+	/// Ark bridge: initiator side. Handles an incoming `teleport_abort` (only valid while still
+	/// `AwaitingTeleportAck`), returning whether this exited quiescence.
+	pub(crate) fn teleport_abort(
+		&mut self, _msg: &msgs::TeleportAbort,
+	) -> Result<bool, ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportAck { .. }) => {
+				self.mark_response_received();
+				let exited_quiescence = self.context.channel_state.is_quiescent();
+				self.context.channel_state.clear_quiescent();
+				Ok(exited_quiescence)
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::WarnAndDisconnect("Got unexpected teleport_abort".to_owned()))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_abort".to_owned())),
+		}
+	}
+
+	/// Ark bridge: responder side. Handles an incoming `teleport_complete`, PROMOTING our
+	/// `FundingScope` to the new scope and returning the resulting monitor update. The responder
+	/// promotes here; the initiator only promotes on `teleport_complete_ack`.
+	pub(crate) fn teleport_complete<L: Logger>(
+		&mut self, _msg: &msgs::TeleportComplete, logger: &L,
+	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingRemoteComplete {
+				new_funding_txo,
+				responder_value_removal_sat,
+			}) => {
+				// Defense-in-depth: a teleport only ever promotes from a quiescent channel. If
+				// quiescence was somehow lost (e.g. a serialization path that failed to preserve
+				// it), refuse to promote rather than emit `RenegotiatedFundingLocked` against a
+				// possibly-advanced commitment number — that would diverge our commitment/monitor
+				// from the counterparty's.
+				if !self.context.channel_state.is_quiescent() {
+					self.pending_teleport = Some(PendingTeleport::AwaitingRemoteComplete {
+						new_funding_txo,
+						responder_value_removal_sat,
+					});
+					return Err(ChannelError::close(
+						"Got teleport_complete while not quiescent".to_owned(),
+					));
+				}
+				self.pending_teleport = Some(PendingTeleport::AwaitingTeleportCompleteAckSend {
+					new_funding_txo,
+					responder_value_removal_sat,
+				});
+				let monitor_update = self.promote_teleport_funding(
+					new_funding_txo,
+					responder_value_removal_sat,
+					logger,
+				);
+				Ok(monitor_update)
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::WarnAndDisconnect("Got unexpected teleport_complete".to_owned()))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_complete".to_owned())),
+		}
+	}
+
+	/// Ark bridge: responder side. Marks that our queued `teleport_complete_ack` has left the
+	/// outbound queue, advancing to await the initiator demonstrating it promoted too. Returns
+	/// whether this exited quiescence.
+	pub(crate) fn teleport_complete_ack_sent(&mut self) -> Result<bool, ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportCompleteAckSend {
+				new_funding_txo,
+				responder_value_removal_sat,
+			}) => {
+				self.pending_teleport =
+					Some(PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+						new_funding_txo,
+						responder_value_removal_sat,
+					});
+				let exited_quiescence = self.context.channel_state.is_quiescent();
+				self.context.channel_state.clear_quiescent();
+				Ok(exited_quiescence)
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::Ignore("Got unexpected teleport_complete_ack send".to_owned()))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_complete_ack send".to_owned())),
+		}
+	}
+
+	/// Ark bridge: responder side. Any post-promotion activity from the initiator (an RAA,
+	/// commitment_signed, shutdown, splice_locked, …) demonstrates it processed our
+	/// `teleport_complete_ack` and thus promoted to the new scope too — at which point the
+	/// teleport is fully resolved and no longer needs its pending state.
+	pub(crate) fn note_counterparty_post_teleport_complete_ack_activity(&mut self) {
+		if matches!(
+			self.pending_teleport,
+			Some(PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. })
+		) {
+			self.pending_teleport = None;
+		}
+	}
+
+	/// Ark bridge: initiator side. Handles an incoming `teleport_complete_ack`, PROMOTING our
+	/// `FundingScope` to the new scope. Returns whether this exited quiescence and the resulting
+	/// monitor update.
+	pub(crate) fn teleport_complete_ack<L: Logger>(
+		&mut self, _msg: &msgs::TeleportCompleteAck, logger: &L,
+	) -> Result<(bool, Option<ChannelMonitorUpdate>), ChannelError> {
+		match self.pending_teleport.take() {
+			Some(PendingTeleport::AwaitingTeleportCompleteAck {
+				new_funding_txo,
+				responder_value_removal_sat,
+			}) => {
+				// Defense-in-depth: a teleport only ever promotes from a quiescent channel. If
+				// quiescence was somehow lost (e.g. a serialization path that failed to preserve
+				// it), refuse to promote rather than emit `RenegotiatedFundingLocked` against a
+				// possibly-advanced commitment number — that would diverge our commitment/monitor
+				// from the counterparty's.
+				if !self.context.channel_state.is_quiescent() {
+					self.pending_teleport = Some(PendingTeleport::AwaitingTeleportCompleteAck {
+						new_funding_txo,
+						responder_value_removal_sat,
+					});
+					return Err(ChannelError::close(
+						"Got teleport_complete_ack while not quiescent".to_owned(),
+					));
+				}
+				self.mark_response_received();
+				let exited_quiescence = self.context.channel_state.is_quiescent();
+				self.context.channel_state.clear_quiescent();
+				let monitor_update = self.promote_teleport_funding(
+					new_funding_txo,
+					responder_value_removal_sat,
+					logger,
+				);
+				Ok((exited_quiescence, monitor_update))
+			},
+			Some(pending_teleport) => {
+				self.pending_teleport = Some(pending_teleport);
+				Err(ChannelError::WarnAndDisconnect(
+					"Got unexpected teleport_complete_ack".to_owned(),
+				))
+			},
+			None => Err(ChannelError::Ignore("Got unexpected teleport_complete_ack".to_owned())),
+		}
+	}
+
+	/// Ark bridge: handles the counterparty's new-scope `commitment_signed` during a teleport,
+	/// staging the `RenegotiatedFunding` monitor update and advancing toward completion.
+	fn teleport_commitment_signed<F: FeeEstimator, L: Logger>(
+		&mut self, msg: &msgs::CommitmentSigned, new_funding_txo: OutPoint, is_initiator: bool,
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
+		if msg.funding_txid != Some(new_funding_txo.txid) {
+			return Err(ChannelError::close(format!(
+				"Unexpected teleport funding txid {}; expected {}",
+				msg.funding_txid
+					.map(|txid| txid.to_string())
+					.unwrap_or_else(|| "none".to_owned()),
+				new_funding_txo.txid,
+			)));
+		}
+
+		// Pull the agreed removal off `pending_teleport` (state at this point is
+		// `AwaitingRemoteCommitmentSigned`) so we sign at the agreed value.
+		let responder_value_removal_sat = self
+			.pending_teleport
+			.as_ref()
+			.map(|pt| pt.responder_value_removal_sat())
+			.unwrap_or(0);
+		let monitor_update = self.teleport_initial_commitment_signed(
+			msg,
+			new_funding_txo,
+			responder_value_removal_sat,
+			fee_estimator,
+			logger,
+		)?;
+		self.pending_teleport = Some(if is_initiator {
+			PendingTeleport::AwaitingLocalComplete { new_funding_txo, responder_value_removal_sat }
+		} else {
+			PendingTeleport::AwaitingRemoteComplete { new_funding_txo, responder_value_removal_sat }
+		});
+		Ok(monitor_update)
 	}
 
 	fn send_splice_init(&mut self, context: FundingNegotiationContext) -> msgs::SpliceInit {
@@ -14541,6 +15479,8 @@ where
 					self.splice_funding_failed_for(contribution),
 					NegotiationFailureReason::ChannelClosing,
 				),
+				// Ark bridge: a teleport has no in-flight funding contribution to discard.
+				QuiescentAction::Teleport { .. } => QuiescentError::DoNothing,
 				#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 				QuiescentAction::DoNothing => QuiescentError::DoNothing,
 			});
@@ -14563,6 +15503,8 @@ where
 					self.splice_funding_failed_for(contribution),
 					NegotiationFailureReason::Unknown,
 				),
+				// Ark bridge: a teleport has no in-flight funding contribution to discard.
+				QuiescentAction::Teleport { .. } => QuiescentError::DoNothing,
 			});
 		}
 		// Since we don't have a pending quiescent action, we should never be in a state where we
@@ -14719,6 +15661,36 @@ where
 					self.pending_splice.as_mut().unwrap()
 						.contributions.push(prior_contribution);
 					return Ok(Some(StfuResponse::SpliceInit(splice_init)));
+				},
+				Some(QuiescentAction::Teleport {
+					new_funding_txo,
+					responder_value_removal_sat,
+				}) => {
+					if self.pending_teleport.is_some() {
+						debug_assert!(false);
+						self.quiescent_action = Some(QuiescentAction::Teleport {
+							new_funding_txo,
+							responder_value_removal_sat,
+						});
+						return Err((
+							ChannelError::WarnAndDisconnect(
+								"Channel already has a teleport pending".to_owned(),
+							),
+							// A teleport has no in-flight funding contribution to fail.
+							QuiescentError::DoNothing,
+						));
+					}
+
+					self.pending_teleport = Some(PendingTeleport::AwaitingTeleportAck {
+						new_funding_txo,
+						responder_value_removal_sat,
+					});
+					// Stock-ECDSA new-funding spend: the teleport carries no MuSig2 nonce.
+					return Ok(Some(StfuResponse::TeleportInit(msgs::TeleportInit {
+						channel_id: self.context.channel_id,
+						new_funding_txo,
+						responder_value_removal_sat,
+					})));
 				},
 				#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 				Some(QuiescentAction::DoNothing) => {
@@ -15176,6 +16148,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			holder_commitment_point,
 			pending_splice: None,
 			quiescent_action: None,
+			pending_teleport: None,
 		};
 
 		let need_channel_ready = channel.check_get_channel_ready(0, logger).is_some()
@@ -15498,6 +16471,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 			holder_commitment_point,
 			pending_splice: None,
 			quiescent_action: None,
+			pending_teleport: None,
 		};
 		let need_channel_ready = channel.check_get_channel_ready(0, logger).is_some()
 			|| channel.context.signer_pending_channel_ready;
@@ -15891,6 +16865,15 @@ pub(super) fn get_initial_channel_type(
 		ret.set_scid_privacy_required();
 	}
 
+	// If both sides advertise the Ark channel type, prefer it over everything else — Ark has its
+	// own funding (P2WSH 2-of-2), commitment shape (zero_fee_commitments), and is not compatible
+	// with plain anchors or zero-fee-commitments alone.
+	if config.channel_handshake_config.negotiate_ark_channel
+		&& their_features.supports_ark_channel()
+	{
+		return ChannelTypeFeatures::ark_channel();
+	}
+
 	// Optionally, if the user would like to negotiate `option_zero_fee_commitments` we set it now.
 	// If they don't understand it (or we don't want it), we check the same conditions for
 	// `option_anchors_zero_fee_htlc_tx`. The counterparty can still refuse the channel and we'll
@@ -15908,6 +16891,25 @@ pub(super) fn get_initial_channel_type(
 	}
 
 	ret
+}
+
+/// Resolves the per-channel Ark HTLC success-path CSV delta to store in the channel transaction
+/// parameters at open time.
+///
+/// The delta is only applied to `ArkChannel`s — non-Ark channels are left completely unchanged so
+/// they remain interoperable with stock LDK peers. A configured `Some(0)` is meaningless (it would
+/// produce a no-op `OP_0 OP_CSV` in the HTLC script) and is coerced to `None`, both in debug and
+/// release builds.
+fn ark_htlc_success_csv_delta_for_open(
+	channel_type: &ChannelTypeFeatures, config: &ChannelHandshakeConfig,
+) -> Option<u16> {
+	if !channel_type.requires_ark_channel() {
+		return None;
+	}
+	match config.ark_htlc_success_csv_delta {
+		Some(0) | None => None,
+		Some(delta) => Some(delta),
+	}
 }
 
 const SERIALIZATION_VERSION: u8 = 4;
@@ -15988,12 +16990,18 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 					channel_state.clear_local_stfu_sent();
 					channel_state.clear_remote_stfu_sent();
 					if self.should_reset_pending_splice_state(true)
-						|| !self.has_pending_splice_awaiting_signatures()
+						|| (!self.has_pending_splice_awaiting_signatures()
+							&& !self.has_persistent_teleport())
 					{
 						// We shouldn't be quiescent anymore upon reconnecting if:
 						// - We were in quiescence but a splice/RBF was never negotiated or
 						// - We were in quiescence but the splice negotiation failed due to
 						// disconnecting
+						// Ark bridge: but we MUST stay quiescent across the restart if a
+						// persistent teleport is in flight (the new-scope commitments have been
+						// exchanged and we're awaiting `complete`/`complete_ack`); otherwise the
+						// reloaded channel would process HTLC traffic and a late promotion would
+						// emit `RenegotiatedFundingLocked` against an advanced commitment number.
 						channel_state.clear_quiescent();
 					}
 				},
@@ -16389,6 +17397,13 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 				reset_funding_negotiation,
 			});
 
+		// Ark bridge: only persist a teleport once it's past the new-scope commitment exchange;
+		// earlier states are abandoned on reconnect.
+		let pending_teleport = self
+			.pending_teleport
+			.as_ref()
+			.filter(|pending_teleport| pending_teleport.is_persistent());
+
 		let monitor_pending_tx_signatures =
 			self.context.monitor_pending_tx_signatures.then_some(());
 
@@ -16451,6 +17466,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(75, inbound_committed_update_adds, optional_vec),
 			(77, holding_cell_accountable_flags, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
+			(81, pending_teleport, upgradable_option), // Added by the Ark bridge
 		});
 
 		Ok(())
@@ -16832,6 +17848,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 		let mut minimum_depth_override: Option<u32> = None;
 
 		let mut pending_splice: Option<PendingFunding> = None;
+		let mut pending_teleport: Option<PendingTeleport> = None;
 
 		let mut pending_outbound_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
 		let mut holding_cell_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
@@ -16894,6 +17911,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(75, inbound_committed_update_adds_opt, optional_vec),
 			(77, holding_cell_accountable, optional_vec), // Added in 0.3
 			(79, pending_outbound_accountable, optional_vec), // Added in 0.3
+			(81, pending_teleport, upgradable_option), // Added by the Ark bridge
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -17211,6 +18229,13 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				return Err(DecodeError::InvalidValue);
 			}
 		}
+		// Ark bridge: only persistent teleport states are ever written, so a non-persistent one
+		// read back is corrupt data.
+		if let Some(pending_teleport) = pending_teleport.as_ref() {
+			if !pending_teleport.is_persistent() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
 
 		Ok(FundedChannel {
 			funding: FundingScope {
@@ -17353,6 +18378,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			holder_commitment_point,
 			pending_splice,
 			quiescent_action: None,
+			pending_teleport,
 		})
 	}
 }

@@ -171,6 +171,10 @@ mod sealed {
 			,,,,,,,,,,,
 			// Byte 19
 			HtlcHold,
+			// Byte 20 - 49
+			,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+			// Byte 50
+			ArkChannel,
 		]
 	);
 	define_context!(
@@ -200,6 +204,10 @@ mod sealed {
 			,,,,,,,,,,,,
 			// Byte 32
 			DnsResolver,
+			// Byte 33 - 49
+			,,,,,,,,,,,,,,,,,
+			// Byte 50
+			ArkChannel,
 		]
 	);
 	define_context!(ChannelContext, []);
@@ -259,6 +267,10 @@ mod sealed {
 		AnchorZeroFeeCommitments | SCIDPrivacy,
 		// Byte 6
 		ZeroConf,
+		// Byte 7 - 49
+		,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+		// Byte 50
+		ArkChannel,
 	]);
 
 	/// Defines a feature with the given bits for the specified [`Context`]s. The generated trait is
@@ -728,6 +740,19 @@ mod sealed {
 		supports_dns_resolution,
 		requires_dns_resolution
 	);
+	define_feature!(
+		401, // Experimental: Ark channel type. No BOLT proposal; bit chosen well clear of any
+		     // assigned or draft-assigned bits.
+		ArkChannel,
+		[InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for Ark channels: stock P2WSH 2-of-2 funding, zero_fee_commitments \
+		 commit-TX shape, and Ark-specific HTLC success-path CSV protection (M2+).",
+		set_ark_channel_optional,
+		set_ark_channel_required,
+		clear_ark_channel,
+		supports_ark_channel,
+		requires_ark_channel
+	);
 
 	// Note: update the module-level docs when a new feature bit is added!
 
@@ -1082,6 +1107,21 @@ impl ChannelTypeFeatures {
 	/// Constructs a ChannelTypeFeatures with zero fee commitment anchors support.
 	pub fn anchors_zero_fee_commitments() -> Self {
 		let mut ret = Self::empty();
+		<sealed::ChannelTypeContext as sealed::AnchorZeroFeeCommitments>::set_required_bit(
+			&mut ret,
+		);
+		ret
+	}
+
+	/// Constructs a [`ChannelTypeFeatures`] for the Ark channel type.
+	///
+	/// Ark channels use stock P2WSH 2-of-2 funding, the `zero_fee_commitments` commit-TX shape
+	/// (v3/TRUC + P2A anchor, 0-fee), and `static_remote_key`. `anchor_zero_fee_commitments` is
+	/// implied so all zero-fee-commit code paths (BumpTransactionEvent, witness predictors, anchor
+	/// input handling) apply to Ark channels without special-casing.
+	pub fn ark_channel() -> Self {
+		let mut ret = Self::only_static_remote_key();
+		<sealed::ChannelTypeContext as sealed::ArkChannel>::set_required_bit(&mut ret);
 		<sealed::ChannelTypeContext as sealed::AnchorZeroFeeCommitments>::set_required_bit(
 			&mut ret,
 		);
@@ -1523,6 +1563,32 @@ mod tests {
 		assert_eq!(converted_features, ChannelTypeFeatures::only_static_remote_key());
 		assert!(!converted_features.supports_any_optional_bits());
 		assert!(converted_features.requires_static_remote_key());
+	}
+
+	#[test]
+	fn test_ark_channel_feature() {
+		let ark = ChannelTypeFeatures::ark_channel();
+		assert!(ark.requires_ark_channel());
+		assert!(ark.supports_ark_channel());
+		// Ark builds on static_remote_key.
+		assert!(ark.requires_static_remote_key());
+		// Ark inherits anchor_zero_fee_commitments — same v3/TRUC + P2A commit-TX shape, and
+		// LDK's zero-fee-commit code paths gate on supports_anchor_zero_fee_commitments().
+		assert!(ark.supports_anchor_zero_fee_commitments());
+		assert!(ark.requires_anchor_zero_fee_commitments());
+
+		// from_init promotes optional bits to required, and we expect both ark_channel,
+		// static_remote_key, and anchor_zero_fee_commitments to land in the result.
+		let mut init = InitFeatures::empty();
+		init.set_ark_channel_optional();
+		init.set_static_remote_key_optional();
+		init.set_anchor_zero_fee_commitments_optional();
+		let converted = ChannelTypeFeatures::from_init(&init);
+		assert_eq!(converted, ark);
+
+		// Distinct from other channel types.
+		assert_ne!(ark, ChannelTypeFeatures::only_static_remote_key());
+		assert_ne!(ark, ChannelTypeFeatures::anchors_zero_fee_commitments());
 	}
 
 	#[test]

@@ -34,6 +34,7 @@ use bitcoin::{secp256k1, Transaction, Witness};
 use crate::blinded_path::message::BlindedMessagePath;
 use crate::blinded_path::payment::{BlindedPaymentTlvs, DummyTlvs, ForwardTlvs, ReceiveTlvs};
 use crate::blinded_path::payment::{BlindedTrampolineTlvs, TrampolineForwardTlvs};
+use crate::chain::transaction::OutPoint;
 use crate::ln::onion_utils;
 use crate::ln::types::ChannelId;
 use crate::offers::invoice_request::InvoiceRequest;
@@ -491,6 +492,56 @@ pub struct SpliceLocked {
 	pub channel_id: ChannelId,
 	/// The ID of the new funding transaction that has been locked
 	pub splice_txid: Txid,
+}
+
+/// A `teleport_init` message to be sent by or received from the stfu initiator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportInit {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
+	/// The outpoint of the replacement funding transaction agreed out of band.
+	pub new_funding_txo: OutPoint,
+	/// Satoshis the **responder** is removing from their channel balance as part of this
+	/// teleport. The new funding outpoint's value is `prev_channel_value - this`; the responder
+	/// reclaims the difference out-of-band (Ark fork: forfeit-TX claim of the old leaf vTXO).
+	///
+	/// Comes off the responder's `value_to_self_msat` only — the initiator's `value_to_self_msat`
+	/// is invariant across the teleport. See `FundingScope::for_teleport`.
+	///
+	/// `0` is the default and means "no value change" (existing teleport semantics).
+	///
+	/// This field is **declarative** from the initiator's perspective: the actual amount is
+	/// committed-to by the responder at leaf-cosign time (out of band). The responder
+	/// validates incoming `TeleportInit` against the value they signed; mismatch ⇒ abort.
+	pub responder_value_removal_sat: u64,
+}
+
+/// A `teleport_ack` message to be received by or sent to the teleport initiator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportAck {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
+}
+
+/// A `teleport_abort` message to be received by or sent to the teleport initiator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportAbort {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
+}
+
+/// A `teleport_complete` message to be sent by the teleport initiator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportComplete {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
+}
+
+/// A `teleport_complete_ack` message to be sent in response to `teleport_complete`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeleportCompleteAck {
+	/// The channel ID where teleport is intended.
+	pub channel_id: ChannelId,
 }
 
 /// A [`tx_add_input`] message for adding an input during interactive transaction construction
@@ -1772,6 +1823,41 @@ pub enum MessageSendEvent {
 		/// The message which should be sent.
 		msg: SpliceLocked,
 	},
+	/// Used to indicate that a teleport_init message should be sent to the peer with the given node id.
+	SendTeleportInit {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportInit,
+	},
+	/// Used to indicate that a teleport_ack message should be sent to the peer with the given node id.
+	SendTeleportAck {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportAck,
+	},
+	/// Used to indicate that a teleport_abort message should be sent to the peer with the given node id.
+	SendTeleportAbort {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportAbort,
+	},
+	/// Used to indicate that a teleport_complete message should be sent to the peer with the given node id.
+	SendTeleportComplete {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportComplete,
+	},
+	/// Used to indicate that a teleport_complete_ack message should be sent to the peer with the given node id.
+	SendTeleportCompleteAck {
+		/// The node_id of the node which should receive this message
+		node_id: PublicKey,
+		/// The message which should be sent.
+		msg: TeleportCompleteAck,
+	},
 	/// Used to indicate that a tx_add_input message should be sent to the peer with the given node_id.
 	SendTxAddInput {
 		/// The node_id of the node which should receive this message
@@ -2123,6 +2209,16 @@ pub trait ChannelMessageHandler: BaseMessageHandler {
 	fn handle_splice_ack(&self, their_node_id: PublicKey, msg: &SpliceAck);
 	/// Handle an incoming `splice_locked` message from the given peer.
 	fn handle_splice_locked(&self, their_node_id: PublicKey, msg: &SpliceLocked);
+	/// Handle an incoming `teleport_init` message from the given peer.
+	fn handle_teleport_init(&self, their_node_id: PublicKey, msg: &TeleportInit);
+	/// Handle an incoming `teleport_ack` message from the given peer.
+	fn handle_teleport_ack(&self, their_node_id: PublicKey, msg: &TeleportAck);
+	/// Handle an incoming `teleport_abort` message from the given peer.
+	fn handle_teleport_abort(&self, their_node_id: PublicKey, msg: &TeleportAbort);
+	/// Handle an incoming `teleport_complete` message from the given peer.
+	fn handle_teleport_complete(&self, their_node_id: PublicKey, msg: &TeleportComplete);
+	/// Handle an incoming `teleport_complete_ack` message from the given peer.
+	fn handle_teleport_complete_ack(&self, their_node_id: PublicKey, msg: &TeleportCompleteAck);
 
 	// Interactive channel construction
 	/// Handle an incoming `tx_add_input message` from the given peer.
@@ -2266,6 +2362,21 @@ impl<T: ChannelMessageHandler + ?Sized, C: Deref<Target = T>> ChannelMessageHand
 	}
 	fn handle_splice_locked(&self, their_node_id: PublicKey, msg: &SpliceLocked) {
 		self.deref().handle_splice_locked(their_node_id, msg)
+	}
+	fn handle_teleport_init(&self, their_node_id: PublicKey, msg: &TeleportInit) {
+		self.deref().handle_teleport_init(their_node_id, msg)
+	}
+	fn handle_teleport_ack(&self, their_node_id: PublicKey, msg: &TeleportAck) {
+		self.deref().handle_teleport_ack(their_node_id, msg)
+	}
+	fn handle_teleport_abort(&self, their_node_id: PublicKey, msg: &TeleportAbort) {
+		self.deref().handle_teleport_abort(their_node_id, msg)
+	}
+	fn handle_teleport_complete(&self, their_node_id: PublicKey, msg: &TeleportComplete) {
+		self.deref().handle_teleport_complete(their_node_id, msg)
+	}
+	fn handle_teleport_complete_ack(&self, their_node_id: PublicKey, msg: &TeleportCompleteAck) {
+		self.deref().handle_teleport_complete_ack(their_node_id, msg)
 	}
 	fn handle_tx_add_input(&self, their_node_id: PublicKey, msg: &TxAddInput) {
 		self.deref().handle_tx_add_input(their_node_id, msg)
@@ -3051,6 +3162,30 @@ impl_writeable_msg!(SpliceAck, {
 impl_writeable_msg!(SpliceLocked, {
 	channel_id,
 	splice_txid,
+}, {});
+
+impl_writeable_msg!(TeleportInit, {
+	channel_id,
+	new_funding_txo,
+}, {
+	// Default 0 preserves on-wire compat with peers that don't send this field.
+	(4, responder_value_removal_sat, (default_value, 0u64)),
+});
+
+impl_writeable_msg!(TeleportAck, {
+	channel_id,
+}, {});
+
+impl_writeable_msg!(TeleportAbort, {
+	channel_id,
+}, {});
+
+impl_writeable_msg!(TeleportComplete, {
+	channel_id,
+}, {});
+
+impl_writeable_msg!(TeleportCompleteAck, {
+	channel_id,
 }, {});
 
 impl Writeable for TxAddInput {
@@ -7072,5 +7207,81 @@ mod tests {
 		do_test_htlc_accountable_from_u8(Some(7), Some(true));
 		do_test_htlc_accountable_from_u8(Some(3), Some(false));
 		do_test_htlc_accountable_from_u8(Some(0), Some(false));
+	}
+
+	// --- Teleport message round-trip tests (M3) ---
+	// These assert the exact kept fields and that NO nonce field exists on any struct.
+
+	#[test]
+	fn encoding_teleport_init() {
+		let channel_id = ChannelId::from_bytes([5; 32]);
+		let txid =
+			Txid::from_str("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e")
+				.unwrap();
+		let new_funding_txo =
+			crate::chain::transaction::OutPoint { txid, index: 0 };
+		let msg = msgs::TeleportInit {
+			channel_id,
+			new_funding_txo,
+			responder_value_removal_sat: 100_000,
+		};
+
+		// Verify there is no nonce field — these lines would fail to compile if they existed:
+		// let _ = msg.next_local_nonces; // must NOT compile
+
+		let encoded = msg.encode();
+		let decoded: msgs::TeleportInit =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.channel_id, channel_id);
+		assert_eq!(decoded.new_funding_txo, new_funding_txo);
+		assert_eq!(decoded.responder_value_removal_sat, 100_000);
+	}
+
+	#[test]
+	fn encoding_teleport_ack() {
+		let channel_id = ChannelId::from_bytes([6; 32]);
+		let msg = msgs::TeleportAck { channel_id };
+
+		// Verify there is no nonce field — struct has exactly one field: channel_id.
+		let encoded = msg.encode();
+		let decoded: msgs::TeleportAck =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.channel_id, channel_id);
+	}
+
+	#[test]
+	fn encoding_teleport_complete() {
+		let channel_id = ChannelId::from_bytes([7; 32]);
+		let msg = msgs::TeleportComplete { channel_id };
+
+		// Verify there is no nonce field — struct has exactly one field: channel_id.
+		let encoded = msg.encode();
+		let decoded: msgs::TeleportComplete =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.channel_id, channel_id);
+	}
+
+	#[test]
+	fn encoding_teleport_complete_ack() {
+		let channel_id = ChannelId::from_bytes([8; 32]);
+		let msg = msgs::TeleportCompleteAck { channel_id };
+
+		// Verify there is no nonce field — struct has exactly one field: channel_id.
+		let encoded = msg.encode();
+		let decoded: msgs::TeleportCompleteAck =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.channel_id, channel_id);
+	}
+
+	#[test]
+	fn encoding_teleport_abort() {
+		let channel_id = ChannelId::from_bytes([9; 32]);
+		let msg = msgs::TeleportAbort { channel_id };
+
+		// Verify there is no nonce field — struct has exactly one field: channel_id.
+		let encoded = msg.encode();
+		let decoded: msgs::TeleportAbort =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.channel_id, channel_id);
 	}
 }

@@ -6610,7 +6610,8 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 					let transaction_output_index: Option<u32> = Readable::read(reader)?;
 
 					HTLCOutputInCommitment {
-						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index
+						offered, amount_msat, cltv_expiry, payment_hash, transaction_output_index,
+						ark_htlc_success_csv_delta: None,
 					}
 				}
 			}
@@ -6805,6 +6806,21 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 		let channel_parameters = channel_parameters.unwrap_or_else(|| {
 			onchain_tx_handler.channel_parameters().clone()
 		});
+
+		// Ark-on-Lightning: the per-HTLC `ark_htlc_success_csv_delta` is a per-channel constant that
+		// is NOT persisted in the legacy fixed-layout `counterparty_claimable_outpoints` HTLC
+		// encoding (`read_htlc_in_commitment!` reconstructs it as `None`). It IS persisted on the
+		// channel transaction parameters (TLV tag 31 above), so re-hydrate every counterparty-
+		// claimable HTLC from there. Without this, a reloaded monitor would build the
+		// counterparty-offered HTLC preimage claim with the wrong (sub-CSV) `nSequence` and produce
+		// a consensus-invalid, unconfirmable claim. Non-Ark channels carry `None` and are unaffected.
+		if channel_parameters.ark_htlc_success_csv_delta.is_some() {
+			for htlc_infos in counterparty_claimable_outpoints.values_mut() {
+				for (htlc, _source) in htlc_infos.iter_mut() {
+					htlc.ark_htlc_success_csv_delta = channel_parameters.ark_htlc_success_csv_delta;
+				}
+			}
+		}
 
 		// Monitors for anchor outputs channels opened in v0.0.116 suffered from a bug in which the
 		// wrong `counterparty_payment_script` was being tracked. Fix it now on deserialization to
@@ -7013,6 +7029,7 @@ pub(super) fn dummy_monitor<S: EcdsaChannelSigner + 'static>(
 		splice_parent_funding_txid: None,
 		channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 		channel_value_satoshis: 0,
+		ark_htlc_success_csv_delta: None,
 	};
 	let shutdown_script = crate::ln::script::ShutdownScript::new_p2wpkh_from_pubkey(dummy_key);
 	let best_block = BlockLocator::from_network(Network::Testnet);
@@ -7233,6 +7250,7 @@ mod tests {
 							cltv_expiry: 0,
 							payment_hash: preimage.1.clone(),
 							transaction_output_index: Some(idx as u32),
+							ark_htlc_success_csv_delta: None,
 						});
 					}
 					res
@@ -7342,11 +7360,12 @@ mod tests {
 		macro_rules! sign_input {
 			($sighash_parts: expr, $idx: expr, $amount: expr, $weight: expr, $sum_actual_sigs: expr, $opt_anchors: expr) => {
 				let htlc = HTLCOutputInCommitment {
-					offered: if *$weight == weight_revoked_offered_htlc($opt_anchors) || *$weight == weight_offered_htlc($opt_anchors) { true } else { false },
+					offered: if *$weight == weight_revoked_offered_htlc($opt_anchors, None) || *$weight == weight_offered_htlc($opt_anchors, None) { true } else { false },
 					amount_msat: 0,
 					cltv_expiry: 2 << 16,
 					payment_hash: PaymentHash([1; 32]),
 					transaction_output_index: Some($idx as u32),
+					ark_htlc_success_csv_delta: None,
 				};
 				let redeem_script = if *$weight == WEIGHT_REVOKED_OUTPUT { chan_utils::get_revokeable_redeemscript(&RevocationKey::from_basepoint(&secp_ctx, &RevocationBasepoint::from(pubkey), &pubkey), 256, &DelayedPaymentKey::from_basepoint(&secp_ctx, &DelayedPaymentBasepoint::from(pubkey), &pubkey)) } else { chan_utils::get_htlc_redeemscript_with_explicit_keys(&htlc, $opt_anchors, &HtlcKey::from_basepoint(&secp_ctx, &HtlcBasepoint::from(pubkey), &pubkey), &HtlcKey::from_basepoint(&secp_ctx, &HtlcBasepoint::from(pubkey), &pubkey), &RevocationKey::from_basepoint(&secp_ctx, &RevocationBasepoint::from(pubkey), &pubkey)) };
 				let sighash = hash_to_message!(&$sighash_parts.p2wsh_signature_hash($idx, &redeem_script, $amount, EcdsaSighashType::All).unwrap()[..]);
@@ -7358,9 +7377,9 @@ mod tests {
 				witness.push(ser_sig);
 				if *$weight == WEIGHT_REVOKED_OUTPUT {
 					witness.push(vec!(1));
-				} else if *$weight == weight_revoked_offered_htlc($opt_anchors) || *$weight == weight_revoked_received_htlc($opt_anchors) {
+				} else if *$weight == weight_revoked_offered_htlc($opt_anchors, None) || *$weight == weight_revoked_received_htlc($opt_anchors, None) {
 					witness.push(pubkey.clone().serialize().to_vec());
-				} else if *$weight == weight_received_htlc($opt_anchors) {
+				} else if *$weight == weight_received_htlc($opt_anchors, None) {
 					witness.push(vec![0]);
 				} else {
 					witness.push(PaymentPreimage([1; 32]).0.to_vec());
@@ -7396,7 +7415,7 @@ mod tests {
 				value: Amount::ZERO,
 			});
 			let base_weight = claim_tx.weight().to_wu();
-			let inputs_weight = [WEIGHT_REVOKED_OUTPUT, weight_revoked_offered_htlc(channel_type_features), weight_revoked_offered_htlc(channel_type_features), weight_revoked_received_htlc(channel_type_features)];
+			let inputs_weight = [WEIGHT_REVOKED_OUTPUT, weight_revoked_offered_htlc(channel_type_features, None), weight_revoked_offered_htlc(channel_type_features, None), weight_revoked_received_htlc(channel_type_features, None)];
 			let mut inputs_total_weight = 2; // count segwit flags
 			{
 				let mut sighash_parts = sighash::SighashCache::new(&mut claim_tx);
@@ -7428,7 +7447,7 @@ mod tests {
 				value: Amount::ZERO,
 			});
 			let base_weight = claim_tx.weight().to_wu();
-			let inputs_weight = [weight_offered_htlc(channel_type_features), weight_received_htlc(channel_type_features), weight_received_htlc(channel_type_features), weight_received_htlc(channel_type_features)];
+			let inputs_weight = [weight_offered_htlc(channel_type_features, None), weight_received_htlc(channel_type_features, None), weight_received_htlc(channel_type_features, None), weight_received_htlc(channel_type_features, None)];
 			let mut inputs_total_weight = 2; // count segwit flags
 			{
 				let mut sighash_parts = sighash::SighashCache::new(&mut claim_tx);
