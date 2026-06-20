@@ -1276,6 +1276,14 @@ pub(super) struct ReestablishResponses {
 	/// Ark bridge: a `teleport_complete_ack` to (re)send on reconnect if we (the responder)
 	/// promoted on a `teleport_complete` but the initiator hasn't yet processed our ack.
 	pub teleport_complete_ack: Option<msgs::TeleportCompleteAck>,
+	/// Ark bridge: the responder's new-scope `commitment_signed` (CS_R) to retransmit on reconnect
+	/// when we (the responder) are in `AwaitingRemoteComplete` — we sent CS_R and processed the
+	/// initiator's `commitment_signed`, but have not yet received `teleport_complete`. The teleport
+	/// CS_R does not advance the commitment number, so stock LDK's lost-commitment retransmission
+	/// never resends it; without this the kept initiator stalls awaiting a CS_R that never comes. It
+	/// is carried separately from `commitment_update` because it neither advances nor is ordered
+	/// against the normal RAA/commitment sequence.
+	pub teleport_initial_commitment_signed: Option<msgs::CommitmentSigned>,
 }
 
 /// The first message we send to our peer after connection
@@ -2457,6 +2465,34 @@ where
 							logger,
 						)
 						.map(|monitor_update_opt| (None, monitor_update_opt))
+				} else if funded_channel
+					.pending_teleport
+					.as_ref()
+					.map(|pending_teleport| {
+						msg.funding_txid == Some(pending_teleport.new_funding_txo().txid)
+					})
+					.unwrap_or(false)
+				{
+					// Ark bridge: a new-scope teleport `commitment_signed` (CS_R) that names our
+					// in-flight teleport's new scope but arrives when we are NOT
+					// `AwaitingRemoteCommitmentSigned` is a DUPLICATE — we already processed the
+					// original and advanced (e.g. to `AwaitingLocalComplete`). The responder always
+					// retransmits CS_R from `AwaitingRemoteComplete` on reconnect, unable to know we
+					// already have it. Ignore it: the channel is still quiescent here, so letting it
+					// fall through to the normal `commitment_signed` path would mis-reject it as a
+					// "commitment_signed while quiescent" and force a disconnect. Re-applying it
+					// would at best re-stage the identical monitor update; dropping it is the correct
+					// idempotent response (the reestablish commitment-number negotiation already
+					// established there was no real loss).
+					log_info!(
+						logger,
+						"Ignoring duplicate teleport commitment_signed for funding txid {} on channel {}",
+						msg.funding_txid
+							.map(|txid| txid.to_string())
+							.unwrap_or_else(|| "none".to_owned()),
+						&funded_channel.context.channel_id(),
+					);
+					Ok((None, None))
 				} else if has_negotiated_pending_splice && !session_received_commitment_signed {
 					let has_holder_witnesses = funded_channel
 						.context
@@ -7723,6 +7759,47 @@ where
 		self.context.get_initial_commitment_signed_v2(&funding, logger)
 	}
 
+	/// Ark bridge: if we (the responder) have sent our new-scope `commitment_signed` (CS_R) and
+	/// processed the initiator's, but have NOT yet received the initiator's `teleport_complete` (i.e.
+	/// we are in the persistent `AwaitingRemoteComplete`), regenerate CS_R so it can be retransmitted
+	/// on reconnect.
+	///
+	/// CS_R is sent exactly once on the happy path — as a one-shot `UpdateHTLCs` at `ack_teleport`
+	/// time — and is dropped (like every un-flushed message event) on `peer_disconnected`. Unlike a
+	/// normal `commitment_signed`, the teleport's CS_R does NOT advance the commitment-transaction
+	/// number ([H1]: it signs the new scope's *initial* commitment at the SAME number), so after the
+	/// exchange both sides are at equal `next_commitment_number`s and stock LDK's lost-commitment
+	/// retransmission (`get_last_commitment_update_for_send`, only entered when the peer is one
+	/// commitment behind) never fires for it. Without an explicit resend the initiator — which, kept
+	/// across the disconnect by its mid-exchange reconcile gate, is still
+	/// `AwaitingRemoteCommitmentSigned{is_initiator:true}` awaiting CS_R — would stall forever.
+	///
+	/// Regeneration is deterministic and idempotent: it re-signs the counterparty's initial
+	/// commitment for the new scope at the unchanged `counterparty_next_commitment_transaction_number`
+	/// (receiving the initiator's CS did not advance it), reproducing the original CS_R bit-for-bit.
+	/// Only `AwaitingRemoteComplete` needs this: in the earlier
+	/// `AwaitingRemoteCommitmentSigned{is_initiator:false}` the responder's state is non-persistent (a
+	/// disconnect there is a clean symmetric abort — see [I1]), and in the later post-`teleport_complete`
+	/// states the initiator has provably already processed CS_R (it could not have sent
+	/// `teleport_complete` otherwise), so only `teleport_complete_ack` remains to be resent.
+	fn get_pending_teleport_initial_commitment_signed<L: Logger>(
+		&mut self, logger: &L,
+	) -> Option<msgs::CommitmentSigned> {
+		let (new_funding_txo, responder_value_removal_sat) =
+			match self.pending_teleport.as_ref()? {
+				PendingTeleport::AwaitingRemoteComplete {
+					new_funding_txo,
+					responder_value_removal_sat,
+				} => (*new_funding_txo, *responder_value_removal_sat),
+				_ => return None,
+			};
+		self.get_initial_teleport_commitment_signed(
+			new_funding_txo,
+			responder_value_removal_sat,
+			logger,
+		)
+	}
+
 	/// Ark bridge: validates the counterparty's new-scope `commitment_signed` and stages a
 	/// `RenegotiatedFunding` monitor update against the new funding scope.
 	///
@@ -11151,8 +11228,13 @@ where
 					&self.context.channel_id(),
 				);
 				self.pending_teleport = None;
+				// Use `exit_quiescence()` (not a bare `clear_quiescent()`): we are fully abandoning
+				// the teleport and returning the channel to normal operation, so we must also clear
+				// `sent_message_awaiting_response` — otherwise the disconnect-await timer could later
+				// fire on a channel that is no longer waiting on anything. `exit_quiescence()` is the
+				// canonical "leave quiescence" helper and is a no-op if we were not quiescent.
 				if self.context.channel_state.is_quiescent() {
-					self.context.channel_state.clear_quiescent();
+					self.exit_quiescence();
 				}
 			}
 		}
@@ -11160,6 +11242,14 @@ where
 		// Ark bridge: if we (the responder) promoted on `teleport_complete` but the initiator
 		// hasn't yet processed our `teleport_complete_ack`, resend it on reconnect.
 		let teleport_complete_ack = self.get_pending_teleport_complete_ack();
+
+		// Ark bridge: if we (the responder) are in `AwaitingRemoteComplete` (CS_R sent + initiator's
+		// CS processed, but no `teleport_complete` yet), retransmit CS_R. It is dropped on disconnect
+		// and is invisible to stock lost-commitment retransmission (it does not advance the commitment
+		// number), so the kept initiator would otherwise stall awaiting it. See
+		// `get_pending_teleport_initial_commitment_signed`.
+		let teleport_initial_commitment_signed =
+			self.get_pending_teleport_initial_commitment_signed(logger);
 
 		let mut commitment_update = None;
 		let mut tx_signatures = None;
@@ -11282,6 +11372,7 @@ where
 					splice_locked: None,
 					inferred_splice_locked: None,
 					teleport_complete_ack,
+					teleport_initial_commitment_signed,
 				});
 			}
 
@@ -11297,6 +11388,7 @@ where
 				splice_locked: None,
 				inferred_splice_locked: None,
 				teleport_complete_ack,
+				teleport_initial_commitment_signed,
 			});
 		}
 
@@ -11414,6 +11506,7 @@ where
 				splice_locked,
 				inferred_splice_locked,
 				teleport_complete_ack,
+				teleport_initial_commitment_signed,
 			})
 		} else if msg.next_local_commitment_number == next_counterparty_commitment_number - 1 {
 			debug_assert!(commitment_update.is_none());
@@ -11441,6 +11534,7 @@ where
 					splice_locked,
 					inferred_splice_locked,
 					teleport_complete_ack,
+					teleport_initial_commitment_signed,
 				})
 			} else {
 				let commitment_update = if self.context.resend_order == RAACommitmentOrder::RevokeAndACKFirst
@@ -11470,6 +11564,7 @@ where
 					splice_locked,
 					inferred_splice_locked,
 					teleport_complete_ack,
+					teleport_initial_commitment_signed,
 				})
 			}
 		} else if msg.next_local_commitment_number < next_counterparty_commitment_number {

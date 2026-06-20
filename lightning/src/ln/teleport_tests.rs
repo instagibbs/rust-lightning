@@ -121,6 +121,118 @@ fn ack_teleport<'a, 'b, 'c>(
 	check_added_monitors(responder, 1);
 }
 
+/// Drive the teleport into the **asymmetric mid-exchange gap**: the responder processes the
+/// initiator's new-scope `commitment_signed` and advances to the PERSISTENT `AwaitingRemoteComplete`,
+/// but its own new-scope `commitment_signed` (CS_R) is NOT delivered to the initiator — so the
+/// initiator stays in the persistent `AwaitingRemoteCommitmentSigned{is_initiator:true}`, awaiting a
+/// CS_R it never received. Returns the held CS_R (the one-shot the responder emitted at `ack_teleport`
+/// time, captured rather than delivered). This is exactly the window a post-`TeleportAck` mid-CS
+/// disconnect lands in, and the one the responder's reconnect retransmission must close.
+fn ack_teleport_into_gap<'a, 'b, 'c>(
+	initiator: &Node<'a, 'b, 'c>, responder: &Node<'a, 'b, 'c>, channel_id: ChannelId,
+) -> crate::ln::msgs::CommitmentSigned {
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+
+	responder.node.ack_teleport(&channel_id, &initiator_id).unwrap();
+	let mut responder_events = responder.node.get_and_clear_pending_msg_events();
+	assert_eq!(responder_events.len(), 2, "{responder_events:?}");
+	let teleport_ack = match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::SendTeleportAck { msg, .. } => msg,
+		event => panic!("Unexpected event {event:?}"),
+	};
+	// Capture (do NOT deliver) the responder's new-scope `commitment_signed` (CS_R).
+	let held_responder_cs =
+		match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+			MessageSendEvent::UpdateHTLCs { updates, .. } => updates.commitment_signed[0].clone(),
+			event => panic!("Unexpected event {event:?}"),
+		};
+	assert!(responder_events.is_empty());
+
+	// The initiator processes `teleport_ack` and emits its own `commitment_signed`; deliver THAT to
+	// the responder so the responder advances to `AwaitingRemoteComplete`. The initiator, never having
+	// received CS_R, stays in `AwaitingRemoteCommitmentSigned{is_initiator:true}`.
+	initiator.node.handle_teleport_ack(responder_id, &teleport_ack);
+	let initiator_commitment_signed =
+		get_htlc_update_msgs(initiator, &responder_id).commitment_signed[0].clone();
+	responder.node.handle_commitment_signed(initiator_id, &initiator_commitment_signed);
+	check_added_monitors(responder, 1);
+
+	held_responder_cs
+}
+
+/// Reconnect two peers and drive the `channel_reestablish` exchange, returning the responder's
+/// retransmitted new-scope `commitment_signed` (CS_R) if it sent one.
+///
+/// A responder in `AwaitingRemoteComplete` (CS_R already sent, initiator's `commitment_signed`
+/// already processed, no `teleport_complete` yet) MUST retransmit CS_R on reconnect — it was dropped
+/// on disconnect and is not covered by stock lost-commitment retransmission. This helper performs the
+/// manual reestablish dance (rather than `reconnect_nodes`, which has no notion of the teleport CS_R)
+/// and isolates that CS_R so callers can assert on it and feed it back in. It deliberately ignores
+/// the ordinary reconnect churn (`channel_ready`/`announcement_signatures`/`channel_update`) that an
+/// announced channel re-exchanges — those are not what these teleport tests are asserting.
+fn teleport_reconnect_capturing_responder_cs<'a, 'b, 'c>(
+	initiator: &Node<'a, 'b, 'c>, responder: &Node<'a, 'b, 'c>,
+) -> Option<crate::ln::msgs::CommitmentSigned> {
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+
+	let initiator_init = crate::ln::msgs::Init {
+		features: initiator.init_features(responder_id),
+		networks: None,
+		remote_network_address: None,
+	};
+	let responder_init = crate::ln::msgs::Init {
+		features: responder.init_features(initiator_id),
+		networks: None,
+		remote_network_address: None,
+	};
+	initiator.node.peer_connected(responder_id, &responder_init, true).unwrap();
+	let initiator_reestablish = get_chan_reestablish_msgs!(initiator, responder);
+	assert_eq!(initiator_reestablish.len(), 1);
+	responder.node.peer_connected(initiator_id, &initiator_init, false).unwrap();
+	let responder_reestablish = get_chan_reestablish_msgs!(responder, initiator);
+	assert_eq!(responder_reestablish.len(), 1);
+
+	// Deliver the reestablish messages.
+	initiator.node.handle_channel_reestablish(responder_id, &responder_reestablish[0]);
+	responder.node.handle_channel_reestablish(initiator_id, &initiator_reestablish[0]);
+
+	// The kept initiator (still `AwaitingRemoteCommitmentSigned{is_initiator:true}` if it had not yet
+	// processed CS_R, else already advanced) must not emit a stray teleport `commitment_signed`; it is
+	// the responder that retransmits. Drain the initiator's reconnect churn and assert none of it is a
+	// teleport-scope commitment.
+	for event in initiator.node.get_and_clear_pending_msg_events() {
+		if let MessageSendEvent::UpdateHTLCs { updates, .. } = &event {
+			assert!(
+				updates.commitment_signed.iter().all(|cs| cs.funding_txid.is_none()),
+				"the initiator must not retransmit a new-scope teleport commitment_signed",
+			);
+		}
+	}
+
+	// Extract the responder's retransmitted CS_R (a teleport-scope `commitment_signed`, i.e. one
+	// carrying a `funding_txid`), ignoring `channel_ready`/`announcement_signatures`/`channel_update`.
+	let mut responder_cs = None;
+	for event in responder.node.get_and_clear_pending_msg_events() {
+		if let MessageSendEvent::UpdateHTLCs { node_id, updates, .. } = &event {
+			assert_eq!(*node_id, initiator_id);
+			let teleport_cs: Vec<_> = updates
+				.commitment_signed
+				.iter()
+				.filter(|cs| cs.funding_txid.is_some())
+				.cloned()
+				.collect();
+			if !teleport_cs.is_empty() {
+				assert_eq!(teleport_cs.len(), 1, "exactly one CS_R expected");
+				assert!(responder_cs.is_none(), "the responder retransmitted CS_R more than once");
+				responder_cs = Some(teleport_cs[0].clone());
+			}
+		}
+	}
+	responder_cs
+}
+
 fn current_funding_txo<'a, 'b, 'c>(
 	node: &Node<'a, 'b, 'c>, channel_id: ChannelId,
 ) -> FundingOutPoint {
@@ -420,10 +532,21 @@ fn test_channel_teleport_disconnect_after_ack_preserves_quiescence() {
 	initiator.node.peer_disconnected(responder_id);
 	responder.node.peer_disconnected(initiator_id);
 
-	let mut reconnect_args = ReconnectArgs::new(initiator, responder);
-	reconnect_args.send_channel_ready = (true, true);
-	reconnect_args.send_announcement_sigs = (true, true);
-	reconnect_nodes(reconnect_args);
+	// Here the initiator had ALREADY processed the responder's CS_R before the disconnect (the
+	// `ack_teleport` helper delivered it), so it is in `AwaitingLocalComplete`. On reconnect the
+	// responder (in `AwaitingRemoteComplete`) still retransmits CS_R; that retransmission is a
+	// DUPLICATE for the initiator and MUST be tolerated as a no-op (the defense-in-depth in
+	// `FundedChannel::commitment_signed` drops a `commitment_signed` naming a funding txid that is
+	// neither the current nor a pending scope — here the unpromoted new scope).
+	let responder_cs = teleport_reconnect_capturing_responder_cs(initiator, responder);
+	let responder_cs =
+		responder_cs.expect("responder must retransmit CS_R from AwaitingRemoteComplete");
+	assert_eq!(responder_cs.funding_txid, Some(new_funding_txo.txid));
+	initiator.node.handle_commitment_signed(responder_id, &responder_cs);
+	// Idempotent: the duplicate CS_R is dropped (no new commitment), so no monitor update and — in
+	// particular — NO disconnect/force-close (the duplicate is recognized before the quiescent guard).
+	check_added_monitors(initiator, 0);
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
 
 	for _ in 0..=DISCONNECT_PEER_AWAITING_RESPONSE_TICKS {
 		initiator.node.timer_tick_occurred();
@@ -804,10 +927,18 @@ fn test_channel_teleport_persistent_state_survives_serialize_reload() {
 		"[C1] the reloaded responder's commitment number must not have advanced",
 	);
 
-	let mut reconnect_args = ReconnectArgs::new(initiator, responder);
-	reconnect_args.send_channel_ready = (true, true);
-	reconnect_args.send_announcement_sigs = (true, true);
-	reconnect_nodes(reconnect_args);
+	// On reconnect the reloaded responder (`AwaitingRemoteComplete`) retransmits its new-scope
+	// `commitment_signed` (CS_R) — proving the retransmission survives a full RESTART, not just a live
+	// disconnect. The reloaded initiator already processed CS_R before serialization (it is
+	// `AwaitingLocalComplete`), so this is a DUPLICATE and must be tolerated as a no-op (no monitor
+	// update, no disconnect).
+	let responder_cs = teleport_reconnect_capturing_responder_cs(initiator, responder);
+	let responder_cs =
+		responder_cs.expect("reloaded responder must retransmit CS_R from AwaitingRemoteComplete");
+	assert_eq!(responder_cs.funding_txid, Some(new_funding_txo.txid));
+	initiator.node.handle_commitment_signed(responder_id, &responder_cs);
+	check_added_monitors(initiator, 0);
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
 
 	// A persistent teleport waits on a local `complete_teleport`, so reconnect must NOT trip the
 	// awaiting-response disconnect timer.
@@ -885,10 +1016,15 @@ fn test_channel_teleport_persistent_state_survives_serialize_reload() {
 /// and symmetrically**: BOTH parties drop back to the OLD funding scope and the channel stays
 /// usable (re-quiesce-able for a fresh teleport).
 ///
-/// Before the fix, `AwaitingRemoteCommitmentSigned{is_initiator:true}` was persistent while
-/// `{is_initiator:false}` was not, so a disconnect here left the responder on the OLD scope but the
-/// initiator quiesced forever awaiting a `commitment_signed` that has no teleport resend path — the
-/// initiator was permanently bricked.
+/// How the symmetric abort is achieved: the responder's `{is_initiator:false}` state is
+/// **non-persistent** (it has not processed the initiator's `commitment_signed`, so a disconnect here
+/// simply abandons the attempt — its reconnect `channel_reestablish` therefore advertises NO teleport
+/// scope). The initiator's `{is_initiator:true}` state IS persistent (it must survive a disconnect in
+/// the asymmetric window where the responder has already advanced to `AwaitingRemoteComplete`), but on
+/// reconnect its reconcile gate sees the responder is no longer advertising the teleport scope and so
+/// ABORTS locally — falling back to the old scope and exiting quiescence. Both ends thus converge on
+/// the old scope. (Contrast `test_..._after_ack_preserves_quiescence`, where the responder DID reach
+/// `AwaitingRemoteComplete`, re-advertises the scope, retransmits CS_R, and the teleport completes.)
 #[test]
 fn test_channel_teleport_disconnect_mid_commitment_exchange_aborts_symmetrically() {
 	let chanmon_cfgs = create_chanmon_cfgs(2);
@@ -972,4 +1108,255 @@ fn test_channel_teleport_disconnect_mid_commitment_exchange_aborts_symmetrically
 	ack_teleport(initiator, responder, channel_id);
 	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
 	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
+}
+
+/// [a]+[b] THE GAP this change closes. Drive the teleport into the asymmetric mid-CS window where the
+/// responder reached the PERSISTENT `AwaitingRemoteComplete` but its new-scope `commitment_signed`
+/// (CS_R) was never delivered, so the initiator is still in the PERSISTENT
+/// `AwaitingRemoteCommitmentSigned{is_initiator:true}`. Disconnect there (dropping the in-flight
+/// CS_R), reconnect, and assert:
+///   [a] the responder RETRANSMITS CS_R on `channel_reestablish` (it is the production retransmission,
+///       not any test shim, that carries the teleport forward);
+///   [b] the kept initiator processes that CS_R, advances to `AwaitingLocalComplete`, and the teleport
+///       COMPLETES in-place — both peers promote to the new scope, with [H1] commitment-number
+///       continuity preserved and NO force-close.
+#[test]
+fn test_channel_teleport_responder_retransmits_cs_on_reconnect_kept_initiator_completes() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let new_funding_txo = test_outpoint(21, 0);
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+	let original_funding_script = funding_watch_script(initiator, channel_id, original_funding_txo);
+
+	// [H1] Continuity baseline.
+	let initiator_commitment_number_before = holder_commitment_number(initiator, channel_id);
+	let responder_commitment_number_before = holder_commitment_number(responder, channel_id);
+
+	start_teleport(initiator, responder, channel_id, new_funding_txo);
+	let _ = get_event!(responder, Event::ChannelTeleport);
+
+	// Reach the gap: responder is `AwaitingRemoteComplete`, initiator is still
+	// `AwaitingRemoteCommitmentSigned{is_initiator:true}` (CS_R held, NOT delivered).
+	let _held_cs = ack_teleport_into_gap(initiator, responder, channel_id);
+	// Both still on the OLD scope; neither promoted.
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
+
+	// Disconnect in the gap. The held CS_R is dropped (mirrors stock LDK dropping un-flushed message
+	// events on `peer_disconnected`); the responder MUST regenerate it on reconnect.
+	initiator.node.peer_disconnected(responder_id);
+	responder.node.peer_disconnected(initiator_id);
+	drop(_held_cs);
+
+	// [a] Reconnect: the responder retransmits CS_R.
+	let responder_cs = teleport_reconnect_capturing_responder_cs(initiator, responder);
+	let responder_cs = responder_cs
+		.expect("[a] responder must retransmit CS_R from AwaitingRemoteComplete on reconnect");
+	assert_eq!(
+		responder_cs.funding_txid,
+		Some(new_funding_txo.txid),
+		"[a] retransmitted CS_R must name the new (teleport) funding scope",
+	);
+
+	// [b] The kept initiator processes the retransmitted CS_R: this is a REAL (first) CS_R for it, so
+	// it stages the new-scope monitor update and advances to `AwaitingLocalComplete`.
+	initiator.node.handle_commitment_signed(responder_id, &responder_cs);
+	check_added_monitors(initiator, 1);
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+
+	// The teleport completes IN-PLACE across the disconnect, driven entirely by production messages.
+	initiator.node.complete_teleport(&channel_id, &responder_id).unwrap();
+	let teleport_complete =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportComplete, responder_id);
+	responder.node.handle_teleport_complete(initiator_id, &teleport_complete);
+	check_added_monitors(responder, 1);
+	// Responder promotes on `teleport_complete`; initiator still on old scope until complete_ack.
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), new_funding_txo);
+	assert_eq!(
+		holder_commitment_number(responder, channel_id),
+		responder_commitment_number_before,
+		"[H1] responder promotes against the continued commitment number",
+	);
+
+	let teleport_complete_ack =
+		get_event_msg!(responder, MessageSendEvent::SendTeleportCompleteAck, initiator_id);
+	initiator.node.handle_teleport_complete_ack(responder_id, &teleport_complete_ack);
+	// Just the promotion `RenegotiatedFundingLocked` here: unlike the happy path (where CS_R's
+	// `RenegotiatedFunding` is still pending and applied together with the promotion, giving 2), we
+	// already applied CS_R's monitor update above when the kept initiator processed the retransmission.
+	check_added_monitors(initiator, 1);
+
+	// Both peers promoted to the new scope.
+	assert_eq!(current_funding_txo(initiator, channel_id), new_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), new_funding_txo);
+	assert_eq!(current_monitor_funding_txo(initiator, channel_id), new_funding_txo);
+	assert_eq!(current_monitor_funding_txo(responder, channel_id), new_funding_txo);
+	assert_eq!(
+		holder_commitment_number(initiator, channel_id),
+		initiator_commitment_number_before,
+		"[H1] initiator promotes against the continued commitment number, not a reset/advanced one",
+	);
+
+	// The channel is live on the new scope: a payment flows end-to-end.
+	send_payment(initiator, &[responder], 1_000_000);
+
+	initiator
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script.clone());
+	responder
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script);
+}
+
+/// [c] A duplicate / late CS_R must be tolerated once the initiator has already advanced. Reach the
+/// gap, deliver CS_R so the initiator advances to `AwaitingLocalComplete`, then deliver the SAME CS_R
+/// AGAIN (modelling the responder's unconditional reconnect retransmission landing on an initiator
+/// that already processed the original). The duplicate must be a benign no-op: NO extra monitor
+/// update, NO force-close/disconnect, and the teleport still completes normally afterward.
+#[test]
+fn test_channel_teleport_duplicate_cs_tolerated_when_initiator_already_advanced() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let new_funding_txo = test_outpoint(22, 0);
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+	let original_funding_script = funding_watch_script(initiator, channel_id, original_funding_txo);
+
+	let initiator_commitment_number_before = holder_commitment_number(initiator, channel_id);
+
+	start_teleport(initiator, responder, channel_id, new_funding_txo);
+	let _ = get_event!(responder, Event::ChannelTeleport);
+	let held_cs = ack_teleport_into_gap(initiator, responder, channel_id);
+
+	// Deliver CS_R once: the initiator advances to `AwaitingLocalComplete` (one monitor update).
+	initiator.node.handle_commitment_signed(responder_id, &held_cs);
+	check_added_monitors(initiator, 1);
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+
+	// Deliver the SAME CS_R again — a late/duplicate retransmission. It must be dropped: no monitor
+	// update, and crucially NO `commitment_signed-while-quiescent` disconnect warning.
+	initiator.node.handle_commitment_signed(responder_id, &held_cs);
+	check_added_monitors(initiator, 0);
+	assert!(
+		initiator.node.get_and_clear_pending_msg_events().is_empty(),
+		"a duplicate CS_R must not provoke any message (e.g. a disconnect warning)",
+	);
+	// Still on the old scope, commitment number unchanged — the duplicate changed nothing.
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(
+		holder_commitment_number(initiator, channel_id),
+		initiator_commitment_number_before,
+		"a duplicate CS_R must not touch the commitment number",
+	);
+
+	// The teleport still completes normally from `AwaitingLocalComplete`.
+	initiator.node.complete_teleport(&channel_id, &responder_id).unwrap();
+	let teleport_complete =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportComplete, responder_id);
+	responder.node.handle_teleport_complete(initiator_id, &teleport_complete);
+	check_added_monitors(responder, 1);
+	let teleport_complete_ack =
+		get_event_msg!(responder, MessageSendEvent::SendTeleportCompleteAck, initiator_id);
+	initiator.node.handle_teleport_complete_ack(responder_id, &teleport_complete_ack);
+	check_added_monitors(initiator, 1);
+
+	assert_eq!(current_funding_txo(initiator, channel_id), new_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), new_funding_txo);
+	assert_eq!(
+		holder_commitment_number(initiator, channel_id),
+		initiator_commitment_number_before,
+		"[H1] promotion continues the commitment number even after a duplicate CS_R",
+	);
+
+	initiator
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script.clone());
+	responder
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script);
+}
+
+/// [d] The reconnect ABORT path stays clean. Reach the asymmetric gap (initiator persistent
+/// `AwaitingRemoteCommitmentSigned{is_initiator:true}`, CS_R undelivered), but the responder NEVER
+/// reached `AwaitingRemoteComplete` — model the responder simply dropping the teleport (it forgets the
+/// pending teleport, as a non-persistent `{is_initiator:false}` disconnect would). On reconnect the
+/// responder's `channel_reestablish` therefore carries NO `teleport_funding_txid`, so the kept
+/// initiator's reconcile gate must ABORT: drop the teleport, exit quiescence, and fall back to the old
+/// scope — leaving a fully usable channel and NO force-close.
+#[test]
+fn test_channel_teleport_reconnect_aborts_when_peer_drops_teleport() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+
+	start_teleport(initiator, responder, channel_id, test_outpoint(23, 0));
+	let _ = get_event!(responder, Event::ChannelTeleport);
+
+	// Bring only the INITIATOR into the persistent mid-exchange state: it processes `teleport_ack`
+	// and sends its `commitment_signed`, landing in `AwaitingRemoteCommitmentSigned{is_initiator:true}`.
+	responder.node.ack_teleport(&channel_id, &initiator_id).unwrap();
+	let mut responder_events = responder.node.get_and_clear_pending_msg_events();
+	assert_eq!(responder_events.len(), 2, "{responder_events:?}");
+	let teleport_ack = match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::SendTeleportAck { msg, .. } => msg,
+		event => panic!("Unexpected event {event:?}"),
+	};
+	// Drop the responder's CS_R (never delivered) AND have the responder forget the teleport — the
+	// non-persistent `{is_initiator:false}` window: on its own disconnect it abandons the attempt.
+	match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::UpdateHTLCs { .. } => {},
+		event => panic!("Unexpected event {event:?}"),
+	};
+	initiator.node.handle_teleport_ack(responder_id, &teleport_ack);
+	let _initiator_cs = get_htlc_update_msgs(initiator, &responder_id).commitment_signed[0].clone();
+
+	initiator.node.peer_disconnected(responder_id);
+	responder.node.peer_disconnected(initiator_id);
+
+	// On reconnect the responder advertises NO teleport scope (its `{is_initiator:false}` state was
+	// non-persistent and dropped on disconnect). The kept initiator's gate must abort to the old scope.
+	let responder_cs = teleport_reconnect_capturing_responder_cs(initiator, responder);
+	assert!(
+		responder_cs.is_none(),
+		"[d] responder must not retransmit CS_R when it never reached AwaitingRemoteComplete",
+	);
+
+	// Neither side holds a lingering quiescence/teleport state that trips the disconnect timer.
+	for _ in 0..=DISCONNECT_PEER_AWAITING_RESPONSE_TICKS {
+		initiator.node.timer_tick_occurred();
+		responder.node.timer_tick_occurred();
+	}
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+	assert!(responder.node.get_and_clear_pending_msg_events().is_empty());
+
+	// Both ends are back on the OLD funding scope — neither bricked, no force-close.
+	assert_eq!(current_funding_txo(initiator, channel_id), original_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), original_funding_txo);
+
+	// The channel is fully usable: a normal payment flows end-to-end.
+	send_payment(initiator, &[responder], 1_000_000);
 }

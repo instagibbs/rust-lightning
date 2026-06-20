@@ -11161,6 +11161,11 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				updates.funding_tx_signed,
 				None,
 				updates.teleport_complete_ack,
+				// `MonitorRestoreUpdates` never carries a teleport CS_R retransmit: CS_R is a one-shot
+				// sent at `ack_teleport` time, never held pending a monitor update, so a monitor-update
+				// completion has none to resend. Its retransmission is driven solely by the reconnect
+				// (`ReestablishResponses`) path.
+				None,
 				updates.channel_ready_order,
 			);
 			needs_persist |= !htlc_forwards.is_empty();
@@ -11324,6 +11329,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		channel_ready: Option<msgs::ChannelReady>, announcement_sigs: Option<msgs::AnnouncementSignatures>,
 		mut funding_tx_signed: Option<FundingTxSigned>, tx_abort: Option<msgs::TxAbort>,
 		teleport_complete_ack: Option<msgs::TeleportCompleteAck>,
+		teleport_initial_commitment_signed: Option<msgs::CommitmentSigned>,
 		channel_ready_order: ChannelReadyOrder,
 	) -> (Vec<PendingAddHTLCInfo>, Option<(u64, Vec<msgs::UpdateAddHTLC>)>) {
 		let logger = WithChannelContext::from(&self.logger, &channel.context, None);
@@ -11432,6 +11438,27 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				pending_msg_events.push(MessageSendEvent::SendTeleportCompleteAck {
 					node_id: counterparty_node_id,
 					msg,
+				});
+			}
+			// Ark bridge: retransmit the responder's new-scope `commitment_signed` (CS_R) when we are
+			// in `AwaitingRemoteComplete`. It is dropped on disconnect and is not covered by stock
+			// lost-commitment retransmission (the teleport CS does not advance the commitment number),
+			// so the kept initiator would otherwise stall. Like the original CS_R sent at
+			// `ack_teleport` time it travels as an `UpdateHTLCs` carrying only the `commitment_signed`;
+			// it is not ordered against the normal RAA/commitment sequence (in this state there is no
+			// in-flight normal commitment_update or raa).
+			if let Some(commitment_signed) = teleport_initial_commitment_signed {
+				pending_msg_events.push(MessageSendEvent::UpdateHTLCs {
+					node_id: counterparty_node_id,
+					channel_id: channel.context.channel_id(),
+					updates: msgs::CommitmentUpdate {
+						commitment_signed: vec![commitment_signed],
+						update_add_htlcs: vec![],
+						update_fulfill_htlcs: vec![],
+						update_fail_htlcs: vec![],
+						update_fail_malformed_htlcs: vec![],
+						update_fee: None,
+					},
 				});
 			}
 
@@ -13681,7 +13708,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						let (htlc_forwards, decode_update_add_htlcs) = self.handle_channel_resumption(
 							&mut peer_state.pending_msg_events, chan, responses.raa, responses.commitment_update, responses.commitment_order,
 							Vec::new(), Vec::new(), None, responses.channel_ready, responses.announcement_sigs,
-							funding_tx_signed, responses.tx_abort, responses.teleport_complete_ack, responses.channel_ready_order,
+							funding_tx_signed, responses.tx_abort, responses.teleport_complete_ack,
+							responses.teleport_initial_commitment_signed, responses.channel_ready_order,
 						);
 						debug_assert!(htlc_forwards.is_empty());
 						debug_assert!(decode_update_add_htlcs.is_none());
