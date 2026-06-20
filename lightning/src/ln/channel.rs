@@ -2469,21 +2469,32 @@ where
 					.pending_teleport
 					.as_ref()
 					.map(|pending_teleport| {
+						// Only treat this as a duplicate of the in-flight teleport's new-scope CS_R
+						// when that scope is NOT yet our current funding scope. Once we have PROMOTED
+						// to the new scope (`self.funding`'s txid == the pending new scope), a
+						// `commitment_signed` naming it is ordinary post-promotion traffic on the
+						// current scope and must be processed, not dropped — mirrors the
+						// `matches_known_scope` distinction in `FundedChannel::commitment_signed`.
 						msg.funding_txid == Some(pending_teleport.new_funding_txo().txid)
+							&& funded_channel.funding.get_funding_txid() != msg.funding_txid
 					})
 					.unwrap_or(false)
 				{
 					// Ark bridge: a new-scope teleport `commitment_signed` (CS_R) that names our
-					// in-flight teleport's new scope but arrives when we are NOT
+					// in-flight teleport's not-yet-promoted new scope but arrives when we are NOT
 					// `AwaitingRemoteCommitmentSigned` is a DUPLICATE — we already processed the
-					// original and advanced (e.g. to `AwaitingLocalComplete`). The responder always
-					// retransmits CS_R from `AwaitingRemoteComplete` on reconnect, unable to know we
-					// already have it. Ignore it: the channel is still quiescent here, so letting it
-					// fall through to the normal `commitment_signed` path would mis-reject it as a
-					// "commitment_signed while quiescent" and force a disconnect. Re-applying it
-					// would at best re-stage the identical monitor update; dropping it is the correct
-					// idempotent response (the reestablish commitment-number negotiation already
-					// established there was no real loss).
+					// original and advanced (e.g. the initiator to `AwaitingLocalComplete`). The
+					// responder always retransmits CS_R from `AwaitingRemoteComplete` on reconnect,
+					// unable to know we already have it. Ignore it: the channel is still quiescent
+					// here (we have not promoted), so letting it fall through to the normal
+					// `commitment_signed` path would mis-reject it as a "commitment_signed while
+					// quiescent" and force a disconnect. Re-applying it would at best re-stage the
+					// identical monitor update; dropping it is the correct idempotent response (the
+					// reestablish commitment-number negotiation already established there was no real
+					// loss). NOTE: once we have promoted to this scope (it is our current funding),
+					// the guard above intentionally does NOT match — see
+					// `AwaitingRemoteActivityAfterTeleportCompleteAckSend`, where a legitimate
+					// post-promotion CS names the now-current scope and must be processed.
 					log_info!(
 						logger,
 						"Ignoring duplicate teleport commitment_signed for funding txid {} on channel {}",
@@ -7607,6 +7618,18 @@ where
 		&self.context
 	}
 
+	/// Ark bridge test support: read the channel's in-flight teleport state, if any.
+	#[cfg(test)]
+	pub(crate) fn pending_teleport(&self) -> Option<&PendingTeleport> {
+		self.pending_teleport.as_ref()
+	}
+
+	/// Ark bridge test support: whether the channel is currently quiescent.
+	#[cfg(test)]
+	pub(crate) fn is_quiescent(&self) -> bool {
+		self.context.channel_state.is_quiescent()
+	}
+
 	pub fn force_shutdown(&mut self, closure_reason: ClosureReason) -> ShutdownResult {
 		let splice_funding_failed = self.maybe_fail_splice_negotiation();
 
@@ -7776,7 +7799,8 @@ where
 	///
 	/// Regeneration is deterministic and idempotent: it re-signs the counterparty's initial
 	/// commitment for the new scope at the unchanged `counterparty_next_commitment_transaction_number`
-	/// (receiving the initiator's CS did not advance it), reproducing the original CS_R bit-for-bit.
+	/// (receiving the initiator's CS did not advance it), producing a valid signature over the
+	/// identical commitment transaction (literally bit-for-bit under a deterministic signer).
 	/// Only `AwaitingRemoteComplete` needs this: in the earlier
 	/// `AwaitingRemoteCommitmentSigned{is_initiator:false}` the responder's state is non-persistent (a
 	/// disconnect there is a clean symmetric abort — see [I1]), and in the later post-`teleport_complete`

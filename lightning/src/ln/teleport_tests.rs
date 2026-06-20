@@ -535,9 +535,12 @@ fn test_channel_teleport_disconnect_after_ack_preserves_quiescence() {
 	// Here the initiator had ALREADY processed the responder's CS_R before the disconnect (the
 	// `ack_teleport` helper delivered it), so it is in `AwaitingLocalComplete`. On reconnect the
 	// responder (in `AwaitingRemoteComplete`) still retransmits CS_R; that retransmission is a
-	// DUPLICATE for the initiator and MUST be tolerated as a no-op (the defense-in-depth in
-	// `FundedChannel::commitment_signed` drops a `commitment_signed` naming a funding txid that is
-	// neither the current nor a pending scope — here the unpromoted new scope).
+	// DUPLICATE for the initiator and MUST be tolerated as a no-op. The outer teleport-CS drop in
+	// `Channel::commitment_signed` dispatch catches it: a `commitment_signed` naming our in-flight
+	// teleport's new scope that we have NOT yet promoted to (`AwaitingLocalComplete` is still
+	// quiescent and still on the old scope). It is dropped there — before the normal
+	// `commitment_signed` path, whose quiescent guard would otherwise reject it as a
+	// "commitment_signed while quiescent" and force a disconnect.
 	let responder_cs = teleport_reconnect_capturing_responder_cs(initiator, responder);
 	let responder_cs =
 		responder_cs.expect("responder must retransmit CS_R from AwaitingRemoteComplete");
@@ -1283,6 +1286,226 @@ fn test_channel_teleport_duplicate_cs_tolerated_when_initiator_already_advanced(
 		initiator_commitment_number_before,
 		"[H1] promotion continues the commitment number even after a duplicate CS_R",
 	);
+
+	initiator
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script.clone());
+	responder
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script);
+}
+
+/// Asserts the responder is in the lingering, fully-promoted-but-not-yet-resolved
+/// `AwaitingRemoteActivityAfterTeleportCompleteAckSend` state: it has sent `teleport_complete_ack`,
+/// promoted `self.funding` to `new_funding_txo`, and CLEARED quiescence — and is now waiting for any
+/// post-promotion message from the initiator to retire the lingering `pending_teleport`.
+fn assert_responder_lingering_after_complete_ack<'a, 'b, 'c>(
+	responder: &Node<'a, 'b, 'c>, channel_id: ChannelId, new_funding_txo: FundingOutPoint,
+) {
+	use crate::ln::channel::PendingTeleport;
+	let per_peer_state = responder.node.per_peer_state.read().unwrap();
+	for (_, peer_state_mutex) in per_peer_state.iter() {
+		let peer_state = peer_state_mutex.lock().unwrap();
+		if let Some(chan) = peer_state.channel_by_id.get(&channel_id).and_then(|c| c.as_funded()) {
+			assert!(
+				matches!(
+					chan.pending_teleport(),
+					Some(PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+						new_funding_txo: txo,
+						..
+					}) if *txo == new_funding_txo
+				),
+				"responder must be lingering in AwaitingRemoteActivityAfterTeleportCompleteAckSend \
+				 with the promoted scope, was {:?}",
+				chan.pending_teleport(),
+			);
+			// Already promoted: the live funding scope IS the new (pending-teleport) scope. (Read it
+			// directly off the channel — calling `current_funding_txo` here would re-acquire the
+			// `per_peer_state` lock we already hold.)
+			assert_eq!(chan.funding.get_funding_txo(), Some(new_funding_txo));
+			// Quiescence has been cleared on `teleport_complete_ack_sent`.
+			assert!(
+				!chan.is_quiescent(),
+				"the lingering post-complete-ack state must NOT be quiescent",
+			);
+			return;
+		}
+	}
+	panic!("channel {channel_id} not found");
+}
+
+/// Drives a teleport to FULL completion (both peers promote to `new_funding_txo`) and leaves the
+/// responder in the lingering `AwaitingRemoteActivityAfterTeleportCompleteAckSend` state, awaiting
+/// the initiator's first post-promotion traffic. Mirrors `test_channel_teleport_happy_path_*`'s
+/// completion sequence; draining the responder's `SendTeleportCompleteAck` via
+/// `get_and_clear_pending_msg_events` is what advances it onto the lingering state (and clears its
+/// quiescence) — see `teleport_complete_ack_sent`.
+fn complete_teleport_into_responder_lingering<'a, 'b, 'c>(
+	initiator: &Node<'a, 'b, 'c>, responder: &Node<'a, 'b, 'c>, channel_id: ChannelId,
+	new_funding_txo: FundingOutPoint,
+) {
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+
+	start_teleport(initiator, responder, channel_id, new_funding_txo);
+	let _ = get_event!(responder, Event::ChannelTeleport);
+	ack_teleport(initiator, responder, channel_id);
+
+	initiator.node.complete_teleport(&channel_id, &responder_id).unwrap();
+	let teleport_complete =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportComplete, responder_id);
+	responder.node.handle_teleport_complete(initiator_id, &teleport_complete);
+	check_added_monitors(responder, 1);
+
+	// Drain `SendTeleportCompleteAck`: this advances the responder off `AwaitingTeleportCompleteAckSend`
+	// onto the lingering `AwaitingRemoteActivityAfterTeleportCompleteAckSend` (clearing quiescence).
+	let teleport_complete_ack =
+		get_event_msg!(responder, MessageSendEvent::SendTeleportCompleteAck, initiator_id);
+	initiator.node.handle_teleport_complete_ack(responder_id, &teleport_complete_ack);
+	// One monitor update: the promotion's `RenegotiatedFundingLocked`. (CS_R's `RenegotiatedFunding`
+	// was already applied when the initiator processed CS_R inside `ack_teleport`; unlike the happy
+	// path, there is no holding-cell payment that frees on promotion to add a second update.)
+	check_added_monitors(initiator, 1);
+
+	// Both peers are now on the new scope; the responder is lingering, awaiting post-promotion traffic.
+	assert_eq!(current_funding_txo(initiator, channel_id), new_funding_txo);
+	assert_responder_lingering_after_complete_ack(responder, channel_id, new_funding_txo);
+}
+
+/// REGRESSION (review blind spot): a LEGITIMATE post-promotion `commitment_signed` from the initiator
+/// must NOT be silently dropped while the responder lingers in
+/// `AwaitingRemoteActivityAfterTeleportCompleteAckSend`.
+///
+/// After a teleport completes, BOTH peers have promoted `self.funding` to the new scope, but the
+/// responder keeps a lingering `pending_teleport` until the initiator's first post-promotion message
+/// proves it promoted too. In that window the responder's live funding txid EQUALS
+/// `pending_teleport.new_funding_txo().txid`. The initiator (the funder) chooses `update_fee` +
+/// `commitment_signed` as its first post-promotion traffic; `handle_update_fee` does NOT retire the
+/// lingering teleport, so the `commitment_signed` arrives with the lingering state still set and
+/// carrying `funding_txid == Some(new_scope)`.
+///
+/// The over-broad outer "duplicate teleport CS_R" drop matched purely on
+/// `funding_txid == pending_teleport.new_funding_txo().txid` and SWALLOWED this legitimate CS — the
+/// responder staged no monitor update and sent no RAA/CS, desyncing the channel. The narrowed drop
+/// additionally requires the named scope to NOT be the current funding scope (it only fires for a
+/// duplicate naming a not-yet-promoted pending scope), so this post-promotion CS now falls through to
+/// the normal `commitment_signed` path and is processed.
+#[test]
+fn test_channel_teleport_post_promotion_commitment_signed_not_dropped_while_responder_lingers() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let new_funding_txo = test_outpoint(24, 0);
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+	let original_funding_script = funding_watch_script(initiator, channel_id, original_funding_txo);
+
+	complete_teleport_into_responder_lingering(initiator, responder, channel_id, new_funding_txo);
+
+	// The initiator's FIRST post-promotion traffic is an `update_fee` + `commitment_signed` (the
+	// funder bumps the feerate). `update_fee` does NOT clear the responder's lingering teleport.
+	{
+		let mut feerate_lock = chanmon_cfgs[0].fee_estimator.sat_per_kw.lock().unwrap();
+		*feerate_lock += 250;
+	}
+	initiator.node.timer_tick_occurred();
+	check_added_monitors(initiator, 1);
+	let initiator_updates = get_htlc_update_msgs(initiator, &responder_id);
+	let update_fee = initiator_updates.update_fee.expect("funder should emit an update_fee");
+	let commitment_signed = initiator_updates.commitment_signed[0].clone();
+	// The post-promotion CS names the NEW (now-current) scope — exactly the txid the lingering
+	// `pending_teleport` carries, which is what the over-broad drop keyed on.
+	assert_eq!(
+		commitment_signed.funding_txid,
+		Some(new_funding_txo.txid),
+		"a post-promotion commitment_signed names the current (new) funding scope",
+	);
+
+	// Deliver `update_fee`: accepted, but the lingering teleport remains (handle_update_fee does not
+	// retire it), so the responder is still in the over-broad drop's window.
+	responder.node.handle_update_fee(initiator_id, &update_fee);
+	assert_responder_lingering_after_complete_ack(responder, channel_id, new_funding_txo);
+
+	// Deliver the post-promotion `commitment_signed`. It MUST be processed, not dropped:
+	//  - the responder stages a monitor update, and
+	//  - replies with `revoke_and_ack` (+ its own `commitment_signed`).
+	// On the un-narrowed (buggy) drop this CS is swallowed: NO monitor update, NO reply -> the assert
+	// below fails (and the channel is desynced).
+	responder.node.handle_commitment_signed(initiator_id, &commitment_signed);
+	// The CS is PROCESSED (not dropped): a monitor update is staged. On the buggy (un-narrowed) drop
+	// this is 0 — the CS is silently swallowed.
+	check_added_monitors(responder, 1);
+
+	// Post-promotion traffic also retired the responder's lingering teleport (via
+	// `note_counterparty_post_teleport_complete_ack_activity` on the successful CS handling).
+	{
+		let per_peer_state = responder.node.per_peer_state.read().unwrap();
+		for (_, peer_state_mutex) in per_peer_state.iter() {
+			let peer_state = peer_state_mutex.lock().unwrap();
+			if let Some(chan) =
+				peer_state.channel_by_id.get(&channel_id).and_then(|c| c.as_funded())
+			{
+				assert!(
+					chan.pending_teleport().is_none(),
+					"post-promotion CS must retire the lingering teleport, was {:?}",
+					chan.pending_teleport(),
+				);
+			}
+		}
+	}
+
+	// The responder replies to the post-promotion CS with `revoke_and_ack` + its own
+	// `commitment_signed`. (It also retransmits a now-redundant `teleport_complete_ack`: that resend
+	// is generated while resuming from the staged monitor update, in the brief window before the
+	// lingering teleport is retired. It is a benign duplicate — the initiator has already promoted and
+	// ignores it; we deliver it below to prove so.)
+	let mut responder_events = responder.node.get_and_clear_pending_msg_events();
+	assert_eq!(responder_events.len(), 3, "{responder_events:?}");
+	let responder_raa = match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::SendRevokeAndACK { msg, .. } => msg,
+		event => panic!("Unexpected event {event:?}"),
+	};
+	let responder_cs = match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+		MessageSendEvent::UpdateHTLCs { updates, .. } => {
+			assert_eq!(updates.commitment_signed.len(), 1);
+			updates.commitment_signed[0].clone()
+		},
+		event => panic!("Unexpected event {event:?}"),
+	};
+	let redundant_complete_ack =
+		match remove_first_msg_event_to_node(&initiator_id, &mut responder_events) {
+			MessageSendEvent::SendTeleportCompleteAck { msg, .. } => msg,
+			event => panic!("Unexpected event {event:?}"),
+		};
+	assert!(responder_events.is_empty());
+
+	// The redundant `teleport_complete_ack` is a benign no-op on the already-promoted initiator.
+	initiator.node.handle_teleport_complete_ack(responder_id, &redundant_complete_ack);
+	check_added_monitors(initiator, 0);
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+
+	// Complete the commitment dance so the fee update commits on both sides — proving the channel is
+	// fully in sync (not silently desynced by a dropped CS).
+	initiator.node.handle_revoke_and_ack(responder_id, &responder_raa);
+	check_added_monitors(initiator, 1);
+	initiator.node.handle_commitment_signed(responder_id, &responder_cs);
+	check_added_monitors(initiator, 1);
+	let initiator_raa = get_event_msg!(initiator, MessageSendEvent::SendRevokeAndACK, responder_id);
+	responder.node.handle_revoke_and_ack(initiator_id, &initiator_raa);
+	check_added_monitors(responder, 1);
+
+	// No stray messages pending, and a payment still flows end-to-end on the new scope.
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+	assert!(responder.node.get_and_clear_pending_msg_events().is_empty());
+	assert_eq!(current_funding_txo(initiator, channel_id), new_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), new_funding_txo);
+	send_payment(initiator, &[responder], 1_000_000);
 
 	initiator
 		.chain_source
