@@ -6045,6 +6045,26 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			} else { true });
 		}
 
+		// Retract any *already-passed-upstream* threshold-conf bookkeeping keyed on
+		// this txid. Once a confirmation has matured past the threshold, the entry
+		// is drained from `onchain_events_awaiting_threshold_conf` and its outcome
+		// recorded in one of these terminal sets so we don't redundantly re-process
+		// it if the user duplicatively confirms the same old tx (see the dedup loops
+		// at the top of `transactions_confirmed`). But if that tx is genuinely
+		// reorg'd out via `transaction_unconfirmed`, leaving the record in place
+		// permanently suppresses re-processing when the tx re-confirms in a new
+		// block — the spendable output / HTLC resolution / commitment-spend would be
+		// silently dropped and never re-claimed. Drop the records keyed on this txid
+		// so a re-confirmation re-arms them. (Mirrors what a `block_disconnected`
+		// down past the confirmation height ought to do for these txids.)
+		self.spendable_txids_confirmed.retain(|t| t != txid);
+		self.htlcs_resolved_on_chain.retain(|h| h.resolving_txid != Some(*txid));
+		if self.funding_spend_confirmed == Some(*txid) {
+			log_info!(logger, "Funding-spend tx {} reorg'd out; clearing confirmed-spend record so a re-confirmation re-arms claims", txid);
+			self.funding_spend_confirmed = None;
+			self.confirmed_commitment_tx_counterparty_output = None;
+		}
+
 		debug_assert!(!self.onchain_events_awaiting_threshold_conf.iter().any(|ref entry| entry.txid == *txid));
 
 		// TODO: Replace with `take_if` once our MSRV is >= 1.80.
