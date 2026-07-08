@@ -972,12 +972,20 @@ pub fn build_htlc_transaction(
 #[rustfmt::skip]
 pub(crate) fn build_htlc_input(commitment_txid: &Txid, htlc: &HTLCOutputInCommitment, channel_type_features: &ChannelTypeFeatures) -> TxIn {
 	let baseline_csv = if channel_type_features.supports_anchors_zero_fee_htlc_tx() { 1 } else { 0 };
-	// When the HTLC carries an Ark success-branch CSV delta, the HTLC-Success tx spending this
-	// input must satisfy that relative timelock too. The HTLC-Timeout tx spends through a
-	// different script branch that doesn't have the Ark CSV, but using the same nSequence for
-	// both 2nd-stage txs is still valid (it's >= the baseline anchor CSV) and keeps the pre-
-	// signed tx templates symmetric across both parties.
-	let ark_csv = htlc.ark_htlc_success_csv_delta.unwrap_or(0) as u32;
+	// The Ark success-branch CSV delta applies ONLY to the HTLC-Success 2nd-stage tx (the
+	// 2nd stage of a RECEIVED HTLC): the success script branch carries the extra
+	// `<delta> OP_CSV`, so its spender must set nSequence >= delta or it is
+	// consensus-invalid. The HTLC-Timeout 2nd-stage (an OFFERED HTLC's) spends the timeout
+	// branch, which has no Ark CSV, and MUST stay at the baseline: these are v3
+	// transactions, so any nSequence < 0x80000000 is a real BIP-68 relative timelock, and
+	// presigning the timeout at the delta would delay the offerer's own timeout claim by
+	// the very head start the success CSV exists to create — after the HTLC's absolute
+	// CLTV expires, timeout and preimage claim would mature in the same block (a fee-race
+	// tie, re-opening the replacement-cycling window) instead of the timeout leading by
+	// the delta. The asymmetry is normative (ARK #8 "The Ark channel type"); the HTLC
+	// signatures commit to nSequence, so both peers must build these templates
+	// identically or their signatures fail to verify.
+	let ark_csv = if htlc.offered { 0 } else { htlc.ark_htlc_success_csv_delta.unwrap_or(0) as u32 };
 	let sequence = core::cmp::max(baseline_csv, ark_csv);
 	TxIn {
 		previous_output: OutPoint {
@@ -3201,6 +3209,55 @@ mod tests {
 			"0020e43a7c068553003fe68fcae424fb7b28ec5ce48cd8b6744b3945631389bad2fb",
 			"non-ark received script must be unchanged",
 		);
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn test_ark_htlc_second_stage_sequence_asymmetry() {
+		// ARK #8 "The Ark channel type": the presigned 2nd-stage templates are ASYMMETRIC.
+		// The HTLC-Success tx (a RECEIVED HTLC's 2nd stage) must set its input nSequence to
+		// the success-branch CSV delta (v3 => BIP-68-enforced, and the script demands it);
+		// the HTLC-Timeout tx (an OFFERED HTLC's) MUST stay at the baseline — delaying the
+		// offerer's own timeout by the delta would collapse its head start over a preimage
+		// claim into a fee-race tie at conf+delta once the absolute CLTV expires. The HTLC
+		// signatures commit to nSequence, so this is a consensus-relevant template rule,
+		// not policy.
+		let mk_htlc = |offered: bool, delta: Option<u16>| HTLCOutputInCommitment {
+			offered,
+			amount_msat: 500_000,
+			cltv_expiry: 100,
+			payment_hash: PaymentHash([44; 32]),
+			transaction_output_index: Some(0),
+			ark_htlc_success_csv_delta: delta,
+		};
+		let txid = Txid::from_byte_array([7; 32]);
+		let delta: u16 = 48;
+		let seq = |offered: bool, d: Option<u16>, feats: &ChannelTypeFeatures| {
+			crate::ln::chan_utils::build_htlc_input(&txid, &mk_htlc(offered, d), feats)
+				.sequence.to_consensus_u32()
+		};
+
+		// The Ark channel type (P2A zero-fee commitments): baseline nSequence 0.
+		let ark = ChannelTypeFeatures::ark_channel();
+		assert_eq!(
+			seq(true, Some(delta), &ark), 0,
+			"the presigned HTLC-Timeout must carry NO Ark relative timelock",
+		);
+		assert_eq!(
+			seq(false, Some(delta), &ark), delta as u32,
+			"the presigned HTLC-Success must satisfy the success-branch CSV",
+		);
+		// Without a delta both templates sit at the baseline.
+		assert_eq!(seq(true, None, &ark), 0);
+		assert_eq!(seq(false, None, &ark), 0);
+
+		// Legacy anchor channels (baseline 1): the delta still applies only to
+		// the success side; the timeout keeps the 1-block anchor baseline.
+		let anchors = ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
+		assert_eq!(seq(true, Some(delta), &anchors), 1);
+		assert_eq!(seq(false, Some(delta), &anchors), delta as u32);
+		assert_eq!(seq(true, None, &anchors), 1);
+		assert_eq!(seq(false, None, &anchors), 1);
 	}
 
 	#[test]

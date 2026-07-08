@@ -605,11 +605,20 @@ impl<B: BroadcasterInterface, C: CoinSelectionSource, SP: SignerProvider, L: Log
 			for htlc_descriptor in
 				&htlc_descriptors[broadcasted_htlcs..broadcasted_htlcs + batch_size]
 			{
+				// Ark-on-Lightning: the success-branch CSV suffix enlarges the HTLC
+				// WITNESS SCRIPT itself, which rides in the witness of BOTH spend
+				// branches (a timeout spend reveals the same script), so every
+				// weight estimate below must include it or the post-signing weight
+				// assertion trips (and release builds under-target fees). Zero for
+				// non-Ark HTLCs.
+				let ark_suffix_weight = chan_utils::ark_htlc_success_csv_suffix_weight(
+					htlc_descriptor.htlc.ark_htlc_success_csv_delta,
+				);
 				let input_output_weight = if htlc_descriptor.preimage.is_some() {
 					htlc_success_input_output_pair_weight
 				} else {
 					htlc_timeout_input_output_pair_weight
-				};
+				} + ark_suffix_weight;
 				if htlc_weight_sum + input_output_weight >= max_tx_weight - USER_COINS_WEIGHT_BUDGET
 				{
 					break;
@@ -624,7 +633,7 @@ impl<B: BroadcasterInterface, C: CoinSelectionSource, SP: SignerProvider, L: Log
 							htlc_success_witness_weight
 						} else {
 							htlc_timeout_witness_weight
-						},
+						} + ark_suffix_weight,
 				});
 				htlc_tx.input.push(htlc_input);
 				let htlc_output = htlc_descriptor.tx_output(&self.secp);
