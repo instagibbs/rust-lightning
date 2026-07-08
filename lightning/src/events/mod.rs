@@ -1755,6 +1755,13 @@ pub enum Event {
 		/// [`ChannelManager::ack_teleport`]: crate::ln::channelmanager::ChannelManager::ack_teleport
 		/// [`ChannelManager::cancel_teleport`]: crate::ln::channelmanager::ChannelManager::cancel_teleport
 		responder_value_removal_sat: u64,
+		/// The `initiator_value_removal_sat` the initiator declared on `teleport_init` — the
+		/// amount coming off ITS OWN balance in the new funding scope (Ark fork: the client-side
+		/// `refresh` fee). Like `responder_value_removal_sat`, LDK only sanity-checks it; the
+		/// handler MUST verify the two declared removals against the out-of-band-agreed funding
+		/// value before acking (their sum must equal the old channel value minus the new funding
+		/// output's value, or the new scope's commitments desync from the real funding output).
+		initiator_value_removal_sat: u64,
 	},
 	/// Used to indicate to the user that they can abandon the funding transaction and recycle the
 	/// inputs for another purpose.

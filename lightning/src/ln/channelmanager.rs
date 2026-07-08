@@ -6743,10 +6743,12 @@ impl<
 	///
 	/// `responder_value_removal_sat` carries any out-of-band-agreed value reduction the responder
 	/// is taking off their side of the channel as part of this teleport (Ark refresh: ASP-side
-	/// liquidity extraction). Pass `0` for value-preserving teleports (the typical case).
+	/// liquidity extraction), and `initiator_value_removal_sat` any reduction we take off our own
+	/// side (Ark refresh: the client-side `refresh` fee). Pass `0` for value-preserving teleports
+	/// (the typical case).
 	pub fn teleport_channel(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey, new_funding_txo: OutPoint,
-		responder_value_removal_sat: u64,
+		responder_value_removal_sat: u64, initiator_value_removal_sat: u64,
 	) -> Result<(), APIError> {
 		let mut result = Ok(());
 		PersistenceNotifierGuard::optionally_notify(self, || {
@@ -6778,6 +6780,7 @@ impl<
 						match chan.teleport_channel(
 							new_funding_txo,
 							responder_value_removal_sat,
+							initiator_value_removal_sat,
 							&&logger,
 						) {
 							Ok(stfu_opt) => {
@@ -13822,6 +13825,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							counterparty_node_id: *counterparty_node_id,
 							new_funding_txo: new_funding_txo.into_bitcoin_outpoint(),
 							responder_value_removal_sat: msg.responder_value_removal_sat,
+							initiator_value_removal_sat: msg.initiator_value_removal_sat,
 						},
 						None,
 					));

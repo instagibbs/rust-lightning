@@ -514,6 +514,16 @@ pub struct TeleportInit {
 	/// committed-to by the responder at leaf-cosign time (out of band). The responder
 	/// validates incoming `TeleportInit` against the value they signed; mismatch ⇒ abort.
 	pub responder_value_removal_sat: u64,
+	/// Satoshis the **initiator** is removing from its own channel balance as part of this
+	/// teleport (Ark fork: the client-side `refresh` fee — collected out of band as the round's
+	/// input/output shortfall, so the new funding outpoint's value is
+	/// `prev_channel_value - responder_value_removal_sat - this`).
+	///
+	/// Comes off the initiator's `value_to_self_msat` only. `0` is the default and means "no
+	/// initiator-side value change". Like `responder_value_removal_sat`, it is declarative: the
+	/// responder MUST verify the two declared removals against the funding value agreed out of
+	/// band before acking.
+	pub initiator_value_removal_sat: u64,
 }
 
 /// A `teleport_ack` message to be received by or sent to the teleport initiator.
@@ -3176,8 +3186,9 @@ impl_writeable_msg!(TeleportInit, {
 	channel_id,
 	new_funding_txo,
 }, {
-	// Default 0 preserves on-wire compat with peers that don't send this field.
+	// Default 0 preserves on-wire compat with peers that don't send these fields.
 	(4, responder_value_removal_sat, (default_value, 0u64)),
+	(6, initiator_value_removal_sat, (default_value, 0u64)),
 });
 
 impl_writeable_msg!(TeleportAck, {
@@ -7236,6 +7247,7 @@ mod tests {
 			channel_id,
 			new_funding_txo,
 			responder_value_removal_sat: 100_000,
+			initiator_value_removal_sat: 7_000,
 		};
 
 		// Verify there is no nonce field — these lines would fail to compile if they existed:
@@ -7247,6 +7259,7 @@ mod tests {
 		assert_eq!(decoded.channel_id, channel_id);
 		assert_eq!(decoded.new_funding_txo, new_funding_txo);
 		assert_eq!(decoded.responder_value_removal_sat, 100_000);
+		assert_eq!(decoded.initiator_value_removal_sat, 7_000);
 	}
 
 	#[test]

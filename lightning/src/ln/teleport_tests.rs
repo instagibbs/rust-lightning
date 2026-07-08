@@ -80,7 +80,7 @@ fn start_teleport<'a, 'b, 'c>(
 	let initiator_id = initiator.node.get_our_node_id();
 	let responder_id = responder.node.get_our_node_id();
 
-	initiator.node.teleport_channel(&channel_id, &responder_id, new_funding_txo, 0).unwrap();
+	initiator.node.teleport_channel(&channel_id, &responder_id, new_funding_txo, 0, 0).unwrap();
 
 	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);
 	responder.node.handle_stfu(initiator_id, &stfu);
@@ -313,12 +313,17 @@ fn test_channel_teleport_happy_path_releases_holding_cell() {
 	// No MuSig2 nonce anywhere: exhaustively destructure each teleport message (no `..`). If a
 	// nonce field were ever (re)introduced, these would fail to compile. The new-funding spend is
 	// stock ECDSA 2-of-2, so the teleport protocol carries no nonces.
-	let crate::ln::msgs::TeleportInit { channel_id: _, new_funding_txo: _, responder_value_removal_sat: _ } =
-		crate::ln::msgs::TeleportInit {
-			channel_id,
-			new_funding_txo,
-			responder_value_removal_sat: 0,
-		};
+	let crate::ln::msgs::TeleportInit {
+		channel_id: _,
+		new_funding_txo: _,
+		responder_value_removal_sat: _,
+		initiator_value_removal_sat: _,
+	} = crate::ln::msgs::TeleportInit {
+		channel_id,
+		new_funding_txo,
+		responder_value_removal_sat: 0,
+		initiator_value_removal_sat: 0,
+	};
 	let crate::ln::msgs::TeleportAck { channel_id: _ } =
 		crate::ln::msgs::TeleportAck { channel_id };
 	let crate::ln::msgs::TeleportComplete { channel_id: _ } =
@@ -337,11 +342,13 @@ fn test_channel_teleport_happy_path_releases_holding_cell() {
 			counterparty_node_id,
 			new_funding_txo: ev_outpoint,
 			responder_value_removal_sat,
+			initiator_value_removal_sat,
 		} => {
 			assert_eq!(ev_channel_id, channel_id);
 			assert_eq!(counterparty_node_id, initiator_id);
 			assert_eq!(ev_outpoint, new_funding_txo.into_bitcoin_outpoint());
 			assert_eq!(responder_value_removal_sat, 0);
+			assert_eq!(initiator_value_removal_sat, 0);
 		},
 		_ => panic!(),
 	}
@@ -487,11 +494,13 @@ fn test_channel_teleport_disconnect_before_ack_sent_allows_fresh_attempt_after_r
 			counterparty_node_id,
 			new_funding_txo: ev_outpoint,
 			responder_value_removal_sat,
+			initiator_value_removal_sat,
 		} => {
 			assert_eq!(ev_channel_id, channel_id);
 			assert_eq!(counterparty_node_id, initiator_id);
 			assert_eq!(ev_outpoint, replacement_funding_txo.into_bitcoin_outpoint());
 			assert_eq!(responder_value_removal_sat, 0);
+			assert_eq!(initiator_value_removal_sat, 0);
 		},
 		_ => panic!(),
 	}
@@ -735,7 +744,7 @@ fn test_teleport_responder_value_removal_reduces_only_responder() {
 
 	initiator
 		.node
-		.teleport_channel(&channel_id, &responder_id, new_funding_txo, removal_sat)
+		.teleport_channel(&channel_id, &responder_id, new_funding_txo, removal_sat, 0)
 		.unwrap();
 
 	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);
@@ -811,6 +820,178 @@ fn test_teleport_responder_value_removal_reduces_only_responder() {
 		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script);
 }
 
+/// Ark bridge: an `initiator_value_removal_sat` (the client-side `refresh` fee) declared at
+/// `teleport_channel()` time must reduce ONLY the initiator's `value_to_self`, and a
+/// `responder_value_removal_sat` declared alongside it ONLY the responder's; the channel value
+/// shrinks by their sum. Runs the full flow end-to-end with both removals nonzero.
+#[test]
+fn test_teleport_both_side_value_removals_reduce_each_side() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	// 1M sat channel with 500k pushed to the responder — headroom on both sides for the removals
+	// to pass the reserve checks.
+	let channel_id =
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let new_funding_txo = test_outpoint(3, 1);
+	let responder_removal_sat: u64 = 50_000;
+	let initiator_removal_sat: u64 = 7_000;
+	let original_funding_txo = current_funding_txo(initiator, channel_id);
+	let original_funding_script = funding_watch_script(initiator, channel_id, original_funding_txo);
+
+	let initiator_balance_before = value_to_self_msat(initiator, channel_id);
+	let responder_balance_before = value_to_self_msat(responder, channel_id);
+
+	initiator
+		.node
+		.teleport_channel(
+			&channel_id,
+			&responder_id,
+			new_funding_txo,
+			responder_removal_sat,
+			initiator_removal_sat,
+		)
+		.unwrap();
+
+	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);
+	responder.node.handle_stfu(initiator_id, &stfu);
+	let stfu = get_event_msg!(responder, MessageSendEvent::SendStfu, initiator_id);
+	initiator.node.handle_stfu(responder_id, &stfu);
+
+	let teleport_init =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportInit, responder_id);
+	assert_eq!(teleport_init.responder_value_removal_sat, responder_removal_sat);
+	assert_eq!(
+		teleport_init.initiator_value_removal_sat, initiator_removal_sat,
+		"TeleportInit must carry the initiator-side removal declared at teleport_channel()",
+	);
+	responder.node.handle_teleport_init(initiator_id, &teleport_init);
+	match get_event!(responder, Event::ChannelTeleport) {
+		Event::ChannelTeleport { responder_value_removal_sat, initiator_value_removal_sat, .. } => {
+			assert_eq!(responder_value_removal_sat, responder_removal_sat);
+			assert_eq!(
+				initiator_value_removal_sat, initiator_removal_sat,
+				"ChannelTeleport event must surface the initiator's declared removal",
+			);
+		},
+		_ => panic!(),
+	}
+
+	ack_teleport(initiator, responder, channel_id);
+
+	initiator.node.complete_teleport(&channel_id, &responder_id).unwrap();
+	let teleport_complete =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportComplete, responder_id);
+	responder.node.handle_teleport_complete(initiator_id, &teleport_complete);
+	check_added_monitors(responder, 1);
+	let teleport_complete_ack =
+		get_event_msg!(responder, MessageSendEvent::SendTeleportCompleteAck, initiator_id);
+	initiator.node.handle_teleport_complete_ack(responder_id, &teleport_complete_ack);
+	check_added_monitors(initiator, 1);
+
+	assert_eq!(current_funding_txo(initiator, channel_id), new_funding_txo);
+	assert_eq!(current_funding_txo(responder, channel_id), new_funding_txo);
+
+	// Each side's balance drops by exactly its own removal.
+	let initiator_balance_after = value_to_self_msat(initiator, channel_id);
+	let responder_balance_after = value_to_self_msat(responder, channel_id);
+	assert_eq!(
+		initiator_balance_before.saturating_sub(initiator_balance_after),
+		initiator_removal_sat * 1000,
+		"initiator's value_to_self must drop by exactly the initiator-side removal (the fee)",
+	);
+	assert_eq!(
+		responder_balance_before.saturating_sub(responder_balance_after),
+		responder_removal_sat * 1000,
+		"responder's value_to_self must drop by exactly the responder-side removal",
+	);
+
+	initiator
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script.clone());
+	responder
+		.chain_source
+		.remove_watched_txn_and_outputs(original_funding_txo, original_funding_script);
+}
+
+/// Ark bridge: `teleport_channel()` pre-validates the initiator's OWN removal — one that exceeds
+/// its balance or dips below the counterparty-selected reserve is refused at the API, before
+/// anything goes on the wire.
+#[test]
+fn test_teleport_initiator_value_removal_rejected_at_api_when_below_reserve() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder_id = nodes[1].node.get_our_node_id();
+	let new_funding_txo = test_outpoint(4, 1);
+
+	// Excessive own-side removal: clearly above the initiator's balance.
+	let err = initiator
+		.node
+		.teleport_channel(&channel_id, &responder_id, new_funding_txo, 0, 99_000_000)
+		.unwrap_err();
+	let err_str = format!("{err:?}");
+	assert!(
+		err_str.contains("initiator_value_removal_sat"),
+		"expected an initiator-removal validation error, got: {err_str}",
+	);
+	// Nothing went on the wire.
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+}
+
+/// Ark bridge: the responder rejects (closes the channel on) a crafted `TeleportInit` whose
+/// `initiator_value_removal_sat` exceeds the initiator's balance — the symmetric protection to
+/// the responder-removal reserve check, for a malicious initiator that bypasses its own API
+/// pre-validation.
+#[test]
+fn test_teleport_initiator_value_removal_rejected_by_responder() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let initiator = &nodes[0];
+	let responder = &nodes[1];
+	let initiator_id = initiator.node.get_our_node_id();
+	let responder_id = responder.node.get_our_node_id();
+	let new_funding_txo = test_outpoint(4, 1);
+
+	// Drive an honest teleport into quiescence, then deliver a CRAFTED teleport_init whose
+	// initiator-side removal is absurd (the honest one is dropped).
+	initiator.node.teleport_channel(&channel_id, &responder_id, new_funding_txo, 0, 0).unwrap();
+	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);
+	responder.node.handle_stfu(initiator_id, &stfu);
+	let stfu = get_event_msg!(responder, MessageSendEvent::SendStfu, initiator_id);
+	initiator.node.handle_stfu(responder_id, &stfu);
+	let honest_init =
+		get_event_msg!(initiator, MessageSendEvent::SendTeleportInit, responder_id);
+
+	let crafted = crate::ln::msgs::TeleportInit {
+		initiator_value_removal_sat: 99_000_000,
+		..honest_init
+	};
+	responder.node.handle_teleport_init(initiator_id, &crafted);
+
+	let msg_events = responder.node.get_and_clear_pending_msg_events();
+	assert!(
+		msg_events.iter().any(|e| matches!(e, MessageSendEvent::HandleError { .. })),
+		"expected responder to close-on-error for excessive initiator removal, got: {msg_events:?}",
+	);
+	let _ = responder.node.get_and_clear_pending_events();
+	check_added_monitors(responder, 1);
+}
+
 /// Ark bridge: the responder rejects (closes the channel on) a `TeleportInit` whose
 /// `responder_value_removal_sat` would push the responder below its counterparty-selected reserve.
 #[test]
@@ -832,7 +1013,7 @@ fn test_teleport_responder_value_removal_rejected_when_below_reserve() {
 
 	initiator
 		.node
-		.teleport_channel(&channel_id, &responder_id, new_funding_txo, removal_sat)
+		.teleport_channel(&channel_id, &responder_id, new_funding_txo, removal_sat, 0)
 		.unwrap();
 
 	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, responder_id);

@@ -2449,6 +2449,7 @@ where
 							new_funding_txo,
 							is_initiator,
 							responder_value_removal_sat: _,
+							initiator_value_removal_sat: _,
 						} = pending_teleport
 						{
 							Some((*new_funding_txo, *is_initiator))
@@ -3445,6 +3446,9 @@ pub(crate) enum QuiescentAction {
 		/// teleport. `0` for value-preserving teleports (existing behavior). The bark refresh
 		/// coordinator sets this from the leaf-cosign result.
 		responder_value_removal_sat: u64,
+		/// Sats the initiator is removing from its own side (Ark refresh: the client-side
+		/// `refresh` fee). `0` when value-preserving.
+		initiator_value_removal_sat: u64,
 	},
 	#[cfg(any(test, fuzzing, feature = "_test_utils"))]
 	DoNothing,
@@ -3473,38 +3477,68 @@ pub(crate) enum StfuResponse {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingTeleport {
 	/// Initiator: sent `teleport_init`, awaiting the responder's `teleport_ack`.
-	AwaitingTeleportAck { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportAck {
+		new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
+	},
 	/// Responder: received `teleport_init`, surfaced a [`Event::ChannelTeleport`], awaiting the
 	/// user's `ack_teleport`/`cancel_teleport` decision.
 	///
 	/// [`Event::ChannelTeleport`]: crate::events::Event::ChannelTeleport
-	AwaitingUserDecision { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingUserDecision {
+		new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
+	},
 	/// Responder: queued `teleport_ack` (+ new-scope `commitment_signed`), awaiting it to actually
 	/// leave the outbound queue (`teleport_ack_sent`).
-	AwaitingTeleportAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportAckSend {
+		new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
+	},
 	/// Awaiting the counterparty's new-scope `commitment_signed`. `is_initiator` records which
 	/// side we are so we know which completion state to advance to.
 	AwaitingRemoteCommitmentSigned {
 		new_funding_txo: OutPoint,
 		is_initiator: bool,
 		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
 	},
 	/// Initiator: new-scope commitments exchanged, awaiting the user's `complete_teleport`.
-	AwaitingLocalComplete { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingLocalComplete {
+		new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
+	},
 	/// Responder: new-scope commitments exchanged, awaiting the initiator's `teleport_complete`.
-	AwaitingRemoteComplete { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingRemoteComplete {
+		new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
+	},
 	/// Initiator: sent `teleport_complete`, awaiting the responder's `teleport_complete_ack`
 	/// (after which the initiator promotes).
-	AwaitingTeleportCompleteAck { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportCompleteAck {
+		new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
+	},
 	/// Responder: promoted on `teleport_complete` receipt and queued `teleport_complete_ack`,
 	/// awaiting it to leave the outbound queue (`teleport_complete_ack_sent`).
-	AwaitingTeleportCompleteAckSend { new_funding_txo: OutPoint, responder_value_removal_sat: u64 },
+	AwaitingTeleportCompleteAckSend {
+		new_funding_txo: OutPoint,
+		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
+	},
 	/// Responder: `teleport_complete_ack` sent; awaiting any post-promotion activity from the
 	/// initiator that demonstrates it processed the ack (and thus promoted too), at which point
 	/// the teleport is fully resolved.
 	AwaitingRemoteActivityAfterTeleportCompleteAckSend {
 		new_funding_txo: OutPoint,
 		responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
 	},
 }
 
@@ -3541,6 +3575,41 @@ impl PendingTeleport {
 				responder_value_removal_sat,
 				..
 			} => *responder_value_removal_sat,
+		}
+	}
+
+	/// Satoshis the initiator is removing from its own side of the channel as part of this
+	/// teleport (Ark refresh: the client-side `refresh` fee). `0` when value-preserving.
+	pub(crate) fn initiator_value_removal_sat(&self) -> u64 {
+		match self {
+			Self::AwaitingTeleportAck { initiator_value_removal_sat, .. } => {
+				*initiator_value_removal_sat
+			},
+			Self::AwaitingUserDecision { initiator_value_removal_sat, .. } => {
+				*initiator_value_removal_sat
+			},
+			Self::AwaitingTeleportAckSend { initiator_value_removal_sat, .. } => {
+				*initiator_value_removal_sat
+			},
+			Self::AwaitingRemoteCommitmentSigned { initiator_value_removal_sat, .. } => {
+				*initiator_value_removal_sat
+			},
+			Self::AwaitingLocalComplete { initiator_value_removal_sat, .. } => {
+				*initiator_value_removal_sat
+			},
+			Self::AwaitingRemoteComplete { initiator_value_removal_sat, .. } => {
+				*initiator_value_removal_sat
+			},
+			Self::AwaitingTeleportCompleteAck { initiator_value_removal_sat, .. } => {
+				*initiator_value_removal_sat
+			},
+			Self::AwaitingTeleportCompleteAckSend { initiator_value_removal_sat, .. } => {
+				*initiator_value_removal_sat
+			},
+			Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+				initiator_value_removal_sat,
+				..
+			} => *initiator_value_removal_sat,
 		}
 	}
 
@@ -3605,39 +3674,48 @@ impl_writeable_tlv_based_enum_upgradable!(PendingTeleport,
 	(0, AwaitingTeleportAck) => {
 		(0, new_funding_txo, required),
 		(2, responder_value_removal_sat, (default_value, 0u64)),
+		(4, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 	(2, AwaitingUserDecision) => {
 		(0, new_funding_txo, required),
 		(2, responder_value_removal_sat, (default_value, 0u64)),
+		(4, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 	(4, AwaitingTeleportAckSend) => {
 		(0, new_funding_txo, required),
 		(2, responder_value_removal_sat, (default_value, 0u64)),
+		(4, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 	(6, AwaitingRemoteCommitmentSigned) => {
 		(0, new_funding_txo, required),
 		(2, is_initiator, required),
 		(4, responder_value_removal_sat, (default_value, 0u64)),
+		(6, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 	(8, AwaitingLocalComplete) => {
 		(0, new_funding_txo, required),
 		(2, responder_value_removal_sat, (default_value, 0u64)),
+		(4, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 	(10, AwaitingRemoteComplete) => {
 		(0, new_funding_txo, required),
 		(2, responder_value_removal_sat, (default_value, 0u64)),
+		(4, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 	(12, AwaitingTeleportCompleteAck) => {
 		(0, new_funding_txo, required),
 		(2, responder_value_removal_sat, (default_value, 0u64)),
+		(4, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 	(14, AwaitingTeleportCompleteAckSend) => {
 		(0, new_funding_txo, required),
 		(2, responder_value_removal_sat, (default_value, 0u64)),
+		(4, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 	(16, AwaitingRemoteActivityAfterTeleportCompleteAckSend) => {
 		(0, new_funding_txo, required),
 		(2, responder_value_removal_sat, (default_value, 0u64)),
+		(4, initiator_value_removal_sat, (default_value, 0u64)),
 	},
 );
 
@@ -7734,20 +7812,26 @@ where
 	}
 
 	/// Ark bridge: builds the new `FundingScope` for the teleport to `new_funding_txo`, applying
-	/// any responder-side value removal in a side-aware fashion.
+	/// the responder- and initiator-side value removals in a side-aware fashion: the channel value
+	/// shrinks by their sum, and each side's `value_to_self` by its own removal (Ark refresh: the
+	/// initiator removal is the client-side `refresh` fee, the responder removal the ASP liquidity
+	/// withdrawal `X`).
 	///
 	/// The teleport-initiator (refresh-initiator) is assumed to be the same side as the
 	/// channel-open initiator in our refresh flow (the client refreshes its own channel). If that
 	/// ever changes, this needs revisiting.
 	fn teleport_funding(
 		&self, new_funding_txo: OutPoint, responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64,
 	) -> FundingScope {
-		let channel_value_delta_sat = -(responder_value_removal_sat as i64);
+		let channel_value_delta_sat =
+			-((responder_value_removal_sat + initiator_value_removal_sat) as i64);
 		let local_value_to_self_delta_msat = if self.funding.is_outbound() {
-			// We are the channel-open + teleport initiator: our value_to_self is invariant.
-			0
+			// We are the channel-open + teleport initiator: our value_to_self drops by the
+			// initiator-side removal (the fee) only.
+			-((initiator_value_removal_sat as i64) * 1000)
 		} else {
-			// We are the responder: our value_to_self decreases by the removal.
+			// We are the responder: our value_to_self decreases by the responder-side removal.
 			-((responder_value_removal_sat as i64) * 1000)
 		};
 		FundingScope::for_teleport(
@@ -7776,9 +7860,14 @@ where
 	/// Ark bridge: produces the `commitment_signed` for the counterparty's first commitment on the
 	/// new (teleport) funding scope. Stock ECDSA via `get_initial_commitment_signed_v2`.
 	fn get_initial_teleport_commitment_signed<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64, logger: &L,
 	) -> Option<msgs::CommitmentSigned> {
-		let funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
+		let funding = self.teleport_funding(
+			new_funding_txo,
+			responder_value_removal_sat,
+			initiator_value_removal_sat,
+		);
 		self.context.get_initial_commitment_signed_v2(&funding, logger)
 	}
 
@@ -7809,17 +7898,23 @@ where
 	fn get_pending_teleport_initial_commitment_signed<L: Logger>(
 		&mut self, logger: &L,
 	) -> Option<msgs::CommitmentSigned> {
-		let (new_funding_txo, responder_value_removal_sat) =
+		let (new_funding_txo, responder_value_removal_sat, initiator_value_removal_sat) =
 			match self.pending_teleport.as_ref()? {
 				PendingTeleport::AwaitingRemoteComplete {
 					new_funding_txo,
 					responder_value_removal_sat,
-				} => (*new_funding_txo, *responder_value_removal_sat),
+					initiator_value_removal_sat,
+				} => (
+					*new_funding_txo,
+					*responder_value_removal_sat,
+					*initiator_value_removal_sat,
+				),
 				_ => return None,
 			};
 		self.get_initial_teleport_commitment_signed(
 			new_funding_txo,
 			responder_value_removal_sat,
+			initiator_value_removal_sat,
 			logger,
 		)
 	}
@@ -7832,10 +7927,14 @@ where
 	/// commitment at those same numbers, continuing the existing sequence.
 	fn teleport_initial_commitment_signed<F: FeeEstimator, L: Logger>(
 		&mut self, msg: &msgs::CommitmentSigned, new_funding_txo: OutPoint,
-		responder_value_removal_sat: u64, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+		responder_value_removal_sat: u64, initiator_value_removal_sat: u64,
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
-		let teleport_funding =
-			self.teleport_funding(new_funding_txo, responder_value_removal_sat);
+		let teleport_funding = self.teleport_funding(
+			new_funding_txo,
+			responder_value_removal_sat,
+			initiator_value_removal_sat,
+		);
 
 		let transaction_number = self.holder_commitment_point.current_transaction_number();
 		let commitment_point = self.holder_commitment_point.current_point().ok_or_else(|| {
@@ -7894,14 +7993,19 @@ where
 	/// per-commitment-point/secret derivation live on the channel/context and are deliberately
 	/// left untouched, so the new scope continues the existing commitment sequence.
 	fn promote_teleport_funding<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64, logger: &L,
 	) -> Option<ChannelMonitorUpdate> {
 		log_info!(logger, "Promoting teleport funding txid {}", new_funding_txo.txid);
 
 		if let Some(scid) = self.funding.short_channel_id {
 			self.context.historical_scids.push(scid);
 		}
-		self.funding = self.teleport_funding(new_funding_txo, responder_value_removal_sat);
+		self.funding = self.teleport_funding(
+			new_funding_txo,
+			responder_value_removal_sat,
+			initiator_value_removal_sat,
+		);
 		self.context.announcement_sigs = None;
 		self.context.announcement_sigs_state = AnnouncementSigsState::NotSent;
 
@@ -13544,11 +13648,50 @@ where
 	/// Ark bridge: initiates a channel teleport to `new_funding_txo` once both peers are quiescent.
 	///
 	/// `responder_value_removal_sat` carries any out-of-band-agreed value reduction the responder
-	/// is taking off their side of the channel as part of this teleport. Pass `0` for a
-	/// value-preserving teleport (the typical case).
+	/// is taking off their side of the channel as part of this teleport, and
+	/// `initiator_value_removal_sat` any reduction we take off our own side (Ark refresh: the
+	/// client-side `refresh` fee). Pass `0` for a value-preserving teleport (the typical case).
 	pub fn teleport_channel<L: Logger>(
-		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64, logger: &L,
+		&mut self, new_funding_txo: OutPoint, responder_value_removal_sat: u64,
+		initiator_value_removal_sat: u64, logger: &L,
 	) -> Result<Option<msgs::Stfu>, APIError> {
+		// Validate our own (initiator-side) removal up front: it must fit in our balance and
+		// leave us at or above the reserve the counterparty selected for us — proposing an
+		// invalid one would only get the channel closed by the peer (which runs the same checks
+		// on `teleport_init`). Responder-side and total-viability violations are deliberately
+		// NOT pre-checked here: the responder is the authority on those and rejects them itself.
+		if initiator_value_removal_sat > 0 {
+			let removal_msat =
+				initiator_value_removal_sat.checked_mul(1000).ok_or_else(|| {
+					APIError::APIMisuseError {
+						err: format!(
+							"Teleport initiator_value_removal_sat {} overflows when converted to msat",
+							initiator_value_removal_sat,
+						),
+					}
+				})?;
+			if removal_msat > self.funding.value_to_self_msat {
+				return Err(APIError::APIMisuseError {
+					err: format!(
+						"Teleport initiator_value_removal_sat {} exceeds our value_to_self ({} msat)",
+						initiator_value_removal_sat, self.funding.value_to_self_msat,
+					),
+				});
+			}
+			if let Some(reserve_sat) = self.funding.counterparty_selected_channel_reserve_satoshis
+			{
+				let reserve_msat = reserve_sat.saturating_mul(1000);
+				let new_value_to_self_msat = self.funding.value_to_self_msat - removal_msat;
+				if new_value_to_self_msat < reserve_msat {
+					return Err(APIError::APIMisuseError {
+						err: format!(
+							"Teleport initiator_value_removal_sat {} would drop our value_to_self ({} msat) below the counterparty-selected reserve ({} msat)",
+							initiator_value_removal_sat, new_value_to_self_msat, reserve_msat,
+						),
+					});
+				}
+			}
+		}
 		if self.pending_teleport.is_some() {
 			return Err(APIError::APIMisuseError {
 				err: format!(
@@ -13584,7 +13727,11 @@ where
 
 		self.propose_quiescence(
 			logger,
-			QuiescentAction::Teleport { new_funding_txo, responder_value_removal_sat },
+			QuiescentAction::Teleport {
+				new_funding_txo,
+				responder_value_removal_sat,
+				initiator_value_removal_sat,
+			},
 		)
 		.map_err(|_| APIError::APIMisuseError {
 			err: format!("Channel {} cannot begin teleport", self.context.channel_id()),
@@ -13744,14 +13891,17 @@ where
 			Some(PendingTeleport::AwaitingUserDecision {
 				new_funding_txo,
 				responder_value_removal_sat,
+				initiator_value_removal_sat,
 			}) => {
 				self.pending_teleport = Some(PendingTeleport::AwaitingTeleportAckSend {
 					new_funding_txo,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 				});
 				let commitment_signed = self.get_initial_teleport_commitment_signed(
 					new_funding_txo,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 					logger,
 				);
 				Ok((
@@ -13818,10 +13968,12 @@ where
 			Some(PendingTeleport::AwaitingLocalComplete {
 				new_funding_txo,
 				responder_value_removal_sat,
+				initiator_value_removal_sat,
 			}) => {
 				self.pending_teleport = Some(PendingTeleport::AwaitingTeleportCompleteAck {
 					new_funding_txo,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 				});
 				Ok(msgs::TeleportComplete { channel_id: self.context.channel_id() })
 			},
@@ -13915,14 +14067,51 @@ where
 					)));
 				}
 			}
-			// Coarse dust-floor check on the new channel value: must still hold both anchors + a
-			// non-zero balance per side. Tighter HTLC-coverage checks are deferred (quiescence
-			// drains in-flight updates, and BOLT3 already enforces dust on individual outputs).
-			let new_channel_value = self.funding.get_value_satoshis().saturating_sub(removal_sat);
-			let min_viable_sat = 2 * ANCHOR_OUTPUT_VALUE_SATOSHI + MIN_CHAN_DUST_LIMIT_SATOSHIS;
+		}
+		// Validate the initiator-side removal (the initiator takes it off its OWN balance — Ark
+		// refresh: the client-side `refresh` fee). Our balance is untouched, but the removal must
+		// fit in the initiator's balance and leave it at or above the reserve we selected for it,
+		// or the new-scope commitment would be unbuildable/unacceptable.
+		let initiator_removal_sat = msg.initiator_value_removal_sat;
+		if initiator_removal_sat > 0 {
+			let initiator_removal_msat =
+				initiator_removal_sat.checked_mul(1000).ok_or_else(|| {
+					ChannelError::close(format!(
+						"Teleport initiator_value_removal_sat {initiator_removal_sat} overflows when converted to msat",
+					))
+				})?;
+			let counterparty_balance_msat = (self.funding.get_value_satoshis() * 1000)
+				.saturating_sub(self.funding.value_to_self_msat);
+			if initiator_removal_msat > counterparty_balance_msat {
+				return Err(ChannelError::close(format!(
+					"Teleport initiator_value_removal_sat {initiator_removal_sat} exceeds the initiator's balance ({counterparty_balance_msat} msat)",
+				)));
+			}
+			let reserve_msat = self
+				.funding
+				.holder_selected_channel_reserve_satoshis
+				.saturating_mul(1000);
+			let new_counterparty_balance_msat =
+				counterparty_balance_msat - initiator_removal_msat;
+			if new_counterparty_balance_msat < reserve_msat {
+				return Err(ChannelError::close(format!(
+					"Teleport initiator_value_removal_sat {initiator_removal_sat} would drop the initiator's balance ({new_counterparty_balance_msat} msat) below the holder-selected reserve ({reserve_msat} msat)",
+				)));
+			}
+		}
+		// Coarse dust-floor check on the new channel value: must still hold the shared P2A anchor
+		// (teleports only run on Ark `zero_fee_commitments` channels, which carry a single shared
+		// anchor, not the legacy per-party pair) + a non-zero balance per side. Tighter
+		// HTLC-coverage checks are deferred (quiescence drains in-flight updates, and BOLT3
+		// already enforces dust on individual outputs).
+		let total_removal_sat = removal_sat.saturating_add(initiator_removal_sat);
+		if total_removal_sat > 0 {
+			let new_channel_value =
+				self.funding.get_value_satoshis().saturating_sub(total_removal_sat);
+			let min_viable_sat = chan_utils::P2A_MAX_VALUE + MIN_CHAN_DUST_LIMIT_SATOSHIS;
 			if new_channel_value < min_viable_sat {
 				return Err(ChannelError::close(format!(
-					"Teleport responder_value_removal_sat {removal_sat} would shrink channel_value to {new_channel_value} sat, below dust+anchors floor ({min_viable_sat} sat)",
+					"Teleport value removals ({total_removal_sat} sat total) would shrink channel_value to {new_channel_value} sat, below dust+anchor floor ({min_viable_sat} sat)",
 				)));
 			}
 		}
@@ -13930,6 +14119,7 @@ where
 		self.pending_teleport = Some(PendingTeleport::AwaitingUserDecision {
 			new_funding_txo: msg.new_funding_txo,
 			responder_value_removal_sat: msg.responder_value_removal_sat,
+			initiator_value_removal_sat: msg.initiator_value_removal_sat,
 		});
 		Ok(msg.new_funding_txo)
 	}
@@ -13943,17 +14133,20 @@ where
 			Some(PendingTeleport::AwaitingTeleportAck {
 				new_funding_txo,
 				responder_value_removal_sat,
+				initiator_value_removal_sat,
 			}) => {
 				self.mark_response_received();
 				let commitment_signed = self.get_initial_teleport_commitment_signed(
 					new_funding_txo,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 					logger,
 				);
 				self.pending_teleport = Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
 					new_funding_txo,
 					is_initiator: true,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 				});
 				Ok(commitment_signed)
 			},
@@ -13972,11 +14165,13 @@ where
 			Some(PendingTeleport::AwaitingTeleportAckSend {
 				new_funding_txo,
 				responder_value_removal_sat,
+				initiator_value_removal_sat,
 			}) => {
 				self.pending_teleport = Some(PendingTeleport::AwaitingRemoteCommitmentSigned {
 					new_funding_txo,
 					is_initiator: false,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 				});
 				Ok(())
 			},
@@ -14018,6 +14213,7 @@ where
 			Some(PendingTeleport::AwaitingRemoteComplete {
 				new_funding_txo,
 				responder_value_removal_sat,
+				initiator_value_removal_sat,
 			}) => {
 				// Defense-in-depth: a teleport only ever promotes from a quiescent channel. If
 				// quiescence was somehow lost (e.g. a serialization path that failed to preserve
@@ -14028,6 +14224,7 @@ where
 					self.pending_teleport = Some(PendingTeleport::AwaitingRemoteComplete {
 						new_funding_txo,
 						responder_value_removal_sat,
+						initiator_value_removal_sat,
 					});
 					return Err(ChannelError::close(
 						"Got teleport_complete while not quiescent".to_owned(),
@@ -14036,10 +14233,12 @@ where
 				self.pending_teleport = Some(PendingTeleport::AwaitingTeleportCompleteAckSend {
 					new_funding_txo,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 				});
 				let monitor_update = self.promote_teleport_funding(
 					new_funding_txo,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 					logger,
 				);
 				Ok(monitor_update)
@@ -14060,11 +14259,13 @@ where
 			Some(PendingTeleport::AwaitingTeleportCompleteAckSend {
 				new_funding_txo,
 				responder_value_removal_sat,
+				initiator_value_removal_sat,
 			}) => {
 				self.pending_teleport =
 					Some(PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
 						new_funding_txo,
 						responder_value_removal_sat,
+						initiator_value_removal_sat,
 					});
 				let exited_quiescence = self.context.channel_state.is_quiescent();
 				self.context.channel_state.clear_quiescent();
@@ -14101,6 +14302,7 @@ where
 			Some(PendingTeleport::AwaitingTeleportCompleteAck {
 				new_funding_txo,
 				responder_value_removal_sat,
+				initiator_value_removal_sat,
 			}) => {
 				// Defense-in-depth: a teleport only ever promotes from a quiescent channel. If
 				// quiescence was somehow lost (e.g. a serialization path that failed to preserve
@@ -14111,6 +14313,7 @@ where
 					self.pending_teleport = Some(PendingTeleport::AwaitingTeleportCompleteAck {
 						new_funding_txo,
 						responder_value_removal_sat,
+						initiator_value_removal_sat,
 					});
 					return Err(ChannelError::close(
 						"Got teleport_complete_ack while not quiescent".to_owned(),
@@ -14122,6 +14325,7 @@ where
 				let monitor_update = self.promote_teleport_funding(
 					new_funding_txo,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 					logger,
 				);
 				Ok((exited_quiescence, monitor_update))
@@ -14152,24 +14356,38 @@ where
 			)));
 		}
 
-		// Pull the agreed removal off `pending_teleport` (state at this point is
-		// `AwaitingRemoteCommitmentSigned`) so we sign at the agreed value.
+		// Pull the agreed removals off `pending_teleport` (state at this point is
+		// `AwaitingRemoteCommitmentSigned`) so we sign at the agreed values.
 		let responder_value_removal_sat = self
 			.pending_teleport
 			.as_ref()
 			.map(|pt| pt.responder_value_removal_sat())
 			.unwrap_or(0);
+		let initiator_value_removal_sat = self
+			.pending_teleport
+			.as_ref()
+			.map(|pt| pt.initiator_value_removal_sat())
+			.unwrap_or(0);
 		let monitor_update = self.teleport_initial_commitment_signed(
 			msg,
 			new_funding_txo,
 			responder_value_removal_sat,
+			initiator_value_removal_sat,
 			fee_estimator,
 			logger,
 		)?;
 		self.pending_teleport = Some(if is_initiator {
-			PendingTeleport::AwaitingLocalComplete { new_funding_txo, responder_value_removal_sat }
+			PendingTeleport::AwaitingLocalComplete {
+				new_funding_txo,
+				responder_value_removal_sat,
+				initiator_value_removal_sat,
+			}
 		} else {
-			PendingTeleport::AwaitingRemoteComplete { new_funding_txo, responder_value_removal_sat }
+			PendingTeleport::AwaitingRemoteComplete {
+				new_funding_txo,
+				responder_value_removal_sat,
+				initiator_value_removal_sat,
+			}
 		});
 		Ok(monitor_update)
 	}
@@ -15910,12 +16128,14 @@ where
 				Some(QuiescentAction::Teleport {
 					new_funding_txo,
 					responder_value_removal_sat,
+					initiator_value_removal_sat,
 				}) => {
 					if self.pending_teleport.is_some() {
 						debug_assert!(false);
 						self.quiescent_action = Some(QuiescentAction::Teleport {
 							new_funding_txo,
 							responder_value_removal_sat,
+							initiator_value_removal_sat,
 						});
 						return Err((
 							ChannelError::WarnAndDisconnect(
@@ -15929,12 +16149,14 @@ where
 					self.pending_teleport = Some(PendingTeleport::AwaitingTeleportAck {
 						new_funding_txo,
 						responder_value_removal_sat,
+						initiator_value_removal_sat,
 					});
 					// Stock-ECDSA new-funding spend: the teleport carries no MuSig2 nonce.
 					return Ok(Some(StfuResponse::TeleportInit(msgs::TeleportInit {
 						channel_id: self.context.channel_id,
 						new_funding_txo,
 						responder_value_removal_sat,
+						initiator_value_removal_sat,
 					})));
 				},
 				#[cfg(any(test, fuzzing, feature = "_test_utils"))]
