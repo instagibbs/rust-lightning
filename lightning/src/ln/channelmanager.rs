@@ -13821,6 +13821,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							user_channel_id: chan.context.get_user_id(),
 							counterparty_node_id: *counterparty_node_id,
 							new_funding_txo: new_funding_txo.into_bitcoin_outpoint(),
+							responder_value_removal_sat: msg.responder_value_removal_sat,
 						},
 						None,
 					));

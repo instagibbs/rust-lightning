@@ -1742,6 +1742,19 @@ pub enum Event {
 		counterparty_node_id: PublicKey,
 		/// The replacement funding outpoint provided by the initiator.
 		new_funding_txo: OutPoint,
+		/// The `responder_value_removal_sat` the initiator declared on `teleport_init` — the amount
+		/// it claims comes off OUR (the responder's) balance in the new funding scope. LDK only
+		/// sanity-checks this value (balance, reserve, dust floor); it cannot know the real new
+		/// funding output's value, so the handler MUST verify the declaration against the value
+		/// agreed out of band (Ark fork: current channel value minus out0 of the bridge cosigned
+		/// for this refresh) before calling [`ChannelManager::ack_teleport`], and
+		/// [`ChannelManager::cancel_teleport`] on a mismatch. Acking an over-declaration burns the
+		/// excess of our balance to fees; acking an under-declaration desyncs the scope's value
+		/// from the real funding output, making the new-scope commitment unbroadcastable.
+		///
+		/// [`ChannelManager::ack_teleport`]: crate::ln::channelmanager::ChannelManager::ack_teleport
+		/// [`ChannelManager::cancel_teleport`]: crate::ln::channelmanager::ChannelManager::cancel_teleport
+		responder_value_removal_sat: u64,
 	},
 	/// Used to indicate to the user that they can abandon the funding transaction and recycle the
 	/// inputs for another purpose.

@@ -336,10 +336,12 @@ fn test_channel_teleport_happy_path_releases_holding_cell() {
 			user_channel_id: _,
 			counterparty_node_id,
 			new_funding_txo: ev_outpoint,
+			responder_value_removal_sat,
 		} => {
 			assert_eq!(ev_channel_id, channel_id);
 			assert_eq!(counterparty_node_id, initiator_id);
 			assert_eq!(ev_outpoint, new_funding_txo.into_bitcoin_outpoint());
+			assert_eq!(responder_value_removal_sat, 0);
 		},
 		_ => panic!(),
 	}
@@ -484,10 +486,12 @@ fn test_channel_teleport_disconnect_before_ack_sent_allows_fresh_attempt_after_r
 			user_channel_id: _,
 			counterparty_node_id,
 			new_funding_txo: ev_outpoint,
+			responder_value_removal_sat,
 		} => {
 			assert_eq!(ev_channel_id, channel_id);
 			assert_eq!(counterparty_node_id, initiator_id);
 			assert_eq!(ev_outpoint, replacement_funding_txo.into_bitcoin_outpoint());
+			assert_eq!(responder_value_removal_sat, 0);
 		},
 		_ => panic!(),
 	}
@@ -746,7 +750,17 @@ fn test_teleport_responder_value_removal_reduces_only_responder() {
 		"TeleportInit msg must carry the removal value declared at teleport_channel()",
 	);
 	responder.node.handle_teleport_init(initiator_id, &teleport_init);
-	let _ = get_event!(responder, Event::ChannelTeleport);
+	// The responder's event must surface the initiator's declared removal — it is what the
+	// handler verifies against the out-of-band-agreed value before acking.
+	match get_event!(responder, Event::ChannelTeleport) {
+		Event::ChannelTeleport { responder_value_removal_sat, .. } => {
+			assert_eq!(
+				responder_value_removal_sat, removal_sat,
+				"ChannelTeleport event must carry the initiator's declared removal",
+			);
+		},
+		_ => panic!(),
+	}
 
 	ack_teleport(initiator, responder, channel_id);
 
