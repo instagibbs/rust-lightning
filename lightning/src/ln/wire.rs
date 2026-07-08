@@ -597,24 +597,31 @@ impl Encode for msgs::SpliceLocked {
 	const TYPE: u16 = 77;
 }
 
+// Ark bridge: the teleport messages live in BOLT #1's custom/experimental range (>= 32768).
+// The low numbers they previously used (82-86) sit right where the splicing standardization
+// keeps (re)assigning types (see the SpliceInit TODO above: 74 conflicted with tx_abort, CLN
+// used 75, the draft now says 80), so an upstream rebase could collide. 32850-32854 are the
+// old numbers lifted by 0x8000, preserving the layout and the odd/even parity: even
+// init/abort/complete_ack fail-fast against a peer that doesn't know them, odd ack/complete
+// are ignorable.
 impl Encode for msgs::TeleportInit {
-	const TYPE: u16 = 82;
+	const TYPE: u16 = 32850;
 }
 
 impl Encode for msgs::TeleportAck {
-	const TYPE: u16 = 83;
+	const TYPE: u16 = 32851;
 }
 
 impl Encode for msgs::TeleportAbort {
-	const TYPE: u16 = 84;
+	const TYPE: u16 = 32852;
 }
 
 impl Encode for msgs::TeleportComplete {
-	const TYPE: u16 = 85;
+	const TYPE: u16 = 32853;
 }
 
 impl Encode for msgs::TeleportCompleteAck {
-	const TYPE: u16 = 86;
+	const TYPE: u16 = 32854;
 }
 
 impl Encode for msgs::TxAddInput {
