@@ -7519,9 +7519,15 @@ impl<
 							),
 						});
 					},
-					Err(()) => {
+					// An Ark channel whose persisted timing no longer validates has no floor to
+					// check a new CLTV expiry delta against, so only that field is refused.
+					// Blocking unrelated fields (fee rates, HTLC limits) would not make the
+					// channel any safer, and the unsafe scope itself is force-closed the next
+					// time the manager is deserialized.
+					Err(()) if config_update.cltv_expiry_delta.is_some() => {
 						return Err(APIError::APIMisuseError {
-							err: "Cannot update an Ark channel with invalid persisted timing parameters"
+							err: "Cannot update cltv_expiry_delta on an Ark channel with invalid \
+								persisted timing parameters"
 								.to_owned(),
 						});
 					},
