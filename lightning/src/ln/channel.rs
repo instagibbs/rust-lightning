@@ -3624,9 +3624,9 @@ impl PendingTeleport {
 			| Self::AwaitingRemoteComplete { new_funding_txo, .. }
 			| Self::AwaitingTeleportCompleteAck { new_funding_txo, .. }
 			| Self::AwaitingTeleportCompleteAckSend { new_funding_txo, .. }
-			| Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend { new_funding_txo, .. } => {
-				*new_funding_txo
-			},
+			| Self::AwaitingRemoteActivityAfterTeleportCompleteAckSend {
+				new_funding_txo, ..
+			} => *new_funding_txo,
 		}
 	}
 
@@ -4273,6 +4273,11 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		holder_selected_channel_reserve_satoshis: u64, msg_channel_reserve_satoshis: u64,
 		msg_push_msat: u64, open_channel_fields: msgs::CommonOpenChannelFields,
 	) -> Result<(FundingScope, ChannelContext<SP>), ChannelError> {
+		// An Ark channel without the success-path CSV loses the on-chain race property that
+		// makes the channel safe to use with an Ark funding scope. Do this before creating
+		// any channel state so an inbound peer cannot cause us to accept such a channel.
+		let ark_htlc_success_csv_delta = ark_htlc_success_csv_delta_for_open(&channel_type, config)
+			.map_err(|err| ChannelError::close(err.to_owned()))?;
 		let logger = WithContext::from(
 			logger,
 			Some(counterparty_node_id),
@@ -4577,10 +4582,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				splice_parent_funding_txid: None,
 				channel_type_features: channel_type.clone(),
 				channel_value_satoshis,
-				ark_htlc_success_csv_delta: ark_htlc_success_csv_delta_for_open(
-					&channel_type,
-					&config.channel_handshake_config,
-				),
+				ark_htlc_success_csv_delta,
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -4809,6 +4811,9 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		}
 
 		let channel_type = get_initial_channel_type(&config, their_features);
+		let ark_htlc_success_csv_delta =
+			ark_htlc_success_csv_delta_for_open(&channel_type, &config)
+				.map_err(|err| APIError::APIMisuseError { err: err.to_owned() })?;
 		if !channel_type.supports_anchors_zero_fee_htlc_tx()
 			&& !channel_type.supports_anchor_zero_fee_commitments()
 			&& holder_selected_channel_reserve_satoshis == 0
@@ -4898,10 +4903,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				channel_type_features: channel_type.clone(),
 				// We'll add our counterparty's `funding_satoshis` when we receive `accept_channel2`.
 				channel_value_satoshis,
-				ark_htlc_success_csv_delta: ark_htlc_success_csv_delta_for_open(
-					&channel_type,
-					&config.channel_handshake_config,
-				),
+				ark_htlc_success_csv_delta,
 			},
 			funding_transaction: None,
 			funding_tx_confirmed_in: None,
@@ -7094,6 +7096,8 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 
 		self.feerate_per_kw =
 			selected_commitment_sat_per_1000_weight(&fee_estimator, &next_channel_type);
+		funding.channel_transaction_parameters.ark_htlc_success_csv_delta =
+			ark_htlc_success_csv_delta_for_open(&next_channel_type, user_config).map_err(|_| ())?;
 		funding.channel_transaction_parameters.channel_type_features = next_channel_type;
 
 		Ok(())
@@ -7696,6 +7700,40 @@ where
 		&self.context
 	}
 
+	/// Returns LDK's minimum CLTV floor for this channel's two serial Ark CSV delays.
+	///
+	/// `Ok(None)` means this is not an Ark channel. `Err(())` means the persisted Ark timing is
+	/// intrinsically invalid (the CSV is absent, zero, or cannot be doubled in a `u16`).
+	pub(crate) fn ark_ldk_minimum_cltv_delta(&self) -> Result<Option<u16>, ()> {
+		let parameters = &self.funding.channel_transaction_parameters;
+		if !parameters.channel_type_features.requires_ark_channel() {
+			return Ok(None);
+		}
+		match parameters.ark_htlc_success_csv_delta {
+			Some(delta) if delta != 0 => delta.checked_mul(2).map(Some).ok_or(()),
+			_ => Err(()),
+		}
+	}
+
+	/// Returns whether this is an Ark channel persisted without LDK's required timing floor.
+	///
+	/// Such a scope may have been created by a version which allowed an absent or zero delta, an
+	/// overflowing doubled delta, or an insufficient CLTV floor. It cannot be repaired in place by
+	/// substituting a new CSV because that changes commitment scripts; callers must force-close it
+	/// using its persisted monitor.
+	pub(crate) fn has_unsafe_ark_timing(&self) -> bool {
+		match self.ark_ldk_minimum_cltv_delta() {
+			Ok(None) => false,
+			Ok(Some(minimum)) => self.context.config.options.cltv_expiry_delta < minimum,
+			Err(()) => true,
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn set_ark_htlc_success_csv_delta_for_test(&mut self, delta: Option<u16>) {
+		self.funding.channel_transaction_parameters.ark_htlc_success_csv_delta = delta;
+	}
+
 	/// Ark bridge test support: read the channel's in-flight teleport state, if any.
 	#[cfg(test)]
 	pub(crate) fn pending_teleport(&self) -> Option<&PendingTeleport> {
@@ -7846,14 +7884,12 @@ where
 	/// `teleport_complete_ack`, returns it. Used both on the happy path and to resend it across a
 	/// reconnect. The new-funding spend is stock ECDSA, so this message carries no nonce.
 	fn get_pending_teleport_complete_ack(&self) -> Option<msgs::TeleportCompleteAck> {
-		self.pending_teleport.as_ref().and_then(|pending_teleport| {
-			match pending_teleport {
-				PendingTeleport::AwaitingTeleportCompleteAckSend { .. }
-				| PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. } => {
-					Some(msgs::TeleportCompleteAck { channel_id: self.context.channel_id() })
-				},
-				_ => None,
-			}
+		self.pending_teleport.as_ref().and_then(|pending_teleport| match pending_teleport {
+			PendingTeleport::AwaitingTeleportCompleteAckSend { .. }
+			| PendingTeleport::AwaitingRemoteActivityAfterTeleportCompleteAckSend { .. } => {
+				Some(msgs::TeleportCompleteAck { channel_id: self.context.channel_id() })
+			},
+			_ => None,
 		})
 	}
 
@@ -7904,11 +7940,7 @@ where
 					new_funding_txo,
 					responder_value_removal_sat,
 					initiator_value_removal_sat,
-				} => (
-					*new_funding_txo,
-					*responder_value_removal_sat,
-					*initiator_value_removal_sat,
-				),
+				} => (*new_funding_txo, *responder_value_removal_sat, *initiator_value_removal_sat),
 				_ => return None,
 			};
 		self.get_initial_teleport_commitment_signed(
@@ -7983,7 +8015,15 @@ where
 			channel_id: Some(self.context.channel_id()),
 		};
 
-		self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new(), logger);
+		self.monitor_updating_paused(
+			false,
+			false,
+			false,
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			logger,
+		);
 		Ok(self.push_ret_blockable_mon_update(monitor_update))
 	}
 
@@ -8017,7 +8057,15 @@ where
 			}],
 			channel_id: Some(self.context.channel_id()),
 		};
-		self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new(), logger);
+		self.monitor_updating_paused(
+			false,
+			false,
+			false,
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+			logger,
+		);
 		self.push_ret_blockable_mon_update(monitor_update)
 	}
 
@@ -9296,7 +9344,10 @@ where
 		// message.) A normal old-scope CS carries our current funding txid and is unaffected.
 		if let Some(funding_txid) = msg.funding_txid {
 			let matches_known_scope = self.funding.get_funding_txid() == Some(funding_txid)
-				|| self.pending_funding().iter().any(|f| f.get_funding_txid() == Some(funding_txid));
+				|| self
+					.pending_funding()
+					.iter()
+					.any(|f| f.get_funding_txid() == Some(funding_txid));
 			if !matches_known_scope {
 				log_info!(
 					logger,
@@ -13661,15 +13712,14 @@ where
 		// on `teleport_init`). Responder-side and total-viability violations are deliberately
 		// NOT pre-checked here: the responder is the authority on those and rejects them itself.
 		if initiator_value_removal_sat > 0 {
-			let removal_msat =
-				initiator_value_removal_sat.checked_mul(1000).ok_or_else(|| {
-					APIError::APIMisuseError {
-						err: format!(
-							"Teleport initiator_value_removal_sat {} overflows when converted to msat",
-							initiator_value_removal_sat,
-						),
-					}
-				})?;
+			let removal_msat = initiator_value_removal_sat.checked_mul(1000).ok_or_else(|| {
+				APIError::APIMisuseError {
+					err: format!(
+						"Teleport initiator_value_removal_sat {} overflows when converted to msat",
+						initiator_value_removal_sat,
+					),
+				}
+			})?;
 			if removal_msat > self.funding.value_to_self_msat {
 				return Err(APIError::APIMisuseError {
 					err: format!(
@@ -13678,8 +13728,7 @@ where
 					),
 				});
 			}
-			if let Some(reserve_sat) = self.funding.counterparty_selected_channel_reserve_satoshis
-			{
+			if let Some(reserve_sat) = self.funding.counterparty_selected_channel_reserve_satoshis {
 				let reserve_msat = reserve_sat.saturating_mul(1000);
 				let new_value_to_self_msat = self.funding.value_to_self_msat - removal_msat;
 				if new_value_to_self_msat < reserve_msat {
@@ -13904,10 +13953,7 @@ where
 					initiator_value_removal_sat,
 					logger,
 				);
-				Ok((
-					msgs::TeleportAck { channel_id: self.context.channel_id() },
-					commitment_signed,
-				))
+				Ok((msgs::TeleportAck { channel_id: self.context.channel_id() }, commitment_signed))
 			},
 			Some(pending_teleport) => {
 				self.pending_teleport = Some(pending_teleport);
@@ -14087,12 +14133,9 @@ where
 					"Teleport initiator_value_removal_sat {initiator_removal_sat} exceeds the initiator's balance ({counterparty_balance_msat} msat)",
 				)));
 			}
-			let reserve_msat = self
-				.funding
-				.holder_selected_channel_reserve_satoshis
-				.saturating_mul(1000);
-			let new_counterparty_balance_msat =
-				counterparty_balance_msat - initiator_removal_msat;
+			let reserve_msat =
+				self.funding.holder_selected_channel_reserve_satoshis.saturating_mul(1000);
+			let new_counterparty_balance_msat = counterparty_balance_msat - initiator_removal_msat;
 			if new_counterparty_balance_msat < reserve_msat {
 				return Err(ChannelError::close(format!(
 					"Teleport initiator_value_removal_sat {initiator_removal_sat} would drop the initiator's balance ({new_counterparty_balance_msat} msat) below the holder-selected reserve ({reserve_msat} msat)",
@@ -14275,7 +14318,9 @@ where
 				self.pending_teleport = Some(pending_teleport);
 				Err(ChannelError::Ignore("Got unexpected teleport_complete_ack send".to_owned()))
 			},
-			None => Err(ChannelError::Ignore("Got unexpected teleport_complete_ack send".to_owned())),
+			None => {
+				Err(ChannelError::Ignore("Got unexpected teleport_complete_ack send".to_owned()))
+			},
 		}
 	}
 
@@ -14349,25 +14394,17 @@ where
 		if msg.funding_txid != Some(new_funding_txo.txid) {
 			return Err(ChannelError::close(format!(
 				"Unexpected teleport funding txid {}; expected {}",
-				msg.funding_txid
-					.map(|txid| txid.to_string())
-					.unwrap_or_else(|| "none".to_owned()),
+				msg.funding_txid.map(|txid| txid.to_string()).unwrap_or_else(|| "none".to_owned()),
 				new_funding_txo.txid,
 			)));
 		}
 
 		// Pull the agreed removals off `pending_teleport` (state at this point is
 		// `AwaitingRemoteCommitmentSigned`) so we sign at the agreed values.
-		let responder_value_removal_sat = self
-			.pending_teleport
-			.as_ref()
-			.map(|pt| pt.responder_value_removal_sat())
-			.unwrap_or(0);
-		let initiator_value_removal_sat = self
-			.pending_teleport
-			.as_ref()
-			.map(|pt| pt.initiator_value_removal_sat())
-			.unwrap_or(0);
+		let responder_value_removal_sat =
+			self.pending_teleport.as_ref().map(|pt| pt.responder_value_removal_sat()).unwrap_or(0);
+		let initiator_value_removal_sat =
+			self.pending_teleport.as_ref().map(|pt| pt.initiator_value_removal_sat()).unwrap_or(0);
 		let monitor_update = self.teleport_initial_commitment_signed(
 			msg,
 			new_funding_txo,
@@ -17364,19 +17401,30 @@ pub(super) fn get_initial_channel_type(
 /// parameters at open time.
 ///
 /// The delta is only applied to `ArkChannel`s — non-Ark channels are left completely unchanged so
-/// they remain interoperable with stock LDK peers. A configured `Some(0)` is meaningless (it would
-/// produce a no-op `OP_0 OP_CSV` in the HTLC script) and is coerced to `None`, both in debug and
-/// release builds.
-fn ark_htlc_success_csv_delta_for_open(
-	channel_type: &ChannelTypeFeatures, config: &ChannelHandshakeConfig,
-) -> Option<u16> {
+/// they remain interoperable with stock LDK peers. An Ark channel must have a nonzero delta and a
+/// configured CLTV floor large enough for both serial Ark CSV delays. The enclosing Ark
+/// application must add its VTXO exit-depth and confirmation-margin terms to this LDK-owned floor.
+pub(super) fn ark_htlc_success_csv_delta_for_open(
+	channel_type: &ChannelTypeFeatures, config: &UserConfig,
+) -> Result<Option<u16>, &'static str> {
 	if !channel_type.requires_ark_channel() {
-		return None;
+		return Ok(None);
 	}
-	match config.ark_htlc_success_csv_delta {
-		Some(0) | None => None,
-		Some(delta) => Some(delta),
+	let delta = match config.channel_handshake_config.ark_htlc_success_csv_delta {
+		Some(0) | None => return Err(
+			"ArkChannel requires a nonzero ark_htlc_success_csv_delta; refusing to open an unsafe Ark channel",
+		),
+		Some(delta) => delta,
+	};
+	let minimum_cltv_delta = delta.checked_mul(2).ok_or(
+		"ArkChannel cannot represent twice ark_htlc_success_csv_delta in ChannelConfig::cltv_expiry_delta",
+	)?;
+	if config.channel_config.cltv_expiry_delta < minimum_cltv_delta {
+		return Err(
+			"ArkChannel requires ChannelConfig::cltv_expiry_delta to be at least twice ark_htlc_success_csv_delta",
+		);
 	}
+	Ok(Some(delta))
 }
 
 const SERIALIZATION_VERSION: u8 = 4;

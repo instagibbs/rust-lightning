@@ -4085,6 +4085,24 @@ impl<
 		res
 	}
 
+	#[cfg(test)]
+	pub(crate) fn set_ark_htlc_success_csv_delta_for_test(
+		&self, channel_id: ChannelId, delta: Option<u16>,
+	) {
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		for peer_state_mutex in per_peer_state.values() {
+			let mut peer_state = peer_state_mutex.lock().unwrap();
+			if let Some(channel) = peer_state.channel_by_id.get_mut(&channel_id) {
+				channel
+					.as_funded_mut()
+					.expect("test channel must be funded")
+					.set_ark_htlc_success_csv_delta_for_test(delta);
+				return;
+			}
+		}
+		panic!("test channel not found");
+	}
+
 	/// Gets the list of usable channels, in random order. Useful as an argument to
 	/// [`Router::find_route`] to ensure non-announced channels are used.
 	///
@@ -6785,10 +6803,12 @@ impl<
 						) {
 							Ok(stfu_opt) => {
 								if let Some(msg) = stfu_opt {
-									peer_state.pending_msg_events.push(MessageSendEvent::SendStfu {
-										node_id: *counterparty_node_id,
-										msg,
-									});
+									peer_state.pending_msg_events.push(
+										MessageSendEvent::SendStfu {
+											node_id: *counterparty_node_id,
+											msg,
+										},
+									);
 								}
 								result = Ok(());
 								NotifyOption::DoPersist
@@ -6933,7 +6953,8 @@ impl<
 									},
 								);
 								if exited_quiescence {
-									holding_cell_res = self.check_free_peer_holding_cells(peer_state);
+									holding_cell_res =
+										self.check_free_peer_holding_cells(peer_state);
 								}
 								result = Ok(());
 								NotifyOption::DoPersist
@@ -7448,7 +7469,7 @@ impl<
 	/// `counterparty_node_id` is provided.
 	///
 	/// Returns [`APIMisuseError`] when a [`cltv_expiry_delta`] update is to be applied with a value
-	/// below [`MIN_CLTV_EXPIRY_DELTA`].
+	/// below [`MIN_CLTV_EXPIRY_DELTA`] or below twice the pinned success-path CSV of an Ark channel.
 	///
 	/// If an error is returned, none of the updates should be considered applied.
 	///
@@ -7483,6 +7504,30 @@ impl<
 					counterparty_node_id,
 				));
 			};
+		}
+		for channel_id in channel_ids {
+			if let Some(channel) =
+				peer_state.channel_by_id.get(channel_id).and_then(Channel::as_funded)
+			{
+				let mut candidate = channel.context().config();
+				candidate.apply(config_update);
+				match channel.ark_ldk_minimum_cltv_delta() {
+					Ok(Some(minimum)) if candidate.cltv_expiry_delta < minimum => {
+						return Err(APIError::APIMisuseError {
+							err: format!(
+								"The chosen CLTV expiry delta is below the Ark channel minimum of {minimum}"
+							),
+						});
+					},
+					Err(()) => {
+						return Err(APIError::APIMisuseError {
+							err: "Cannot update an Ark channel with invalid persisted timing parameters"
+								.to_owned(),
+						});
+					},
+					_ => {},
+				}
+			}
 		}
 		for channel_id in channel_ids {
 			if let Some(channel) = peer_state.channel_by_id.get_mut(channel_id) {
@@ -7529,7 +7574,7 @@ impl<
 	/// `counterparty_node_id` is provided.
 	///
 	/// Returns [`APIMisuseError`] when a [`cltv_expiry_delta`] update is to be applied with a value
-	/// below [`MIN_CLTV_EXPIRY_DELTA`].
+	/// below [`MIN_CLTV_EXPIRY_DELTA`] or below twice the pinned success-path CSV of an Ark channel.
 	///
 	/// If an error is returned, none of the updates should be considered applied.
 	///
@@ -16760,7 +16805,9 @@ impl<
 					.pending_msg_events
 					.iter()
 					.filter_map(|event| match event {
-						MessageSendEvent::SendTeleportCompleteAck { msg, .. } => Some(msg.channel_id),
+						MessageSendEvent::SendTeleportCompleteAck { msg, .. } => {
+							Some(msg.channel_id)
+						},
 						_ => None,
 					})
 					.collect();
@@ -17694,7 +17741,10 @@ impl<
 			if res.is_ok() {
 				// Ark bridge: post-promotion traffic from the counterparty resolves a lingering
 				// teleport on our (responder) side before any subsequent commitment dance.
-				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+				self.note_post_teleport_complete_ack_activity(
+					&counterparty_node_id,
+					msg.channel_id,
+				);
 			}
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
@@ -17725,7 +17775,10 @@ impl<
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let res = self.internal_update_fail_htlc(&counterparty_node_id, msg);
 			if res.is_ok() {
-				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+				self.note_post_teleport_complete_ack_activity(
+					&counterparty_node_id,
+					msg.channel_id,
+				);
 			}
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
@@ -17746,7 +17799,10 @@ impl<
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let res = self.internal_update_fail_malformed_htlc(&counterparty_node_id, msg);
 			if res.is_ok() {
-				self.note_post_teleport_complete_ack_activity(&counterparty_node_id, msg.channel_id);
+				self.note_post_teleport_complete_ack_activity(
+					&counterparty_node_id,
+					msg.channel_id,
+				);
 			}
 			let persist = match &res {
 				Err(e) if e.closes_channel() => NotifyOption::DoPersist,
@@ -18595,6 +18651,21 @@ pub(crate) fn provided_channel_type_features(config: &UserConfig) -> ChannelType
 	ChannelTypeFeatures::from_init(&provided_init_features(config))
 }
 
+/// Fetches the set of [`ChannelTypeFeatures`] we understand while restoring persisted channels.
+///
+/// This differs from [`provided_channel_type_features`] only for Ark channels. A node whose current
+/// Ark timing configuration is missing, zero, overflowing, or below LDK's minimum CLTV floor must
+/// not advertise or open new Ark channels, but it still needs to recognize a persisted Ark channel.
+/// A stored safe channel retains its pinned parameters; an unsafe legacy scope is closed below.
+pub(crate) fn provided_channel_type_features_for_deserialization(
+	config: &UserConfig,
+) -> ChannelTypeFeatures {
+	let mut init_features = provided_init_features(config);
+	init_features.set_ark_channel_optional();
+	init_features.set_anchor_zero_fee_commitments_optional();
+	ChannelTypeFeatures::from_init(&init_features)
+}
+
 /// Fetches the set of [`InitFeatures`] flags that are provided by or required by
 /// [`ChannelManager`].
 pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
@@ -18631,7 +18702,10 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 		features.set_anchor_zero_fee_commitments_optional();
 	}
 
-	if config.channel_handshake_config.negotiate_ark_channel {
+	if config.channel_handshake_config.negotiate_ark_channel
+		&& channel::ark_htlc_success_csv_delta_for_open(&ChannelTypeFeatures::ark_channel(), config)
+			.is_ok()
+	{
 		features.set_ark_channel_optional();
 		// ArkChannel implies anchor_zero_fee_commitments and static_remote_key; advertise them
 		// so the peer can recognise the dependency bundle in InitFeatures.
@@ -19471,14 +19545,17 @@ impl<'a, ES: EntropySource, SP: SignerProvider, L: Logger>
 
 		let channel_count: u64 = Readable::read(reader)?;
 		let mut channels = Vec::with_capacity(cmp::min(channel_count as usize, 128));
+		// `provided_init_features` intentionally stops advertising Ark when its required timing
+		// configuration is unsafe. That must not make an already-persisted Ark channel undecodable,
+		// though: it may need to be retained with its pinned parameters or quarantined and
+		// force-closed during the second stage of restoration below. Keep support for the complete
+		// Ark channel type here only; this set is never used to advertise or accept a new channel.
+		let deserialization_features =
+			provided_channel_type_features_for_deserialization(&args.config);
 		for _ in 0..channel_count {
 			let channel: FundedChannel<SP> = FundedChannel::read(
 				reader,
-				(
-					args.entropy_source,
-					args.signer_provider,
-					&provided_channel_type_features(&args.config),
-				),
+				(args.entropy_source, args.signer_provider, &deserialization_features),
 			)?;
 			channels.push(channel);
 		}
@@ -20101,47 +20178,62 @@ impl<
 			let channel_id = channel.context.channel_id();
 			channel_id_set.insert(channel_id);
 			if let Some(ref mut monitor) = args.channel_monitors.get_mut(&channel_id) {
-				if channel.get_cur_holder_commitment_transaction_number()
+				let unsafe_legacy_ark_timing = channel.has_unsafe_ark_timing();
+				let stale_channel_manager = channel.get_cur_holder_commitment_transaction_number()
 					> monitor.get_cur_holder_commitment_number()
 					|| channel.get_revoked_counterparty_commitment_transaction_number()
 						> monitor.get_min_seen_secret()
 					|| channel.get_cur_counterparty_commitment_transaction_number()
 						> monitor.get_cur_counterparty_commitment_number()
 					|| channel.context.get_latest_monitor_update_id()
-						< monitor.get_latest_update_id()
-				{
-					// But if the channel is behind of the monitor, close the channel:
-					log_error!(
-						logger,
-						"A ChannelManager is stale compared to the current ChannelMonitor!"
-					);
-					log_error!(logger, " The channel will be force-closed and the latest commitment transaction from the ChannelMonitor broadcast.");
-					if channel.context.get_latest_monitor_update_id()
-						< monitor.get_latest_update_id()
-					{
-						log_error!(logger, " The ChannelMonitor is at update_id {} but the ChannelManager is at update_id {}.",
-							monitor.get_latest_update_id(), channel.context.get_latest_monitor_update_id());
+						< monitor.get_latest_update_id();
+				if unsafe_legacy_ark_timing || stale_channel_manager {
+					if unsafe_legacy_ark_timing {
+						log_error!(
+							logger,
+							"Restored an Ark channel without a valid success-path CSV and CLTV floor; force-closing the unsafe legacy scope."
+						);
 					}
-					if channel.get_cur_holder_commitment_transaction_number()
-						> monitor.get_cur_holder_commitment_number()
-					{
-						log_error!(logger, " The ChannelMonitor is at holder commitment number {} but the ChannelManager is at holder commitment number {}.",
-							monitor.get_cur_holder_commitment_number(), channel.get_cur_holder_commitment_transaction_number());
+					if stale_channel_manager {
+						// But if the channel is behind of the monitor, close the channel:
+						log_error!(
+							logger,
+							"A ChannelManager is stale compared to the current ChannelMonitor!"
+						);
+						log_error!(logger, " The channel will be force-closed and the latest commitment transaction from the ChannelMonitor broadcast.");
+						if channel.context.get_latest_monitor_update_id()
+							< monitor.get_latest_update_id()
+						{
+							log_error!(logger, " The ChannelMonitor is at update_id {} but the ChannelManager is at update_id {}.",
+								monitor.get_latest_update_id(), channel.context.get_latest_monitor_update_id());
+						}
+						if channel.get_cur_holder_commitment_transaction_number()
+							> monitor.get_cur_holder_commitment_number()
+						{
+							log_error!(logger, " The ChannelMonitor is at holder commitment number {} but the ChannelManager is at holder commitment number {}.",
+								monitor.get_cur_holder_commitment_number(), channel.get_cur_holder_commitment_transaction_number());
+						}
+						if channel.get_revoked_counterparty_commitment_transaction_number()
+							> monitor.get_min_seen_secret()
+						{
+							log_error!(logger, " The ChannelMonitor is at revoked counterparty transaction number {} but the ChannelManager is at revoked counterparty transaction number {}.",
+								monitor.get_min_seen_secret(), channel.get_revoked_counterparty_commitment_transaction_number());
+						}
+						if channel.get_cur_counterparty_commitment_transaction_number()
+							> monitor.get_cur_counterparty_commitment_number()
+						{
+							log_error!(logger, " The ChannelMonitor is at counterparty commitment transaction number {} but the ChannelManager is at counterparty commitment transaction number {}.",
+								monitor.get_cur_counterparty_commitment_number(), channel.get_cur_counterparty_commitment_transaction_number());
+						}
 					}
-					if channel.get_revoked_counterparty_commitment_transaction_number()
-						> monitor.get_min_seen_secret()
-					{
-						log_error!(logger, " The ChannelMonitor is at revoked counterparty transaction number {} but the ChannelManager is at revoked counterparty transaction number {}.",
-							monitor.get_min_seen_secret(), channel.get_revoked_counterparty_commitment_transaction_number());
-					}
-					if channel.get_cur_counterparty_commitment_transaction_number()
-						> monitor.get_cur_counterparty_commitment_number()
-					{
-						log_error!(logger, " The ChannelMonitor is at counterparty commitment transaction number {} but the ChannelManager is at counterparty commitment transaction number {}.",
-							monitor.get_cur_counterparty_commitment_number(), channel.get_cur_counterparty_commitment_transaction_number());
-					}
-					let shutdown_result =
-						channel.force_shutdown(ClosureReason::OutdatedChannelManager);
+					let closure_reason = if unsafe_legacy_ark_timing {
+						ClosureReason::ProcessingError {
+							err: "Ark channel restored without valid success-path CSV and CLTV timing; force-closing unsafe legacy scope".to_owned(),
+						}
+					} else {
+						ClosureReason::OutdatedChannelManager
+					};
+					let shutdown_result = channel.force_shutdown(closure_reason.clone());
 					if shutdown_result.unbroadcasted_batch_funding_txid.is_some() {
 						return Err(DecodeError::InvalidValue);
 					}
@@ -20180,7 +20272,7 @@ impl<
 						events::Event::ChannelClosed {
 							channel_id: channel.context.channel_id(),
 							user_channel_id: channel.context.get_user_id(),
-							reason: ClosureReason::OutdatedChannelManager,
+							reason: closure_reason,
 							counterparty_node_id: Some(channel.context.get_counterparty_node_id()),
 							channel_capacity_sats: Some(channel.funding.get_value_satoshis()),
 							channel_funding_txo: channel.funding.get_funding_txo(),

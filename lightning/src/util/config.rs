@@ -260,6 +260,9 @@ pub struct ChannelHandshakeConfig {
 	/// Ark-on-Lightning: if `true`, advertise and prefer the `ArkChannel` channel type when both
 	/// sides support it. The Ark channel type uses stock P2WSH 2-of-2 funding with the
 	/// `zero_fee_commitments` commit-TX shape (v3/TRUC + P2A anchor, 0-fee).
+	/// Advertisement and channel open are suppressed unless
+	/// [`Self::ark_htlc_success_csv_delta`] and [`ChannelConfig::cltv_expiry_delta`] satisfy the
+	/// mandatory Ark timing checks documented below.
 	///
 	/// Default value: `false`.
 	pub negotiate_ark_channel: bool,
@@ -270,13 +273,21 @@ pub struct ChannelHandshakeConfig {
 	/// timeout claim path activates before the local success path, so the Ark server never has to
 	/// unroll the tree to resolve an HTLC.
 	///
-	/// Both sides of the channel must set this to the same value for the channel's commitment
-	/// signatures to validate. Intended for use only between Ark-aware peers; there is no
-	/// feature-bit negotiation yet, so setting this with a stock LDK counterparty will break the
-	/// channel.
+	/// This is mandatory for an `ArkChannel`: opening or accepting an Ark channel with `None` or
+	/// `Some(0)` is rejected. Both sides of the channel must set this to the same nonzero value for
+	/// the channel's commitment signatures to validate. The Ark channel type is feature-negotiated,
+	/// but the numeric CSV value is not carried on the wire and must be bound by the enclosing Ark
+	/// protocol to the bridge's pinned exit delay. Non-Ark channel types ignore this field and remain
+	/// interoperable with stock LDK peers.
 	///
-	/// A value of `Some(0)` is meaningless (it would emit a no-op `OP_0 OP_CSV`) and is treated as
-	/// `None` (no Ark CSV) when the channel is opened.
+	/// LDK additionally requires [`ChannelConfig::cltv_expiry_delta`] to be at least twice this
+	/// value, using checked arithmetic. This covers the two serial exit-delay terms LDK can validate.
+	/// The enclosing Ark implementation must add its maximum VTXO exit depth and confirmation safety
+	/// margin to the configured CLTV floor. Values greater than `u16::MAX / 2` cannot satisfy even
+	/// LDK's minimum and are rejected.
+	///
+	/// A value of `Some(0)` is meaningless (it would emit a no-op `OP_0 OP_CSV`) and is rejected
+	/// for Ark channels.
 	///
 	/// Default value: `None` (standard BOLT-3 HTLC script shape).
 	pub ark_htlc_success_csv_delta: Option<u16>,
@@ -1260,8 +1271,12 @@ pub struct ChannelHandshakeConfigUpdate {
 	pub channel_reserve_proportional_millionths: Option<u32>,
 
 	/// Override for the Ark-on-Lightning HTLC success-path CSV delta. See
-	/// [`ChannelHandshakeConfig::ark_htlc_success_csv_delta`]. `Some(Some(d))` sets the delta,
-	/// `Some(None)` disables Ark protection, `None` leaves the existing config value alone.
+	/// [`ChannelHandshakeConfig::ark_htlc_success_csv_delta`]. `Some(Some(d))` sets a nonzero
+	/// delta for future Ark channel opens, provided the configured CLTV floor is at least `2 * d`.
+	/// `Some(None)`, `Some(Some(0))`, an overflowing `2 * d`, or an insufficient CLTV floor make
+	/// future Ark channel opens fail; they cannot remove protection from an existing Ark channel
+	/// because that would change its commitment scripts. `None` leaves the existing config value
+	/// alone.
 	pub ark_htlc_success_csv_delta: Option<Option<u16>>,
 }
 

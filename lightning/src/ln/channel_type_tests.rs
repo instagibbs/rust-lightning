@@ -3,6 +3,7 @@ use crate::ln::channel::{get_initial_channel_type, InboundV1Channel, OutboundV1C
 use crate::ln::channelmanager;
 use crate::prelude::*;
 use crate::util::config::UserConfig;
+use crate::util::errors::APIError;
 use crate::util::test_utils::{TestFeeEstimator, TestKeysInterface, TestLogger};
 use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
@@ -108,6 +109,8 @@ fn test_option_ark_channel_initial() {
 		ChannelTypeFeatures::only_static_remote_key(),
 		|cfg: &mut UserConfig| {
 			cfg.channel_handshake_config.negotiate_ark_channel = true;
+			cfg.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+			cfg.channel_config.cltv_expiry_delta = 288;
 		},
 		|their_features: &mut InitFeatures| {
 			their_features.set_ark_channel_optional();
@@ -122,6 +125,8 @@ fn test_supports_ark_channel() {
 	// `channel_type`, and that it uses zero-fee commitment shape (feerate == 0).
 	let mut config = UserConfig::default();
 	config.channel_handshake_config.negotiate_ark_channel = true;
+	config.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+	config.channel_config.cltv_expiry_delta = 288;
 
 	let expected_channel_type = ChannelTypeFeatures::ark_channel();
 	assert!(expected_channel_type.requires_ark_channel());
@@ -129,6 +134,155 @@ fn test_supports_ark_channel() {
 	assert!(expected_channel_type.requires_anchor_zero_fee_commitments());
 
 	do_test_supports_channel_type(config, expected_channel_type)
+}
+
+#[test]
+fn test_ark_channel_requires_safe_ldk_timing() {
+	let secp_ctx = Secp256k1::new();
+	let fee_estimator = TestFeeEstimator::new(15_000);
+	let fee_estimator = LowerBoundedFeeEstimator::new(&fee_estimator);
+	let network = Network::Testnet;
+	let keys_provider = TestKeysInterface::new(&[42; 32], network);
+	let logger = TestLogger::new();
+	let peer_node_id =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+
+	let mut peer_features = InitFeatures::empty();
+	peer_features.set_ark_channel_optional();
+
+	let mut unsafe_config = UserConfig::default();
+	unsafe_config.channel_handshake_config.negotiate_ark_channel = true;
+
+	let assert_outbound_rejected =
+		|config: &UserConfig, expected: &str| match OutboundV1Channel::<&TestKeysInterface>::new(
+			&fee_estimator,
+			&&keys_provider,
+			&&keys_provider,
+			peer_node_id,
+			&peer_features,
+			10_000_000,
+			100_000,
+			42,
+			config,
+			0,
+			42,
+			None,
+			&logger,
+			None,
+		) {
+			Err(APIError::APIMisuseError { err }) => {
+				assert!(err.contains(expected), "unexpected rejection: {err}",)
+			},
+			Err(err) => panic!("unexpected error type: {err:?}"),
+			Ok(_) => panic!("opened ArkChannel with unsafe LDK timing"),
+		};
+
+	// `None` and `Some(0)` must not silently turn the Ark CSV into a no-op.
+	assert_outbound_rejected(
+		&unsafe_config,
+		"ArkChannel requires a nonzero ark_htlc_success_csv_delta",
+	);
+	unsafe_config.channel_handshake_config.ark_htlc_success_csv_delta = Some(0);
+	assert_outbound_rejected(
+		&unsafe_config,
+		"ArkChannel requires a nonzero ark_htlc_success_csv_delta",
+	);
+
+	// The two serial Ark delays must fit in the u16 CLTV field, and the configured floor must
+	// actually cover them. The enclosing application adds exit-depth and safety-margin terms.
+	unsafe_config.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+	unsafe_config.channel_config.cltv_expiry_delta = 287;
+	assert_outbound_rejected(&unsafe_config, "at least twice ark_htlc_success_csv_delta");
+	unsafe_config.channel_handshake_config.ark_htlc_success_csv_delta = Some(32_768);
+	unsafe_config.channel_config.cltv_expiry_delta = u16::MAX;
+	assert_outbound_rejected(&unsafe_config, "cannot represent twice");
+
+	// The same invariant applies when accepting an Ark open_channel, rather than only when
+	// initiating one.
+	let mut safe_config = unsafe_config.clone();
+	safe_config.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+	safe_config.channel_config.cltv_expiry_delta = 288;
+	let mut safe_outbound = OutboundV1Channel::<&TestKeysInterface>::new(
+		&fee_estimator,
+		&&keys_provider,
+		&&keys_provider,
+		peer_node_id,
+		&peer_features,
+		10_000_000,
+		100_000,
+		42,
+		&safe_config,
+		0,
+		42,
+		None,
+		&logger,
+		None,
+	)
+	.unwrap();
+	assert_eq!(
+		safe_outbound.funding.channel_transaction_parameters.ark_htlc_success_csv_delta,
+		Some(144),
+	);
+	let open_channel =
+		safe_outbound.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap();
+	let local_features = ChannelTypeFeatures::ark_channel();
+	let inbound_rejection = |config: &UserConfig| {
+		InboundV1Channel::<&TestKeysInterface>::new(
+			&fee_estimator,
+			&&keys_provider,
+			&&keys_provider,
+			peer_node_id,
+			&local_features,
+			&peer_features,
+			&open_channel,
+			7,
+			config,
+			0,
+			&&logger,
+			None,
+		)
+		.err()
+		.expect("inbound Ark open with unsafe timing must fail")
+		.to_string()
+	};
+	unsafe_config.channel_handshake_config.ark_htlc_success_csv_delta = None;
+	assert!(inbound_rejection(&unsafe_config)
+		.contains("ArkChannel requires a nonzero ark_htlc_success_csv_delta"));
+	unsafe_config.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+	unsafe_config.channel_config.cltv_expiry_delta = 287;
+	assert!(inbound_rejection(&unsafe_config).contains("at least twice ark_htlc_success_csv_delta"));
+}
+
+#[test]
+fn test_ark_feature_is_only_advertised_with_safe_ldk_timing() {
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_ark_channel = true;
+	for unsafe_delta in [None, Some(0)] {
+		config.channel_handshake_config.ark_htlc_success_csv_delta = unsafe_delta;
+		assert!(!channelmanager::provided_init_features(&config).supports_ark_channel());
+		assert!(
+			channelmanager::provided_channel_type_features_for_deserialization(&config)
+				.supports_ark_channel(),
+			"a legacy Ark channel with {unsafe_delta:?} must be decodable so it can be closed"
+		);
+	}
+
+	config.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+	config.channel_config.cltv_expiry_delta = 287;
+	assert!(!channelmanager::provided_init_features(&config).supports_ark_channel());
+
+	config.channel_handshake_config.ark_htlc_success_csv_delta = Some(32_768);
+	config.channel_config.cltv_expiry_delta = u16::MAX;
+	assert!(!channelmanager::provided_init_features(&config).supports_ark_channel());
+
+	// Largest success CSV whose doubled LDK-owned floor fits exactly in a u16.
+	config.channel_handshake_config.ark_htlc_success_csv_delta = Some(32_767);
+	config.channel_config.cltv_expiry_delta = 65_534;
+	assert!(channelmanager::provided_init_features(&config).supports_ark_channel());
+
+	config.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+	config.channel_config.cltv_expiry_delta = 288;
+	assert!(channelmanager::provided_init_features(&config).supports_ark_channel());
 }
 
 fn do_test_get_initial_channel_type<F1, F2>(

@@ -8,6 +8,8 @@ use crate::ln::chan_utils::{
 use crate::ln::functional_test_utils::*;
 use crate::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
 use crate::prelude::*;
+use crate::util::errors::APIError;
+use crate::util::ser::Writeable;
 
 use bitcoin::constants::WITNESS_SCALE_FACTOR;
 use bitcoin::opcodes::all::OP_CSV;
@@ -15,7 +17,6 @@ use bitcoin::script::Instruction;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::Amount;
 use lightning_types::features::ChannelTypeFeatures;
-
 
 #[test]
 fn test_p2a_anchor_values_under_trims_and_rounds() {
@@ -446,6 +447,8 @@ fn test_ark_channel_funding_output_is_p2wsh() {
 	let mut user_cfg = test_default_channel_config();
 	// Enable ArkChannel negotiation on both sides.
 	user_cfg.channel_handshake_config.negotiate_ark_channel = true;
+	user_cfg.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+	user_cfg.channel_config.cltv_expiry_delta = 288;
 
 	let configs = [Some(user_cfg.clone()), Some(user_cfg)];
 	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &configs);
@@ -460,8 +463,7 @@ fn test_ark_channel_funding_output_is_p2wsh() {
 	// --- Open-channel / accept-channel handshake via functional-test helpers.
 	// After this, node 0 has a pending FundingGenerationReady event.
 	const CHAN_VALUE: u64 = 10_000_000;
-	let temporary_channel_id =
-		exchange_open_accept_chan(&nodes[0], &nodes[1], CHAN_VALUE, 0);
+	let temporary_channel_id = exchange_open_accept_chan(&nodes[0], &nodes[1], CHAN_VALUE, 0);
 
 	// `create_funding_transaction` consumes the FundingGenerationReady event and builds a
 	// transaction whose sole output uses exactly the `output_script` from that event.
@@ -538,6 +540,103 @@ fn test_ark_channel_funding_output_is_p2wsh() {
 		"ArkChannel should have reached ChannelReady, channel_id={:?}",
 		chan.channel_id
 	);
+
+	// A live Ark channel cannot later lower its forwarding floor below the two delays pinned at
+	// open. This check is atomic with the ordinary channel-config update.
+	let mut unsafe_channel_config = test_default_channel_config().channel_config;
+	unsafe_channel_config.cltv_expiry_delta = 287;
+	match nodes[0].node.update_channel_config(
+		&node_b_id,
+		&[chan.channel_id],
+		&unsafe_channel_config,
+	) {
+		Err(APIError::APIMisuseError { err }) => {
+			assert!(err.contains("below the Ark channel minimum of 288"));
+		},
+		Err(err) => panic!("unexpected error type: {err:?}"),
+		Ok(()) => panic!("lowered a live Ark channel below its pinned CLTV floor"),
+	}
+}
+
+fn do_test_legacy_unsafe_ark_timing_is_force_closed_on_restore(unsafe_delta: Option<u16>) {
+	const ARK_DELTA: u16 = 144;
+	const CHAN_VALUE: u64 = 10_000_000;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut initial_config = test_default_channel_config();
+	initial_config.channel_handshake_config.negotiate_ark_channel = true;
+	initial_config.channel_handshake_config.ark_htlc_success_csv_delta = Some(ARK_DELTA);
+	initial_config.channel_config.cltv_expiry_delta = ARK_DELTA * 2;
+	let persister;
+	let new_chain_monitor;
+	let reloaded_manager;
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(initial_config.clone()), Some(initial_config)]);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let _coinbase_tx = provide_anchor_reserves(&nodes);
+
+	let (_, _, channel_id, funding_tx) = create_announced_chan_between_nodes_with_value(
+		&nodes,
+		0,
+		1,
+		CHAN_VALUE,
+		(CHAN_VALUE / 2) * 1000,
+	);
+	assert_eq!(
+		nodes[0].node.list_channels()[0].channel_type,
+		Some(ChannelTypeFeatures::ark_channel())
+	);
+
+	// Simulate an Ark channel written by a version which allowed a missing or zero success-path
+	// CSV. The monitor remains persisted so restoration must use it to close the channel rather
+	// than rejecting the manager or leaving an unsafe channel live.
+	nodes[0].node.set_ark_htlc_success_csv_delta_for_test(channel_id, unsafe_delta);
+	let manager_serialized = nodes[0].node.encode();
+	let monitor_serialized = get_monitor!(nodes[0], channel_id).encode();
+	nodes[0].node.peer_disconnected(nodes[1].node.get_our_node_id());
+
+	let mut reload_config = test_default_channel_config();
+	reload_config.channel_handshake_config.negotiate_ark_channel = true;
+	reload_config.channel_handshake_config.ark_htlc_success_csv_delta = unsafe_delta;
+	reload_node!(
+		nodes[0],
+		reload_config,
+		manager_serialized,
+		&[&monitor_serialized],
+		persister,
+		new_chain_monitor,
+		reloaded_manager
+	);
+
+	assert!(
+		nodes[0].node.list_channels().is_empty(),
+		"an Ark channel restored with {unsafe_delta:?} must not remain usable"
+	);
+	check_closed_event(
+		&nodes[0],
+		1,
+		ClosureReason::ProcessingError {
+			err: "Ark channel restored without valid success-path CSV and CLTV timing; force-closing unsafe legacy scope".to_owned(),
+		},
+		&[nodes[1].node.get_our_node_id()],
+		CHAN_VALUE,
+	);
+
+	nodes[0].node.test_process_background_events();
+	check_added_monitors(&nodes[0], 1);
+	handle_bump_close_event(&nodes[0]);
+	let txns = nodes[0].tx_broadcaster.txn_broadcast();
+	assert_eq!(txns.len(), 2);
+	check_spends!(txns[0], funding_tx);
+}
+
+#[test]
+fn test_legacy_unsafe_ark_timing_is_force_closed_on_restore() {
+	do_test_legacy_unsafe_ark_timing_is_force_closed_on_restore(None);
+	do_test_legacy_unsafe_ark_timing_is_force_closed_on_restore(Some(0));
+	// The persisted channel floor is 288, so a delta of 145 would require at least 290.
+	do_test_legacy_unsafe_ark_timing_is_force_closed_on_restore(Some(145));
 }
 
 /// End-to-end proof that the Ark HTLC success-path CSV is ACTIVE once `ark_htlc_success_csv_delta`
@@ -567,6 +666,7 @@ fn test_ark_channel_htlc_success_csv_active_end_to_end() {
 	// Enable ArkChannel negotiation AND activate the success-path CSV delta on both sides.
 	user_cfg.channel_handshake_config.negotiate_ark_channel = true;
 	user_cfg.channel_handshake_config.ark_htlc_success_csv_delta = Some(ARK_DELTA);
+	user_cfg.channel_config.cltv_expiry_delta = ARK_DELTA * 2;
 	user_cfg.channel_handshake_config.our_htlc_minimum_msat = 1;
 
 	let configs = [Some(user_cfg.clone()), Some(user_cfg)];
@@ -615,8 +715,7 @@ fn test_ark_channel_htlc_success_csv_active_end_to_end() {
 		.unwrap();
 	check_added_monitors(&nodes[1], 1);
 	check_closed_broadcast(&nodes[1], 1, true);
-	let reason =
-		ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
 	check_closed_event(&nodes[1], 1, reason, &[node_a_id], CHAN_CAPACITY);
 
 	mine_transaction(&nodes[1], &node_1_commit_tx);
@@ -725,6 +824,7 @@ fn test_ark_channel_manual_funding_lifecycle() {
 	let mut user_cfg = test_default_channel_config();
 	user_cfg.channel_handshake_config.negotiate_ark_channel = true;
 	user_cfg.channel_handshake_config.ark_htlc_success_csv_delta = Some(ARK_DELTA);
+	user_cfg.channel_config.cltv_expiry_delta = ARK_DELTA * 2;
 	user_cfg.channel_handshake_config.our_htlc_minimum_msat = 1;
 
 	let configs = [Some(user_cfg.clone()), Some(user_cfg)];
@@ -795,7 +895,10 @@ fn test_ark_channel_manual_funding_lifecycle() {
 			other => panic!("unexpected pending event: {other:?}"),
 		}
 	}
-	assert!(saw_broadcast_safe, "FundingTxBroadcastSafe must be emitted on the manual-funding path");
+	assert!(
+		saw_broadcast_safe,
+		"FundingTxBroadcastSafe must be emitted on the manual-funding path"
+	);
 
 	// -----------------------------------------------------------------------
 	// Phase 2: Mine the funding tx → ChannelReady, exchange announcement sigs.
@@ -803,7 +906,12 @@ fn test_ark_channel_manual_funding_lifecycle() {
 	// confirm_first: mine on node_b (sends channel_ready to node_a)
 	let conf_height =
 		core::cmp::max(nodes[0].best_block_info().1 + 1, nodes[1].best_block_info().1 + 1);
-	create_chan_between_nodes_with_value_confirm_first(&nodes[0], &nodes[1], &funding_tx, conf_height);
+	create_chan_between_nodes_with_value_confirm_first(
+		&nodes[0],
+		&nodes[1],
+		&funding_tx,
+		conf_height,
+	);
 
 	// mine on node_a, which fires ChannelReady + AnnouncementSigs + ChannelUpdate
 	confirm_transaction_at(&nodes[0], &funding_tx, conf_height);
@@ -875,8 +983,7 @@ fn test_ark_channel_manual_funding_lifecycle() {
 		.unwrap();
 	check_added_monitors(&nodes[1], 1);
 	check_closed_broadcast(&nodes[1], 1, true);
-	let reason =
-		ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
 	check_closed_event(&nodes[1], 1, reason, &[node_a_id], CHAN_VALUE);
 
 	mine_transaction(&nodes[1], &node_1_commit_tx);
