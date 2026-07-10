@@ -254,6 +254,70 @@ fn test_ark_channel_requires_safe_ldk_timing() {
 }
 
 #[test]
+fn test_ark_channel_type_is_not_downgradable_on_peer_error() {
+	// When a peer rejects our open with an error message, the channel-type downgrade path
+	// retries with the next-best type. An Ark channel must not participate in that ladder, in
+	// either direction: re-selecting `ark_channel()` would resend the identical rejected type
+	// forever (the peer still advertises the feature bit, so recomputing the preferred type
+	// yields the same answer), and falling back to a non-Ark type would open a channel without
+	// the HTLC success-path CSV its funding construction requires. The only safe outcome is a
+	// clean failure of the open.
+	let secp_ctx = Secp256k1::new();
+	let fee_estimator = TestFeeEstimator::new(15_000);
+	let fee_estimator = LowerBoundedFeeEstimator::new(&fee_estimator);
+	let network = Network::Testnet;
+	let keys_provider = TestKeysInterface::new(&[42; 32], network);
+	let logger = TestLogger::new();
+	let peer_node_id =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+
+	// The peer keeps advertising Ark support (and everything the downgrade ladder could pick):
+	// the rejection we are reacting to was a policy error, not a missing feature bit.
+	let mut peer_features = InitFeatures::empty();
+	peer_features.set_ark_channel_optional();
+	peer_features.set_anchor_zero_fee_commitments_optional();
+	peer_features.set_anchors_zero_fee_htlc_tx_optional();
+	peer_features.set_static_remote_key_optional();
+
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_ark_channel = true;
+	config.channel_handshake_config.ark_htlc_success_csv_delta = Some(144);
+	config.channel_config.cltv_expiry_delta = 288;
+
+	let mut chan = OutboundV1Channel::<&TestKeysInterface>::new(
+		&fee_estimator,
+		&&keys_provider,
+		&&keys_provider,
+		peer_node_id,
+		&peer_features,
+		10_000_000,
+		100_000,
+		42,
+		&config,
+		0,
+		42,
+		None,
+		&logger,
+		None,
+	)
+	.unwrap();
+	assert!(chan.funding.get_channel_type().requires_ark_channel());
+	// Sending the open is what arms the downgrade path (OUR_INIT_SENT).
+	chan.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap();
+
+	let retry = chan.maybe_handle_error_without_close(
+		ChainHash::using_genesis_block(network),
+		&fee_estimator,
+		&&logger,
+		&config,
+		&peer_features,
+	);
+	assert!(retry.is_err(), "a rejected Ark open must fail cleanly, not retry: {retry:?}");
+	// And the channel type must not have been quietly rewritten on the way out.
+	assert!(chan.funding.get_channel_type().requires_ark_channel());
+}
+
+#[test]
 fn test_ark_feature_is_only_advertised_with_safe_ldk_timing() {
 	let mut config = UserConfig::default();
 	config.channel_handshake_config.negotiate_ark_channel = true;

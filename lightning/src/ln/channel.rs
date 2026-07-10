@@ -7068,6 +7068,16 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		let channel_type = &funding.channel_transaction_parameters.channel_type_features;
 		assert!(!channel_type.supports_anchors_nonzero_fee_htlc_tx());
 
+		// An Ark channel does not participate in the downgrade ladder, in either direction.
+		// Re-selecting the preferred type would yield `ark_channel()` again (the counterparty
+		// still advertises the feature bit — the rejection was a policy error, not a missing
+		// feature), resending the identical rejected type forever; and falling back to a non-Ark
+		// type would open a channel without the HTLC success-path CSV the Ark funding
+		// construction requires. Fail the open cleanly instead.
+		if channel_type.requires_ark_channel() {
+			return Err(());
+		}
+
 		// We support opening a few different types of channels. Try removing our additional
 		// features one by one until we've either arrived at our default or the counterparty has
 		// accepted one. Features are un-set for the current channel type or any that come before
