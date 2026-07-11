@@ -7719,10 +7719,9 @@ where
 		if !parameters.channel_type_features.requires_ark_channel() {
 			return Ok(None);
 		}
-		match parameters.ark_htlc_success_csv_delta {
-			Some(delta) if delta != 0 => delta.checked_mul(2).map(Some).ok_or(()),
-			_ => Err(()),
-		}
+		ark_doubled_success_csv(parameters.ark_htlc_success_csv_delta)
+			.map(|(_delta, doubled)| Some(doubled))
+			.map_err(|_| ())
 	}
 
 	/// Returns whether this is an Ark channel persisted without LDK's required timing floor.
@@ -17420,21 +17419,44 @@ pub(super) fn ark_htlc_success_csv_delta_for_open(
 	if !channel_type.requires_ark_channel() {
 		return Ok(None);
 	}
-	let delta = match config.channel_handshake_config.ark_htlc_success_csv_delta {
-		Some(0) | None => return Err(
-			"ArkChannel requires a nonzero ark_htlc_success_csv_delta; refusing to open an unsafe Ark channel",
-		),
-		Some(delta) => delta,
-	};
-	let minimum_cltv_delta = delta.checked_mul(2).ok_or(
-		"ArkChannel cannot represent twice ark_htlc_success_csv_delta in ChannelConfig::cltv_expiry_delta",
-	)?;
+	let (delta, minimum_cltv_delta) =
+		ark_doubled_success_csv(config.channel_handshake_config.ark_htlc_success_csv_delta)
+			.map_err(|e| {
+				match e {
+				ArkDoubledCsvError::MissingOrZero =>
+					"ArkChannel requires a nonzero ark_htlc_success_csv_delta; refusing to open an unsafe Ark channel",
+				ArkDoubledCsvError::Overflow =>
+					"ArkChannel cannot represent twice ark_htlc_success_csv_delta in ChannelConfig::cltv_expiry_delta",
+			}
+			})?;
 	if config.channel_config.cltv_expiry_delta < minimum_cltv_delta {
 		return Err(
 			"ArkChannel requires ChannelConfig::cltv_expiry_delta to be at least twice ark_htlc_success_csv_delta",
 		);
 	}
 	Ok(Some(delta))
+}
+
+/// Why an Ark HTLC success-path CSV delta cannot yield LDK's doubled CLTV floor.
+enum ArkDoubledCsvError {
+	/// The configured/persisted delta is absent or zero — an Ark channel must carry a nonzero one.
+	MissingOrZero,
+	/// The delta is nonzero but `2 * delta` does not fit the `u16` CLTV field.
+	Overflow,
+}
+
+/// The single doubling that the Ark channel type's two serial CSV delays require:
+/// `(delta, 2 * delta)` for a nonzero `delta`. Both the open path
+/// ([`ark_htlc_success_csv_delta_for_open`]) and the restore/config path
+/// ([`FundedChannel::ark_ldk_minimum_cltv_delta`]) go through here so the floor arithmetic —
+/// which was once wrong by a factor of two — exists in exactly one place.
+fn ark_doubled_success_csv(delta: Option<u16>) -> Result<(u16, u16), ArkDoubledCsvError> {
+	match delta {
+		Some(delta) if delta != 0 => {
+			delta.checked_mul(2).map(|doubled| (delta, doubled)).ok_or(ArkDoubledCsvError::Overflow)
+		},
+		_ => Err(ArkDoubledCsvError::MissingOrZero),
+	}
 }
 
 const SERIALIZATION_VERSION: u8 = 4;
